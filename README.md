@@ -4,9 +4,9 @@ A CalDAV (VTODO) tasks client for the reMarkable Paper Pro Move, distributed
 as an [AppLoad](https://github.com/asivery/rmpp-appload) app for users running
 xovi. Nextcloud is the v1 sync target; iCloud is deferred to v1.5.
 
-This repository currently contains **Milestone 0** — a hello-world AppLoad
-app that proves the toolchain, cross-compile, and QML↔Rust protocol end to
-end. No CalDAV yet.
+This repository currently contains **Milestone 9a** — an offline-first task
+client with syncing to Nextcloud via CalDAV. Writes queue locally; network
+round-trips are optional.
 
 ## Layout
 
@@ -89,6 +89,21 @@ scp -r app/output-rmpp/ root@<device-ip>:/home/root/xovi/exthome/appload/retaska
 Launch from the AppLoad menu. Tap **Ping**; the text should change to
 `pong from reTaskable`.
 
+## Offline queue (M9a)
+
+reTaskable now stores every write (Create, Toggle, Edit, Delete) in a local
+queue and applies it optimistically to the cached task view, then flushes
+the queue to the CalDAV server when you tap Sync.
+
+- Writes return "Queued: ..." instantly, even with no network.
+- Tap **Sync** to drain the queue and pull server state.
+- Tap **Show Pending** to see every queued operation, including any errors.
+- Tap **Clear Errored** (twice, to confirm) to drop ops the server rejected;
+  the next Sync reconciles your cached view with authoritative server state.
+
+On first launch after upgrading, the local cache is rebuilt from the server
+(schema migration). Your data on the server is unchanged.
+
 ## Status
 
 - [x] M0: hello-world round-trip
@@ -100,6 +115,8 @@ Launch from the AppLoad menu. Tap **Ping**; the text should change to
 - [x] M6: 412 auto-retry helper + delete first task
 - [x] M7: create task (minimal VCALENDAR/VTODO + If-None-Match)
 - [x] M8: edit summary (reuses retry helper)
-- [ ] M9: offline queue + conflict-aware retry UI
+- [x] M9a: offline queue + Show Pending + Clear Errored UI
+- [ ] M9b: conflict-resolution UI
+- [ ] M9c: pending-row markers in Show Tasks
 - [ ] M10: polish for v1
 - [ ] M11: companion xovi extension — sidebar tile in xochitl that launches reTaskable via `AppLoadLauncher.launchApplication`
