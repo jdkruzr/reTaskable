@@ -737,6 +737,24 @@ fn apply_vtodo_mutations(ical: &str, mutations: &[(&str, Option<String>)]) -> St
     out
 }
 
+/// Replace the VTODO's SUMMARY (and bump DTSTAMP / LAST-MODIFIED to now).
+/// Everything else passes through verbatim via apply_vtodo_mutations. Same
+/// defensive ensure_crlf at the entry as toggle_completion, so LF-only cache
+/// rows from before the M5 line-ending fix self-heal on first edit.
+pub fn replace_summary(ical_text: &str, new_summary: &str) -> String {
+    let ical_text = ensure_crlf(ical_text);
+    let now = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let escaped = escape_ical_text(new_summary);
+    apply_vtodo_mutations(
+        &ical_text,
+        &[
+            ("SUMMARY", Some(escaped)),
+            ("DTSTAMP", Some(now.clone())),
+            ("LAST-MODIFIED", Some(now)),
+        ],
+    )
+}
+
 /// iCalendar (RFC 5545) requires CRLF line terminators. roxmltree normalises
 /// to LF per the XML 1.0 spec, so calendar-data extracted from XML loses its
 /// CRs and some parsers + folding code paths trip on the result. This restores
@@ -938,7 +956,40 @@ fn propstat_is_ok(propstat: &roxmltree::Node) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_crlf, escape_ical_text};
+    use super::{ensure_crlf, escape_ical_text, replace_summary};
+
+    #[test]
+    fn replace_summary_preserves_unrelated_properties() {
+        let input = "BEGIN:VCALENDAR\r\n\
+            VERSION:2.0\r\n\
+            PRODID:-//reTaskable test//EN\r\n\
+            BEGIN:VTODO\r\n\
+            UID:test-edit@retaskable\r\n\
+            DTSTAMP:20260101T000000Z\r\n\
+            SUMMARY:Old summary\r\n\
+            STATUS:NEEDS-ACTION\r\n\
+            X-CUSTOM-PROP:keep-me\r\n\
+            BEGIN:VALARM\r\n\
+            ACTION:DISPLAY\r\n\
+            TRIGGER:-PT15M\r\n\
+            DESCRIPTION:reminder\r\n\
+            END:VALARM\r\n\
+            END:VTODO\r\n\
+            END:VCALENDAR\r\n";
+        let out = replace_summary(input, "New summary");
+        assert!(out.contains("SUMMARY:New summary\r\n"), "SUMMARY not replaced:\n{out}");
+        assert!(!out.contains("SUMMARY:Old summary"), "Old SUMMARY still present:\n{out}");
+        assert!(out.contains("STATUS:NEEDS-ACTION\r\n"), "STATUS dropped:\n{out}");
+        assert!(out.contains("X-CUSTOM-PROP:keep-me\r\n"), "X-property dropped:\n{out}");
+        assert!(out.contains("BEGIN:VALARM\r\n"), "VALARM begin dropped:\n{out}");
+        assert!(out.contains("ACTION:DISPLAY\r\n"), "VALARM body dropped:\n{out}");
+        assert!(out.contains("END:VALARM\r\n"), "VALARM end dropped:\n{out}");
+        // LAST-MODIFIED should be present (we inject it).
+        assert!(out.contains("LAST-MODIFIED:"), "LAST-MODIFIED not added:\n{out}");
+        // DTSTAMP should be updated (different from the input's 20260101 value).
+        assert!(!out.contains("DTSTAMP:20260101T000000Z"), "DTSTAMP not bumped:\n{out}");
+    }
+
 
     #[test]
     fn escape_ical_text_handles_all_specials() {

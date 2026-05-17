@@ -99,7 +99,7 @@ Launch from the AppLoad menu. Tap **Ping**; the text should change to
 - [x] M5: toggle complete
 - [x] M6: 412 auto-retry helper + delete first task
 - [x] M7: create task (minimal VCALENDAR/VTODO + If-None-Match)
-- [ ] M8: edit summary (reuses retry helper)
+- [x] M8: edit summary (reuses retry helper)
 - [ ] M9: offline queue + conflict-aware retry UI
 - [ ] M10: polish for v1
 - [ ] M11: companion xovi extension — sidebar tile in xochitl that launches reTaskable via `AppLoadLauncher.launchApplication`

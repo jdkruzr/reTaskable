@@ -17,7 +17,7 @@ Rectangle {
         applicationID: "us.reticulum.retaskable"
 
         onMessageReceived: (type, contents) => {
-            if (type === 101 || type === 102 || type === 103 || type === 104 || type === 105 || type === 106 || type === 107 || type === 108) {
+            if (type === 101 || type === 102 || type === 103 || type === 104 || type === 105 || type === 106 || type === 107 || type === 108 || type === 109) {
                 responseText.text = contents
             }
         }
@@ -32,7 +32,7 @@ Rectangle {
 
         Text {
             anchors.horizontalCenter: parent.horizontalCenter
-            text: "reTaskable — M7"
+            text: "reTaskable — M8"
             font.pixelSize: 36
             color: "black"
         }
@@ -43,10 +43,10 @@ Rectangle {
 
             TextField {
                 id: summaryInput
-                width: parent.width - createBtn.width - 16
+                width: parent.width - createBtn.width - editBtn.width - 32
                 height: 80
                 font.pixelSize: 22
-                placeholderText: "New task summary"
+                placeholderText: "Task summary"
             }
             Rectangle {
                 id: createBtn
@@ -65,6 +65,27 @@ Rectangle {
                     enabled: createBtn.enabled
                     onClicked: {
                         endpoint.sendMessage(8, summaryInput.text.trim())
+                        summaryInput.text = ""
+                    }
+                }
+            }
+            Rectangle {
+                id: editBtn
+                property bool enabled: summaryInput.text.trim().length > 0
+                width: 240; height: 80
+                color: editBtn.enabled ? "white" : "#dddddd"
+                border.color: "black"; border.width: 3
+                Text {
+                    anchors.centerIn: parent
+                    text: "Edit First"
+                    font.pixelSize: 22
+                    color: editBtn.enabled ? "black" : "#888888"
+                }
+                MouseArea {
+                    anchors.fill: parent
+                    enabled: editBtn.enabled
+                    onClicked: {
+                        endpoint.sendMessage(9, summaryInput.text.trim())
                         summaryInput.text = ""
                     }
                 }

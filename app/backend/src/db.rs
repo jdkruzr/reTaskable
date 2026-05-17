@@ -185,10 +185,19 @@ pub fn get_first_task(
     conn: &Connection,
     calendar_href: &str,
 ) -> Result<Option<CachedTask>> {
+    // Match nextcloud::format_tasks's display sort: incomplete first, then
+    // undated last, then by due ascending, then href as tiebreak. Keeps
+    // "First" buttons (Toggle / Delete / Edit) in sync with what the user
+    // sees at the top of Show Tasks.
     let mut stmt = conn.prepare(
         "SELECT href, etag, ical_text, summary \
          FROM task WHERE calendar_href = ?1 \
-         ORDER BY href LIMIT 1",
+         ORDER BY \
+           CASE WHEN status = 'completed' THEN 1 ELSE 0 END, \
+           CASE WHEN due IS NULL THEN 1 ELSE 0 END, \
+           COALESCE(due, ''), \
+           href \
+         LIMIT 1",
     )?;
     let result = stmt.query_row(params![calendar_href], |row| {
         Ok(CachedTask {
@@ -206,8 +215,17 @@ pub fn get_first_task(
 }
 
 pub fn list_tasks(conn: &Connection, calendar_href: &str) -> Result<Vec<Task>> {
+    // SQL order matches get_first_task. format_tasks does a stable Rust-side
+    // sort by (completed, undated, due) -- which preserves the href tiebreak
+    // SQLite gives us here -- so Show Tasks's first row and get_first_task's
+    // first row come from the same total ordering.
     let mut stmt = conn.prepare(
-        "SELECT summary, status, due FROM task WHERE calendar_href = ?1",
+        "SELECT summary, status, due FROM task WHERE calendar_href = ?1 \
+         ORDER BY \
+           CASE WHEN status = 'completed' THEN 1 ELSE 0 END, \
+           CASE WHEN due IS NULL THEN 1 ELSE 0 END, \
+           COALESCE(due, ''), \
+           href",
     )?;
     let rows = stmt.query_map(params![calendar_href], |row| {
         let summary: String = row.get(0)?;
