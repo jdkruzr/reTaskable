@@ -13,6 +13,8 @@ pub struct CachedTask {
     pub etag: String,
     pub ical_text: String,
     pub summary: String,
+    pub uid: String,
+    pub status: String,
 }
 
 #[derive(Debug, Clone)]
@@ -547,7 +549,7 @@ pub fn get_first_task(
     // "First" buttons (Toggle / Delete / Edit) in sync with what the user
     // sees at the top of Show Tasks.
     let mut stmt = conn.prepare(
-        "SELECT href, etag, ical_text, summary \
+        "SELECT href, etag, ical_text, summary, uid, status \
          FROM task WHERE calendar_href = ?1 AND pending_delete = 0 \
          ORDER BY \
            CASE WHEN status = 'completed' THEN 1 ELSE 0 END, \
@@ -562,6 +564,8 @@ pub fn get_first_task(
             etag: row.get(1)?,
             ical_text: row.get(2)?,
             summary: row.get(3)?,
+            uid: row.get(4)?,
+            status: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
         })
     });
     match result {
@@ -1163,6 +1167,25 @@ mod tests {
             [], |r| r.get(0),
         ).unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn get_first_task_returns_uid_and_status() {
+        let mut conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        conn.execute(
+            "INSERT INTO calendar (href, display_name) VALUES ('/cal/', 'Cal')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO task (calendar_href, href, etag, ical_text, summary, status, due, uid, pending_delete)
+             VALUES ('/cal/', '/cal/t.ics', 'e', 'ical', 'walk', 'completed', NULL, 'uid-1', 0)",
+            [],
+        ).unwrap();
+        let task = get_first_task(&conn, "/cal/").unwrap().unwrap();
+        assert_eq!(task.uid, "uid-1");
+        assert_eq!(task.status, "completed");
+        assert_eq!(task.summary, "walk");
     }
 
     #[test]
