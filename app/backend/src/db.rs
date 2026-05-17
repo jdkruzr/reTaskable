@@ -274,7 +274,7 @@ pub fn get_first_task(
     // sees at the top of Show Tasks.
     let mut stmt = conn.prepare(
         "SELECT href, etag, ical_text, summary \
-         FROM task WHERE calendar_href = ?1 \
+         FROM task WHERE calendar_href = ?1 AND pending_delete = 0 \
          ORDER BY \
            CASE WHEN status = 'completed' THEN 1 ELSE 0 END, \
            CASE WHEN due IS NULL THEN 1 ELSE 0 END, \
@@ -303,7 +303,7 @@ pub fn list_tasks(conn: &Connection, calendar_href: &str) -> Result<Vec<Task>> {
     // SQLite gives us here -- so Show Tasks's first row and get_first_task's
     // first row come from the same total ordering.
     let mut stmt = conn.prepare(
-        "SELECT uid, summary, status, due FROM task WHERE calendar_href = ?1 \
+        "SELECT uid, summary, status, due FROM task WHERE calendar_href = ?1 AND pending_delete = 0 \
          ORDER BY \
            CASE WHEN status = 'completed' THEN 1 ELSE 0 END, \
            CASE WHEN due IS NULL THEN 1 ELSE 0 END, \
@@ -559,5 +559,28 @@ mod tests {
             .unwrap();
         assert_eq!(etag, "etag-2");
         assert_eq!(summary.as_deref(), Some("hello again"));
+    }
+
+    #[test]
+    fn list_tasks_filters_tombstoned_rows() {
+        let conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        conn.execute(
+            "INSERT INTO calendar (href, display_name) VALUES ('/cal/', 'Cal')",
+            [],
+        )
+        .unwrap();
+        // Two rows: one live, one tombstoned.
+        conn.execute(
+            "INSERT INTO task
+             (calendar_href, href, etag, ical_text, summary, status, due, uid, pending_delete)
+             VALUES ('/cal/', '/cal/a.ics', '', '', 'live', 'needs-action', NULL, 'uid-a', 0),
+                    ('/cal/', '/cal/b.ics', '', '', 'gone', 'needs-action', NULL, 'uid-b', 1)",
+            [],
+        )
+        .unwrap();
+        let rows = list_tasks(&conn, "/cal/").expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].summary, "live");
     }
 }
