@@ -1,0 +1,8 @@
+{
+    "id": "us.reticulum.retaskable",
+    "name": "reTaskable",
+    "loadsBackend": true,
+    "entry": "/ui/Main.qml",
+    "supportsScaling": false,
+    "canHaveMultipleFrontends": false
+}
