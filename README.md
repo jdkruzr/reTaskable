@@ -80,3 +80,4 @@ Launch from the AppLoad menu. Tap **Ping**; the text should change to
 - [ ] M6: full CRUD with 412 handling
 - [ ] M7: offline queue + conflict resolution
 - [ ] M8: polish for v1
+- [ ] M9: companion xovi extension — sidebar tile in xochitl that launches reTaskable via `AppLoadLauncher.launchApplication`
