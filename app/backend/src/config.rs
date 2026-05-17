@@ -14,6 +14,11 @@ pub struct NextcloudConfig {
     pub base_url: String,
     pub username: String,
     pub app_password: String,
+    /// Display name of the calendar to pull tasks from. Required for the
+    /// Show Tasks button; optional so older configs still load and the
+    /// non-task buttons keep working.
+    #[serde(default)]
+    pub calendar: Option<String>,
 }
 
 const TEMPLATE: &str = r#"# reTaskable configuration.
@@ -29,6 +34,9 @@ const TEMPLATE: &str = r#"# reTaskable configuration.
 base_url     = "https://nextcloud.example.com"
 username     = "yourname"
 app_password = "xxx-xxx-xxx-xxx-xxx"
+# Display name of the calendar to read tasks from.
+# Run List Calendars in the app to see the available names; paste one here.
+calendar     = "Personal"
 "#;
 
 pub fn path() -> Result<PathBuf> {

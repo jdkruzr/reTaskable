@@ -94,7 +94,7 @@ Launch from the AppLoad menu. Tap **Ping**; the text should change to
 - [x] M0: hello-world round-trip
 - [x] M1: one HTTPS request to Nextcloud
 - [x] M2: RFC 4791 calendar discovery
-- [ ] M3: read-only task list
+- [x] M3: read-only task list
 - [ ] M4: SQLite cache + sync-collection
 - [ ] M5: toggle complete
 - [ ] M6: full CRUD with 412 handling

@@ -17,19 +17,22 @@ Rectangle {
         applicationID: "us.reticulum.retaskable"
 
         onMessageReceived: (type, contents) => {
-            if (type === 101 || type === 102 || type === 103) {
+            if (type === 101 || type === 102 || type === 103 || type === 104) {
                 responseText.text = contents
             }
         }
     }
 
     Column {
-        anchors.centerIn: parent
+        anchors.top: parent.top
+        anchors.topMargin: 40
+        anchors.horizontalCenter: parent.horizontalCenter
+        width: parent.width - 80
         spacing: 24
 
         Text {
             anchors.horizontalCenter: parent.horizontalCenter
-            text: "reTaskable — M2"
+            text: "reTaskable — M3"
             font.pixelSize: 36
             color: "black"
         }
@@ -80,11 +83,25 @@ Rectangle {
                     onClicked: endpoint.sendMessage(3, "")
                 }
             }
+            Rectangle {
+                width: 200; height: 80
+                color: "white"; border.color: "black"; border.width: 3
+                Text {
+                    anchors.centerIn: parent
+                    text: "Show Tasks"
+                    font.pixelSize: 22
+                    color: "black"
+                }
+                MouseArea {
+                    anchors.fill: parent
+                    onClicked: endpoint.sendMessage(4, "")
+                }
+            }
         }
 
         Rectangle {
             anchors.horizontalCenter: parent.horizontalCenter
-            width: 1000
+            width: parent.width
             height: responseText.implicitHeight + 24
             color: "white"
             border.color: "black"
@@ -94,7 +111,7 @@ Rectangle {
                 id: responseText
                 anchors.fill: parent
                 anchors.margins: 12
-                wrapMode: Text.Wrap
+                wrapMode: Text.WrapAnywhere
                 text: "(no response yet)"
                 font.pixelSize: 18
                 font.family: "monospace"
