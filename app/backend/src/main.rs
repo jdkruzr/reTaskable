@@ -282,6 +282,21 @@ async fn sync(db: &mut Connection) -> anyhow::Result<String> {
         cfg.nextcloud.app_password.as_str(),
     );
 
+    // --- Phase 1: drain the queue ---
+    // Use block_in_place to allow the async flush_pending call to work with
+    // non-Send Connection in the handle_message context.
+    let flush = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(
+            queue::flush_pending(db, &client, auth, &calendar_url)
+        )
+    })?;
+
+    // If a transient failure broke the drain, skip sync-collection and report.
+    if flush.transient_failed > 0 {
+        return Ok(compose_sync_response(&flush, None, 0, 0));
+    }
+
+    // --- Phase 2: sync-collection REPORT (unchanged from M4) ---
     let prior_token = db::get_sync_token(db, &cal.href)?;
     let (delta, was_full) = nextcloud::sync_collection_with_fallback(
         &client,
@@ -340,9 +355,7 @@ async fn sync(db: &mut Connection) -> anyhow::Result<String> {
     }
 
     let kind = if was_full { "full" } else { "incremental" };
-    Ok(format!(
-        "Sync complete: {kind}, +{updated} updated, -{deleted} deleted."
-    ))
+    Ok(compose_sync_response(&flush, Some(kind), updated, deleted))
 }
 
 fn toggle_first(db: &mut Connection) -> anyhow::Result<String> {
