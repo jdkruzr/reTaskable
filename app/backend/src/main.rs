@@ -17,6 +17,7 @@ const MSG_SHOW_TASKS: u32 = 4;
 const MSG_SYNC: u32 = 5;
 const MSG_TOGGLE_FIRST: u32 = 6;
 const MSG_DELETE_FIRST: u32 = 7;
+const MSG_CREATE_TASK: u32 = 8;
 const MSG_PONG: u32 = 101;
 const MSG_NEXTCLOUD_RESPONSE: u32 = 102;
 const MSG_CALENDARS_RESPONSE: u32 = 103;
@@ -24,6 +25,7 @@ const MSG_TASKS_RESPONSE: u32 = 104;
 const MSG_SYNC_RESPONSE: u32 = 105;
 const MSG_TOGGLE_RESPONSE: u32 = 106;
 const MSG_DELETE_RESPONSE: u32 = 107;
+const MSG_CREATE_RESPONSE: u32 = 108;
 
 #[tokio::main]
 async fn main() {
@@ -99,6 +101,15 @@ impl AppLoadBackend for Backend {
                 };
                 eprintln!("retaskable: delete first result:\n{response}");
                 send(replier, MSG_DELETE_RESPONSE, &response);
+            }
+            MSG_CREATE_TASK => {
+                eprintln!("retaskable: create task requested ({} chars)", msg.contents.len());
+                let response = match create(&mut self.db, &msg.contents).await {
+                    Ok(s) => s,
+                    Err(e) => format!("error: {e:#}"),
+                };
+                eprintln!("retaskable: create task result:\n{response}");
+                send(replier, MSG_CREATE_RESPONSE, &response);
             }
             t => eprintln!("retaskable: ignoring unknown msg type {t}"),
         }
@@ -282,6 +293,42 @@ async fn toggle_first(db: &mut Connection) -> anyhow::Result<String> {
         "Toggled \"{}\": {:?} -> {:?} (new etag {}){}",
         task.summary, old_status, new_status, new_etag, suffix
     ))
+}
+
+async fn create(db: &mut Connection, summary: &str) -> anyhow::Result<String> {
+    let summary = summary.trim();
+    if summary.is_empty() {
+        anyhow::bail!("summary cannot be empty");
+    }
+
+    let cfg = config::load()?;
+    let wanted = cfg.nextcloud.calendar.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "config is missing `calendar = \"...\"` under [nextcloud]. \
+             Run List Calendars to see options."
+        )
+    })?;
+
+    let Some(cal_href) = db::get_calendar_href_by_display_name(db, wanted)? else {
+        return Ok(format!(
+            "calendar {wanted:?} not yet synced -- tap Sync first."
+        ));
+    };
+
+    let cal_url = url::Url::parse(&cal_href)?;
+    let client = reqwest::Client::new();
+    let auth = (
+        cfg.nextcloud.username.as_str(),
+        cfg.nextcloud.app_password.as_str(),
+    );
+
+    let (task_url, etag, ical) =
+        nextcloud::create_task(&client, &cal_url, auth, summary).await?;
+
+    let parsed = nextcloud::parse_vtodos_first(&ical)?;
+    db::upsert_task(db, &cal_href, &task_url, &etag, &ical, &parsed)?;
+
+    Ok(format!("Created \"{}\" (etag {})", parsed.summary, etag))
 }
 
 async fn delete_first(db: &mut Connection) -> anyhow::Result<String> {

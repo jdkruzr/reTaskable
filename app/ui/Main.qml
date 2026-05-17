@@ -17,7 +17,7 @@ Rectangle {
         applicationID: "us.reticulum.retaskable"
 
         onMessageReceived: (type, contents) => {
-            if (type === 101 || type === 102 || type === 103 || type === 104 || type === 105 || type === 106 || type === 107) {
+            if (type === 101 || type === 102 || type === 103 || type === 104 || type === 105 || type === 106 || type === 107 || type === 108) {
                 responseText.text = contents
             }
         }
@@ -32,9 +32,43 @@ Rectangle {
 
         Text {
             anchors.horizontalCenter: parent.horizontalCenter
-            text: "reTaskable — M6"
+            text: "reTaskable — M7"
             font.pixelSize: 36
             color: "black"
+        }
+
+        Row {
+            width: parent.width
+            spacing: 16
+
+            TextField {
+                id: summaryInput
+                width: parent.width - createBtn.width - 16
+                height: 80
+                font.pixelSize: 22
+                placeholderText: "New task summary"
+            }
+            Rectangle {
+                id: createBtn
+                property bool enabled: summaryInput.text.trim().length > 0
+                width: 200; height: 80
+                color: createBtn.enabled ? "white" : "#dddddd"
+                border.color: "black"; border.width: 3
+                Text {
+                    anchors.centerIn: parent
+                    text: "Create"
+                    font.pixelSize: 24
+                    color: createBtn.enabled ? "black" : "#888888"
+                }
+                MouseArea {
+                    anchors.fill: parent
+                    enabled: createBtn.enabled
+                    onClicked: {
+                        endpoint.sendMessage(8, summaryInput.text.trim())
+                        summaryInput.text = ""
+                    }
+                }
+            }
         }
 
         Flow {

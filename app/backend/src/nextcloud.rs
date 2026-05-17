@@ -3,6 +3,7 @@ use chrono::Utc;
 use reqwest::{header, Client, Method, StatusCode};
 use serde::Serialize;
 use url::Url;
+use uuid::Uuid;
 
 use crate::config::NextcloudConfig;
 
@@ -501,6 +502,102 @@ where
     }
 }
 
+/// Create-specific PUT: uses `If-None-Match: *` (RFC 4791 §5.3.2 — create
+/// only if no resource exists at the URL). 412 here means "already exists",
+/// which is semantically unrelated to the stale-ETag case `put_task_once`
+/// handles; we don't retry. Reuses `WriteOutcome` for shape.
+async fn put_task_create_once(
+    client: &Client,
+    task_url: &Url,
+    ical_text: &str,
+    auth: (&str, &str),
+) -> Result<WriteOutcome> {
+    eprintln!("retaskable: PUT {task_url} (if-none-match *)");
+    let resp = client
+        .put(task_url.clone())
+        .basic_auth(auth.0, Some(auth.1))
+        .header(header::IF_NONE_MATCH, "*")
+        .header(header::CONTENT_TYPE, "text/calendar; charset=utf-8")
+        .body(ical_text.to_string())
+        .send()
+        .await
+        .with_context(|| format!("PUT {task_url}"))?;
+
+    let status = resp.status();
+    if status == StatusCode::PRECONDITION_FAILED {
+        return Ok(WriteOutcome::PreconditionFailed);
+    }
+
+    let new_etag = resp
+        .headers()
+        .get(header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        bail!("PUT {task_url} -> {status}: {body}");
+    }
+
+    let etag = new_etag
+        .ok_or_else(|| anyhow!("PUT {task_url} succeeded ({status}) but no ETag in response"))?;
+    Ok(WriteOutcome::Updated(etag))
+}
+
+/// Create a new VTODO in the given calendar collection. Generates a v4 UUID
+/// for the resource name, builds a minimal RFC 5545 VCALENDAR/VTODO body
+/// (CRLF terminators, escaped SUMMARY), and PUTs with `If-None-Match: *`.
+///
+/// Returns `(task_url, etag, ical_text)`. The caller is responsible for
+/// inserting the resulting row into the local cache (so subsequent reads
+/// see it without waiting for the next Sync).
+pub async fn create_task(
+    client: &Client,
+    calendar_url: &Url,
+    auth: (&str, &str),
+    summary: &str,
+) -> Result<(String, String, String)> {
+    // Defensive: ensure the calendar URL's path ends with '/'. Without it,
+    // url::Url::join replaces the last path segment instead of appending.
+    // Sabre/Nextcloud calendar collections always have a trailing slash, but
+    // belt-and-braces.
+    let mut base = calendar_url.clone();
+    if !base.path().ends_with('/') {
+        let p = format!("{}/", base.path());
+        base.set_path(&p);
+    }
+
+    let uid = Uuid::new_v4().to_string();
+    let task_url = base
+        .join(&format!("{uid}.ics"))
+        .context("building task URL")?;
+
+    let now = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let escaped_summary = escape_ical_text(summary);
+
+    let ical_text = format!(
+        "BEGIN:VCALENDAR\r\n\
+         VERSION:2.0\r\n\
+         PRODID:-//reTaskable//EN\r\n\
+         BEGIN:VTODO\r\n\
+         UID:{uid}\r\n\
+         DTSTAMP:{now}\r\n\
+         CREATED:{now}\r\n\
+         LAST-MODIFIED:{now}\r\n\
+         SUMMARY:{escaped_summary}\r\n\
+         STATUS:NEEDS-ACTION\r\n\
+         END:VTODO\r\n\
+         END:VCALENDAR\r\n"
+    );
+
+    match put_task_create_once(client, &task_url, &ical_text, auth).await? {
+        WriteOutcome::Updated(etag) => Ok((task_url.to_string(), etag, ical_text)),
+        WriteOutcome::PreconditionFailed => bail!(
+            "412 on create -- UID collision (should never happen with v4 UUIDs). Tap Create again."
+        ),
+    }
+}
+
 /// DELETE with one-shot 412 auto-retry. Returns `retried`.
 ///
 /// On 412 we GET the resource just for its current ETag, then DELETE again
@@ -646,6 +743,16 @@ fn apply_vtodo_mutations(ical: &str, mutations: &[(&str, Option<String>)]) -> St
 /// CRLF whether the input has none, LF-only, or already-CRLF endings.
 pub fn ensure_crlf(s: &str) -> String {
     s.replace("\r\n", "\n").replace('\n', "\r\n")
+}
+
+/// Escape a text value for inclusion in an iCalendar property (RFC 5545
+/// §3.3.11). Order matters: backslash first so we don't double-escape the
+/// backslashes we introduce for newline/comma/semicolon.
+pub fn escape_ical_text(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace(',', "\\,")
+        .replace(';', "\\;")
 }
 
 fn matching_mutation<'a>(
@@ -831,7 +938,20 @@ fn propstat_is_ok(propstat: &roxmltree::Node) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::ensure_crlf;
+    use super::{ensure_crlf, escape_ical_text};
+
+    #[test]
+    fn escape_ical_text_handles_all_specials() {
+        assert_eq!(escape_ical_text("plain"), "plain");
+        assert_eq!(escape_ical_text("a, b"), "a\\, b");
+        assert_eq!(escape_ical_text("a; b"), "a\\; b");
+        assert_eq!(escape_ical_text("a\nb"), "a\\nb");
+        assert_eq!(escape_ical_text("a\\b"), "a\\\\b");
+        // Backslash must escape first so we don't double-escape the
+        // backslashes we introduce for , ; and \n.
+        assert_eq!(escape_ical_text("a, b; c\nd\\e"), "a\\, b\\; c\\nd\\\\e");
+    }
+
 
     #[test]
     fn ensure_crlf_handles_lf_only_input() {
