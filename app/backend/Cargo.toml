@@ -17,3 +17,4 @@ roxmltree = "0.20"
 url = "2"
 icalendar = "0.16"
 rusqlite = { version = "0.32", features = ["bundled"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }

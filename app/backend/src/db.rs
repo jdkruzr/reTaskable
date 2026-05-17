@@ -6,6 +6,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::nextcloud::{Task, TaskStatus};
 
+#[derive(Debug)]
+pub struct CachedTask {
+    pub href: String,
+    pub etag: String,
+    pub ical_text: String,
+    pub summary: String,
+}
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS calendar (
     href TEXT PRIMARY KEY,
@@ -171,6 +179,30 @@ pub fn delete_tasks_not_in(
     }
     tx.commit()?;
     Ok(deleted)
+}
+
+pub fn get_first_task(
+    conn: &Connection,
+    calendar_href: &str,
+) -> Result<Option<CachedTask>> {
+    let mut stmt = conn.prepare(
+        "SELECT href, etag, ical_text, summary \
+         FROM task WHERE calendar_href = ?1 \
+         ORDER BY href LIMIT 1",
+    )?;
+    let result = stmt.query_row(params![calendar_href], |row| {
+        Ok(CachedTask {
+            href: row.get(0)?,
+            etag: row.get(1)?,
+            ical_text: row.get(2)?,
+            summary: row.get(3)?,
+        })
+    });
+    match result {
+        Ok(t) => Ok(Some(t)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }
 
 pub fn list_tasks(conn: &Connection, calendar_href: &str) -> Result<Vec<Task>> {

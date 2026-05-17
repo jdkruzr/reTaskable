@@ -96,7 +96,7 @@ Launch from the AppLoad menu. Tap **Ping**; the text should change to
 - [x] M2: RFC 4791 calendar discovery
 - [x] M3: read-only task list
 - [x] M4: SQLite cache + sync-collection
-- [ ] M5: toggle complete
+- [x] M5: toggle complete
 - [ ] M6: full CRUD with 412 handling
 - [ ] M7: offline queue + conflict resolution
 - [ ] M8: polish for v1

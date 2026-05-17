@@ -15,11 +15,13 @@ const MSG_TEST_NEXTCLOUD: u32 = 2;
 const MSG_LIST_CALENDARS: u32 = 3;
 const MSG_SHOW_TASKS: u32 = 4;
 const MSG_SYNC: u32 = 5;
+const MSG_TOGGLE_FIRST: u32 = 6;
 const MSG_PONG: u32 = 101;
 const MSG_NEXTCLOUD_RESPONSE: u32 = 102;
 const MSG_CALENDARS_RESPONSE: u32 = 103;
 const MSG_TASKS_RESPONSE: u32 = 104;
 const MSG_SYNC_RESPONSE: u32 = 105;
+const MSG_TOGGLE_RESPONSE: u32 = 106;
 
 #[tokio::main]
 async fn main() {
@@ -77,6 +79,15 @@ impl AppLoadBackend for Backend {
                 };
                 eprintln!("retaskable: sync result:\n{response}");
                 send(replier, MSG_SYNC_RESPONSE, &response);
+            }
+            MSG_TOGGLE_FIRST => {
+                eprintln!("retaskable: toggle first task requested");
+                let response = match toggle_first(&mut self.db).await {
+                    Ok(s) => s,
+                    Err(e) => format!("error: {e:#}"),
+                };
+                eprintln!("retaskable: toggle first result:\n{response}");
+                send(replier, MSG_TOGGLE_RESPONSE, &response);
             }
             t => eprintln!("retaskable: ignoring unknown msg type {t}"),
         }
@@ -206,6 +217,45 @@ async fn sync(db: &mut Connection) -> anyhow::Result<String> {
     let kind = if was_full { "full" } else { "incremental" };
     Ok(format!(
         "Sync complete: {kind}, +{updated} updated, -{deleted} deleted."
+    ))
+}
+
+async fn toggle_first(db: &mut Connection) -> anyhow::Result<String> {
+    let cfg = config::load()?;
+    let wanted = cfg.nextcloud.calendar.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "config is missing `calendar = \"...\"` under [nextcloud]. \
+             Run List Calendars to see options."
+        )
+    })?;
+
+    let Some(cal_href) = db::get_calendar_href_by_display_name(db, wanted)? else {
+        return Ok(format!(
+            "calendar {wanted:?} not yet synced -- tap Sync first."
+        ));
+    };
+
+    let Some(task) = db::get_first_task(db, &cal_href)? else {
+        return Ok("no tasks in cache -- tap Sync first.".to_string());
+    };
+
+    let (new_ical, old_status, new_status) = nextcloud::toggle_completion(&task.ical_text)?;
+
+    let task_url = url::Url::parse(&task.href)?;
+    let client = reqwest::Client::new();
+    let auth = (
+        cfg.nextcloud.username.as_str(),
+        cfg.nextcloud.app_password.as_str(),
+    );
+    let new_etag = nextcloud::put_task(&client, &task_url, &new_ical, &task.etag, auth).await?;
+
+    // Re-parse so the cache's denormalised fields match the new state.
+    let parsed = nextcloud::parse_vtodos_first(&new_ical)?;
+    db::upsert_task(db, &cal_href, &task.href, &new_etag, &new_ical, &parsed)?;
+
+    Ok(format!(
+        "Toggled \"{}\": {:?} -> {:?} (new etag {})",
+        task.summary, old_status, new_status, new_etag
     ))
 }
 

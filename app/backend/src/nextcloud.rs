@@ -1,5 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
-use reqwest::{Client, Method, StatusCode};
+use chrono::Utc;
+use reqwest::{header, Client, Method, StatusCode};
 use serde::Serialize;
 use url::Url;
 
@@ -242,7 +243,8 @@ fn parse_sync_response(xml: &str, base: &Url) -> Result<SyncDelta> {
                     }
                 } else if child.has_tag_name("calendar-data") {
                     if let Some(t) = child.text() {
-                        ical = t.trim().to_string();
+                        // ensure_crlf restores the line endings XML stripped.
+                        ical = ensure_crlf(t.trim());
                     }
                 }
             }
@@ -334,6 +336,181 @@ pub async fn discover_calendars(cfg: &NextcloudConfig) -> Result<Vec<Calendar>> 
     );
 
     Ok(calendars)
+}
+
+pub async fn put_task(
+    client: &Client,
+    task_url: &Url,
+    ical_text: &str,
+    if_match_etag: &str,
+    auth: (&str, &str),
+) -> Result<String> {
+    eprintln!("retaskable: PUT {task_url} (if-match {if_match_etag:?})");
+    let resp = client
+        .put(task_url.clone())
+        .basic_auth(auth.0, Some(auth.1))
+        .header(header::IF_MATCH, if_match_etag)
+        .header(header::CONTENT_TYPE, "text/calendar; charset=utf-8")
+        .body(ical_text.to_string())
+        .send()
+        .await
+        .with_context(|| format!("PUT {task_url}"))?;
+
+    let status = resp.status();
+    if status == StatusCode::PRECONDITION_FAILED {
+        bail!("412 Precondition Failed -- task was changed elsewhere; tap Sync, then Toggle again");
+    }
+
+    let new_etag = resp
+        .headers()
+        .get(header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        bail!("PUT {task_url} -> {status}: {body}");
+    }
+
+    new_etag.ok_or_else(|| anyhow!("PUT {task_url} succeeded ({status}) but no ETag in response"))
+}
+
+/// Pure function: read STATUS from the iCalendar text, decide what the new
+/// state should be, and return a new iCalendar string with the 5 affected
+/// properties replaced/added/removed. Everything else (including folded lines,
+/// X-properties, ALARMs, etc.) passes through verbatim.
+pub fn toggle_completion(ical_text: &str) -> Result<(String, TaskStatus, TaskStatus)> {
+    // Older cache rows may be LF-only (cached before ensure_crlf was wired
+    // into sync_collection). Normalise defensively so the rest of the function
+    // only ever sees RFC-conformant CRLF input.
+    let ical_text = ensure_crlf(ical_text);
+    let current = read_current_status(&ical_text)?;
+    let new_status = if matches!(current, TaskStatus::Completed) {
+        TaskStatus::NeedsAction
+    } else {
+        TaskStatus::Completed
+    };
+
+    let now = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+
+    // (key, Some(value)) = set/replace; (key, None) = remove.
+    let mutations: Vec<(&str, Option<String>)> = match new_status {
+        TaskStatus::Completed => vec![
+            ("DTSTAMP", Some(now.clone())),
+            ("LAST-MODIFIED", Some(now.clone())),
+            ("STATUS", Some("COMPLETED".to_string())),
+            ("COMPLETED", Some(now.clone())),
+            ("PERCENT-COMPLETE", Some("100".to_string())),
+        ],
+        _ => vec![
+            ("DTSTAMP", Some(now.clone())),
+            ("LAST-MODIFIED", Some(now)),
+            ("STATUS", Some("NEEDS-ACTION".to_string())),
+            ("COMPLETED", None),
+            ("PERCENT-COMPLETE", None),
+        ],
+    };
+
+    let new_ical = apply_vtodo_mutations(&ical_text, &mutations);
+    Ok((new_ical, current, new_status))
+}
+
+fn read_current_status(ical_text: &str) -> Result<TaskStatus> {
+    use icalendar::{Calendar as ICal, CalendarComponent, Component};
+    let cal: ICal = ical_text
+        .parse()
+        .map_err(|e: String| anyhow!("icalendar parse error: {e}"))?;
+    for component in cal.components.iter() {
+        if let CalendarComponent::Todo(todo) = component {
+            return Ok(todo
+                .property_value("STATUS")
+                .map(parse_status)
+                .unwrap_or(TaskStatus::NeedsAction));
+        }
+    }
+    bail!("no VTODO component in iCalendar payload")
+}
+
+fn apply_vtodo_mutations(ical: &str, mutations: &[(&str, Option<String>)]) -> String {
+    let mut out = String::new();
+    let mut in_vtodo = false;
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+
+    for line in ical.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
+
+        if in_vtodo && trimmed == "END:VTODO" {
+            // Append any mutations we never matched on (new properties to add).
+            for (key, value) in mutations.iter() {
+                if !seen.contains(key) {
+                    if let Some(v) = value {
+                        out.push_str(&format!("{}:{}\r\n", key, v));
+                    }
+                }
+            }
+            out.push_str(line);
+            in_vtodo = false;
+            continue;
+        }
+
+        if trimmed == "BEGIN:VTODO" {
+            in_vtodo = true;
+            seen.clear();
+            out.push_str(line);
+            continue;
+        }
+
+        if in_vtodo {
+            if let Some((key, value)) = matching_mutation(trimmed, mutations) {
+                seen.insert(key);
+                match value {
+                    Some(v) => {
+                        // Replace the existing line with the new value, preserving CRLF style.
+                        let eol = if line.ends_with("\r\n") { "\r\n" } else { "\n" };
+                        out.push_str(&format!("{}:{}{}", key, v, eol));
+                    }
+                    None => {
+                        // Drop the line entirely.
+                    }
+                }
+                continue;
+            }
+        }
+
+        out.push_str(line);
+    }
+
+    out
+}
+
+/// iCalendar (RFC 5545) requires CRLF line terminators. roxmltree normalises
+/// to LF per the XML 1.0 spec, so calendar-data extracted from XML loses its
+/// CRs and some parsers + folding code paths trip on the result. This restores
+/// CRLF whether the input has none, LF-only, or already-CRLF endings.
+pub fn ensure_crlf(s: &str) -> String {
+    s.replace("\r\n", "\n").replace('\n', "\r\n")
+}
+
+fn matching_mutation<'a>(
+    line: &str,
+    mutations: &'a [(&'a str, Option<String>)],
+) -> Option<(&'a str, &'a Option<String>)> {
+    for (key, value) in mutations.iter() {
+        if line.starts_with(key) {
+            let rest = &line[key.len()..];
+            if rest.starts_with(':') || rest.starts_with(';') {
+                return Some((key, value));
+            }
+        }
+    }
+    None
+}
+
+pub fn parse_vtodos_first(ical_text: &str) -> Result<Task> {
+    parse_vtodos(ical_text)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("no VTODO components in iCalendar payload"))
 }
 
 fn parse_vtodos(ical_text: &str) -> Result<Vec<Task>> {
@@ -497,6 +674,29 @@ fn propstat_is_ok(propstat: &roxmltree::Node) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::ensure_crlf;
+
+    #[test]
+    fn ensure_crlf_handles_lf_only_input() {
+        let input = "BEGIN:VCALENDAR\nVERSION:2.0\nEND:VCALENDAR\n";
+        let out = ensure_crlf(input);
+        assert_eq!(out, "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nEND:VCALENDAR\r\n");
+    }
+
+    #[test]
+    fn ensure_crlf_idempotent_on_crlf_input() {
+        let input = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n";
+        let out = ensure_crlf(input);
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn ensure_crlf_handles_mixed_input() {
+        let input = "BEGIN:VCALENDAR\r\nVERSION:2.0\nPRODID:foo\r\n";
+        let out = ensure_crlf(input);
+        assert_eq!(out, "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:foo\r\n");
+    }
+
     #[test]
     fn icalendar_preserves_x_properties() {
         let input = "BEGIN:VCALENDAR\r\n\

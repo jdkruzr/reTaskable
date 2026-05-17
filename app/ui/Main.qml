@@ -17,7 +17,7 @@ Rectangle {
         applicationID: "us.reticulum.retaskable"
 
         onMessageReceived: (type, contents) => {
-            if (type === 101 || type === 102 || type === 103 || type === 104 || type === 105) {
+            if (type === 101 || type === 102 || type === 103 || type === 104 || type === 105 || type === 106) {
                 responseText.text = contents
             }
         }
@@ -32,13 +32,13 @@ Rectangle {
 
         Text {
             anchors.horizontalCenter: parent.horizontalCenter
-            text: "reTaskable — M4"
+            text: "reTaskable — M5"
             font.pixelSize: 36
             color: "black"
         }
 
-        Row {
-            anchors.horizontalCenter: parent.horizontalCenter
+        Flow {
+            width: parent.width
             spacing: 16
 
             Rectangle {
@@ -109,6 +109,20 @@ Rectangle {
                 MouseArea {
                     anchors.fill: parent
                     onClicked: endpoint.sendMessage(5, "")
+                }
+            }
+            Rectangle {
+                width: 240; height: 80
+                color: "white"; border.color: "black"; border.width: 3
+                Text {
+                    anchors.centerIn: parent
+                    text: "Toggle First"
+                    font.pixelSize: 22
+                    color: "black"
+                }
+                MouseArea {
+                    anchors.fill: parent
+                    onClicked: endpoint.sendMessage(6, "")
                 }
             }
         }

@@ -921,6 +921,7 @@ dependencies = [
  "anyhow",
  "appload-client",
  "async-trait",
+ "chrono",
  "dirs",
  "icalendar",
  "reqwest",
