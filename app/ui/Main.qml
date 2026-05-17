@@ -17,7 +17,7 @@ Rectangle {
         applicationID: "us.reticulum.retaskable"
 
         onMessageReceived: (type, contents) => {
-            if (type === 101 || type === 102 || type === 103 || type === 104 || type === 105 || type === 106 || type === 107 || type === 108 || type === 109) {
+            if (type === 101 || type === 102 || type === 103 || type === 104 || type === 105 || type === 106 || type === 107 || type === 108 || type === 109 || type === 110 || type === 111) {
                 responseText.text = contents
             }
         }
@@ -207,6 +207,51 @@ Rectangle {
                         } else {
                             deleteBtn.armed = true
                             deleteArmTimer.restart()
+                        }
+                    }
+                }
+            }
+            Rectangle {
+                width: 240; height: 80
+                color: "white"; border.color: "black"; border.width: 3
+                Text {
+                    anchors.centerIn: parent
+                    text: "Show Pending"
+                    font.pixelSize: 22
+                    color: "black"
+                }
+                MouseArea {
+                    anchors.fill: parent
+                    onClicked: endpoint.sendMessage(10, "")
+                }
+            }
+            Rectangle {
+                id: clearErroredBtn
+                property bool armed: false
+                width: 260; height: 80
+                color: clearErroredBtn.armed ? "black" : "white"
+                border.color: "black"; border.width: 3
+                Text {
+                    anchors.centerIn: parent
+                    text: clearErroredBtn.armed ? "Tap again to confirm" : "Clear Errored"
+                    font.pixelSize: 20
+                    color: clearErroredBtn.armed ? "white" : "black"
+                }
+                Timer {
+                    id: clearErroredArmTimer
+                    interval: 3000
+                    onTriggered: clearErroredBtn.armed = false
+                }
+                MouseArea {
+                    anchors.fill: parent
+                    onClicked: {
+                        if (clearErroredBtn.armed) {
+                            clearErroredBtn.armed = false
+                            clearErroredArmTimer.stop()
+                            endpoint.sendMessage(11, "")
+                        } else {
+                            clearErroredBtn.armed = true
+                            clearErroredArmTimer.restart()
                         }
                     }
                 }

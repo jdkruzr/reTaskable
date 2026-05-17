@@ -21,6 +21,8 @@ const MSG_TOGGLE_FIRST: u32 = 6;
 const MSG_DELETE_FIRST: u32 = 7;
 const MSG_CREATE_TASK: u32 = 8;
 const MSG_EDIT_FIRST: u32 = 9;
+const MSG_SHOW_PENDING: u32 = 10;
+const MSG_CLEAR_ERRORED: u32 = 11;
 const MSG_PONG: u32 = 101;
 const MSG_NEXTCLOUD_RESPONSE: u32 = 102;
 const MSG_CALENDARS_RESPONSE: u32 = 103;
@@ -30,6 +32,8 @@ const MSG_TOGGLE_RESPONSE: u32 = 106;
 const MSG_DELETE_RESPONSE: u32 = 107;
 const MSG_CREATE_RESPONSE: u32 = 108;
 const MSG_EDIT_RESPONSE: u32 = 109;
+const MSG_SHOW_PENDING_RESPONSE: u32 = 110;
+const MSG_CLEAR_ERRORED_RESPONSE: u32 = 111;
 
 #[tokio::main]
 async fn main() {
@@ -124,6 +128,24 @@ impl AppLoadBackend for Backend {
                 eprintln!("retaskable: edit first result:\n{response}");
                 send(replier, MSG_EDIT_RESPONSE, &response);
             }
+            MSG_SHOW_PENDING => {
+                eprintln!("retaskable: show pending requested");
+                let response = match show_pending(&mut self.db) {
+                    Ok(s) => s,
+                    Err(e) => format!("error: {e:#}"),
+                };
+                eprintln!("retaskable: show pending result:\n{response}");
+                send(replier, MSG_SHOW_PENDING_RESPONSE, &response);
+            }
+            MSG_CLEAR_ERRORED => {
+                eprintln!("retaskable: clear errored requested");
+                let response = match clear_errored(&mut self.db) {
+                    Ok(s) => s,
+                    Err(e) => format!("error: {e:#}"),
+                };
+                eprintln!("retaskable: clear errored result:\n{response}");
+                send(replier, MSG_CLEAR_ERRORED_RESPONSE, &response);
+            }
             t => eprintln!("retaskable: ignoring unknown msg type {t}"),
         }
     }
@@ -161,6 +183,39 @@ fn show_tasks(db: &mut Connection) -> anyhow::Result<String> {
         None => "Not yet synced -- tap Sync.\n\n".to_string(),
     };
     Ok(format!("{freshness}{}", nextcloud::format_tasks(&tasks)))
+}
+
+fn show_pending(db: &mut Connection) -> anyhow::Result<String> {
+    let ops = db::list_pending_ops(db)?;
+    if ops.is_empty() {
+        return Ok("No pending ops.".to_string());
+    }
+    let mut lines = Vec::with_capacity(ops.len());
+    for op in &ops {
+        let age = humanize_since(
+            std::time::UNIX_EPOCH + Duration::from_secs(op.enqueued_at.max(0) as u64),
+        );
+        let annotation = if op.errored == 1 || op.error_count > 0 {
+            let err = op.last_error.as_deref().unwrap_or("");
+            format!("  [errored {}x: {err}]", op.error_count.max(1))
+        } else {
+            String::new()
+        };
+        lines.push(format!(
+            "#{}  {}  \"{}\"  {}{}",
+            op.id, op.op_type, op.summary, age, annotation
+        ));
+    }
+    Ok(lines.join("\n"))
+}
+
+fn clear_errored(db: &mut Connection) -> anyhow::Result<String> {
+    let n = db::clear_errored(db)?;
+    if n == 0 {
+        Ok("No errored ops to clear.".to_string())
+    } else {
+        Ok(format!("Cleared {n} errored op(s). Tap Sync to reconcile."))
+    }
 }
 
 /// Build the Sync response string from the queue-flush result and the
