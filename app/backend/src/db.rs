@@ -15,6 +15,19 @@ pub struct CachedTask {
     pub summary: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct PendingOp {
+    pub id: i64,
+    pub op_type: String,
+    pub target_uid: String,
+    pub target_calendar_href: String,
+    pub payload: Option<String>,
+    pub enqueued_at: i64,
+    pub error_count: i64,
+    pub last_error: Option<String>,
+    pub errored: i64,
+}
+
 const SCHEMA_V2: &str = "
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
@@ -80,7 +93,7 @@ pub fn open() -> Result<Connection> {
 
 /// Apply the v2 migration to an already-opened connection. Used by both
 /// `open()` and the test module.
-fn ensure_schema_v2(conn: &Connection) -> Result<()> {
+pub fn ensure_schema_v2(conn: &Connection) -> Result<()> {
     let current = read_schema_version(conn)?;
     if current < SCHEMA_VERSION {
         migrate_to_v2(conn)
@@ -434,6 +447,74 @@ pub fn enqueue_delete(
     let op_id = tx.last_insert_rowid();
     tx.commit()?;
     Ok(op_id)
+}
+
+/// Return the lowest-id pending_op row that is not errored. `Ok(None)` means
+/// the queue is fully drained (or only errored rows remain).
+pub fn fetch_next_drainable(conn: &Connection) -> Result<Option<PendingOp>> {
+    let row = conn
+        .query_row(
+            "SELECT id, op_type, target_uid, target_calendar_href, payload, \
+                    enqueued_at, error_count, last_error, errored \
+             FROM pending_op \
+             WHERE errored = 0 \
+             ORDER BY id ASC \
+             LIMIT 1",
+            [],
+            |r| {
+                Ok(PendingOp {
+                    id: r.get(0)?,
+                    op_type: r.get(1)?,
+                    target_uid: r.get(2)?,
+                    target_calendar_href: r.get(3)?,
+                    payload: r.get(4)?,
+                    enqueued_at: r.get(5)?,
+                    error_count: r.get(6)?,
+                    last_error: r.get(7)?,
+                    errored: r.get(8)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(row)
+}
+
+/// Remove a pending_op row by id. Idempotent — Ok(()) even if the row no
+/// longer exists (drain may be re-entered after a crash).
+pub fn delete_pending_op(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute("DELETE FROM pending_op WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+/// Flip a pending_op to errored = 1 and stamp last_error. Used for both
+/// 5-strike transient promotion (Phase 4) and immediate terminal errors.
+pub fn mark_op_errored(conn: &Connection, id: i64, msg: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE pending_op SET errored = 1, last_error = ?1 WHERE id = ?2",
+        params![msg, id],
+    )?;
+    Ok(())
+}
+
+/// Poison every other non-errored pending_op for the same target_uid, so a
+/// failed op doesn't burn retry budget for the queued ops behind it. Returns
+/// the number of rows newly marked errored.
+///
+/// `blocking_op_type` is the op_type of the op that just failed; it's used
+/// to format the cascaded `last_error` message.
+pub fn cascade_uid(
+    conn: &Connection,
+    target_uid: &str,
+    blocking_op_type: &str,
+) -> Result<usize> {
+    let msg = format!("blocked by failed {blocking_op_type}");
+    let affected = conn.execute(
+        "UPDATE pending_op
+            SET errored = 1, last_error = ?1
+          WHERE target_uid = ?2 AND errored = 0",
+        params![msg, target_uid],
+    )?;
+    Ok(affected)
 }
 
 pub fn get_first_task(
@@ -1061,5 +1142,127 @@ mod tests {
             [], |r| r.get(0),
         ).unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn fetch_next_drainable_returns_lowest_id_unerrored() {
+        let conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        conn.execute(
+            "INSERT INTO calendar (href, display_name) VALUES ('/cal/', 'Cal')",
+            [],
+        ).unwrap();
+        // Seed 3 ops: id 1 errored, id 2 ok, id 3 ok.
+        conn.execute(
+            "INSERT INTO pending_op (op_type, target_uid, target_calendar_href, payload, enqueued_at, errored)
+             VALUES ('toggle', 'a', '/cal/', NULL, 100, 1),
+                    ('toggle', 'b', '/cal/', NULL, 101, 0),
+                    ('toggle', 'c', '/cal/', NULL, 102, 0)",
+            [],
+        ).unwrap();
+        let next = fetch_next_drainable(&conn).unwrap().expect("some op");
+        assert_eq!(next.target_uid, "b");
+        assert_eq!(next.errored, 0);
+    }
+
+    #[test]
+    fn fetch_next_drainable_returns_none_on_empty_or_all_errored() {
+        let conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        assert!(fetch_next_drainable(&conn).unwrap().is_none());
+        conn.execute(
+            "INSERT INTO pending_op (op_type, target_uid, target_calendar_href, payload, enqueued_at, errored)
+             VALUES ('toggle', 'a', '/cal/', NULL, 100, 1)",
+            [],
+        ).unwrap();
+        assert!(fetch_next_drainable(&conn).unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_pending_op_removes_row() {
+        let conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        conn.execute(
+            "INSERT INTO pending_op (op_type, target_uid, target_calendar_href, payload, enqueued_at)
+             VALUES ('toggle', 'a', '/cal/', NULL, 0)",
+            [],
+        ).unwrap();
+        let id: i64 = conn.query_row(
+            "SELECT id FROM pending_op WHERE target_uid = 'a'", [], |r| r.get(0),
+        ).unwrap();
+        delete_pending_op(&conn, id).unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pending_op", [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn delete_pending_op_is_idempotent() {
+        let conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        delete_pending_op(&conn, 9999).expect("must not error on missing row");
+    }
+
+    #[test]
+    fn mark_op_errored_sets_flag_and_message() {
+        let conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        conn.execute(
+            "INSERT INTO pending_op (op_type, target_uid, target_calendar_href, payload, enqueued_at)
+             VALUES ('toggle', 'a', '/cal/', NULL, 0)",
+            [],
+        ).unwrap();
+        let id: i64 = conn.query_row(
+            "SELECT id FROM pending_op WHERE target_uid = 'a'", [], |r| r.get(0),
+        ).unwrap();
+        mark_op_errored(&conn, id, "404 not found").unwrap();
+        let (errored, msg): (i64, String) = conn.query_row(
+            "SELECT errored, last_error FROM pending_op WHERE id = ?1",
+            params![id], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert_eq!(errored, 1);
+        assert_eq!(msg, "404 not found");
+    }
+
+    #[test]
+    fn cascade_uid_poisons_only_unerrored_siblings_on_same_uid() {
+        let conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        // Three ops on uid-x (one already errored, two clean) + one on uid-y.
+        conn.execute(
+            "INSERT INTO pending_op (op_type, target_uid, target_calendar_href, payload, enqueued_at, errored, last_error)
+             VALUES ('toggle', 'uid-x', '/c/', NULL, 0, 1, 'pre-existing'),
+                    ('toggle', 'uid-x', '/c/', NULL, 1, 0, NULL),
+                    ('toggle', 'uid-x', '/c/', NULL, 2, 0, NULL),
+                    ('toggle', 'uid-y', '/c/', NULL, 3, 0, NULL)",
+            [],
+        ).unwrap();
+
+        let cascaded = cascade_uid(&conn, "uid-x", "edit").unwrap();
+        assert_eq!(cascaded, 2, "should cascade two clean siblings");
+
+        // The already-errored row keeps its original message (AC3.6).
+        let pre: String = conn.query_row(
+            "SELECT last_error FROM pending_op WHERE enqueued_at = 0", [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(pre, "pre-existing");
+
+        // The two clean siblings on uid-x are now errored with the cascade message.
+        let cascaded_msgs: Vec<String> = conn
+            .prepare("SELECT last_error FROM pending_op WHERE target_uid = 'uid-x' AND enqueued_at IN (1,2)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(cascaded_msgs.len(), 2);
+        assert!(cascaded_msgs.iter().all(|m| m == "blocked by failed edit"));
+
+        // uid-y is untouched.
+        let y_errored: i64 = conn.query_row(
+            "SELECT errored FROM pending_op WHERE target_uid = 'uid-y'", [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(y_errored, 0);
     }
 }
