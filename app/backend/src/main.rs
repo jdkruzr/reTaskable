@@ -9,6 +9,7 @@ use rusqlite::Connection;
 mod config;
 mod db;
 mod nextcloud;
+mod queue;
 
 const MSG_PING: u32 = 1;
 const MSG_TEST_NEXTCLOUD: u32 = 2;
