@@ -118,11 +118,15 @@ pub(crate) fn classify_error(err: &anyhow::Error) -> ExecOutcome {
         return ExecOutcome::Terminal(msg);
     }
 
-    // 3. 5xx — transient.
-    for code in 500..=599 {
-        if has_status(&msg, code) {
-            return ExecOutcome::Transient(msg);
-        }
+    // 3. 5xx — transient. Check the codes commonly emitted by Nextcloud/CalDAV servers.
+    if has_status(&msg, 500)
+        || has_status(&msg, 502)
+        || has_status(&msg, 503)
+        || has_status(&msg, 504)
+        || has_status(&msg, 507)
+        || has_status(&msg, 508)
+    {
+        return ExecOutcome::Transient(msg);
     }
 
     // 4. Default: transient.
@@ -249,7 +253,7 @@ async fn dispatch_toggle(
         auth,
         &cached_etag,
         &cached_ical,
-        |ical| Ok(crate::nextcloud::toggle_completion(ical).map(|(s, _, _)| s)?),
+        |ical| crate::nextcloud::toggle_completion(ical).map(|(s, _, _)| s),
     )
     .await
     {
@@ -359,17 +363,19 @@ fn fetch_cached_for_dispatch(
 }
 
 fn build_task_url(calendar_url: &Url, href: &str) -> Result<Url> {
-    // Calendar URLs are absolute origins; href is the server-relative path
-    // (sync-collection writes `href` as the full path component, e.g.,
-    // "/remote.php/dav/calendars/user/Tasks/abc.ics"). Reconstruct by setting
-    // the path directly on a cloned base.
-    let mut url = calendar_url.clone();
-    url.set_path(href);
-    Ok(url)
+    // href in the cache is whatever sync-collection stored. nextcloud::sync_collection
+    // canonicalises to absolute URL strings via base.join().to_string(); CalDAV servers
+    // also legally emit absolute-path hrefs. Url::parse handles the former; base.join
+    // handles the latter. Try parse first; on failure (path-only), fall back.
+    Url::parse(href).or_else(|_| calendar_url.join(href)).map_err(Into::into)
 }
 
 /// Apply a dispatch outcome to the DB. Returns Ok(true) to continue draining,
 /// Ok(false) to break the loop (transient failure).
+///
+/// TODO(M9b/Phase 8): adopt a logging convention so these diagnostics can be
+/// filtered per verbosity level. For now eprintln matches the project's existing
+/// diagnostic style (see lessons_learned.md).
 fn apply_outcome(
     conn: &mut Connection,
     op: &PendingOp,
@@ -381,11 +387,22 @@ fn apply_outcome(
         SuccessCreate { task_url, etag, ical_text } => {
             let tx = conn.unchecked_transaction()?;
             // Replace the sentinel row with the real href + etag.
-            tx.execute(
+            let affected = tx.execute(
                 "UPDATE task SET href = ?1, etag = ?2, ical_text = ?3 \
                  WHERE calendar_href = ?4 AND uid = ?5",
                 rusqlite::params![task_url, etag, ical_text, op.target_calendar_href, op.target_uid],
             )?;
+            if affected == 0 {
+                // Cache row vanished (e.g., external delete, or sync-collection cleared during create).
+                // Roll back: pending_op deletion would orphan the queue. Treat as Terminal.
+                drop(tx); // explicit rollback
+                db::mark_op_errored(conn, op.id, "cache row vanished mid-flush (create)")?;
+                let cascaded = db::cascade_uid(conn, &op.target_uid, &op.op_type)?;
+                summary.newly_errored += 1;
+                summary.cascade_errored += cascaded;
+                eprintln!("retaskable: queue: cache vanished for create #{} -> errored; cascaded {cascaded}", op.id);
+                return Ok(true);
+            }
             tx.execute("DELETE FROM pending_op WHERE id = ?1", rusqlite::params![op.id])?;
             tx.commit()?;
             summary.flushed += 1;
@@ -397,11 +414,22 @@ fn apply_outcome(
             // The cached row was optimistically updated at enqueue time; here
             // we replace etag + ical_text with the server-canonical version
             // by uid (not href, since href is stable for edit/toggle).
-            tx.execute(
+            let affected = tx.execute(
                 "UPDATE task SET etag = ?1, ical_text = ?2 \
                  WHERE calendar_href = ?3 AND uid = ?4",
                 rusqlite::params![new_etag, new_ical, op.target_calendar_href, op.target_uid],
             )?;
+            if affected == 0 {
+                // Cache row vanished between dispatch and apply (race vs sync-collection or external clear).
+                // Roll back: pending_op deletion would orphan the queue. Treat as Terminal.
+                drop(tx); // explicit rollback
+                db::mark_op_errored(conn, op.id, "cache row vanished mid-flush")?;
+                let cascaded = db::cascade_uid(conn, &op.target_uid, &op.op_type)?;
+                summary.newly_errored += 1;
+                summary.cascade_errored += cascaded;
+                eprintln!("retaskable: queue: cache vanished for #{} ({}) -> errored; cascaded {cascaded}", op.id, op.op_type);
+                return Ok(true);
+            }
             tx.execute("DELETE FROM pending_op WHERE id = ?1", rusqlite::params![op.id])?;
             tx.commit()?;
             summary.flushed += 1;
@@ -413,10 +441,14 @@ fn apply_outcome(
         }
         SuccessDelete { retried } => {
             let tx = conn.unchecked_transaction()?;
-            tx.execute(
+            let affected = tx.execute(
                 "DELETE FROM task WHERE calendar_href = ?1 AND uid = ?2",
                 rusqlite::params![op.target_calendar_href, op.target_uid],
             )?;
+            if affected == 0 {
+                // Task already gone (idempotent). Server-side it's already deleted.
+                eprintln!("retaskable: queue: delete #{} -- cache row already gone (idempotent)", op.id);
+            }
             tx.execute("DELETE FROM pending_op WHERE id = ?1", rusqlite::params![op.id])?;
             tx.commit()?;
             summary.flushed += 1;
@@ -561,6 +593,42 @@ mod tests {
     }
 
     #[test]
+    fn apply_outcome_success_update_with_missing_cache_row_marks_errored() {
+        // Regression test for IMPORTANT-2: when cache row vanishes between dispatch
+        // and apply (race condition), SuccessUpdate must detect the zero-row UPDATE
+        // and mark the op as errored instead of orphaning it in the queue.
+        let mut conn = fresh();
+        // Seed op but NO cache row (simulates race where sync-collection cleared it).
+        seed_op(&conn, "toggle", "uid-orphan");
+        let op = db::fetch_next_drainable(&conn).unwrap().unwrap();
+        let mut summary = FlushSummary::default();
+
+        let cont = apply_outcome(
+            &mut conn,
+            &op,
+            ExecOutcome::SuccessUpdate {
+                new_etag: "etag-v2".into(),
+                new_ical: "ical-v2".into(),
+                retried: false,
+            },
+            &mut summary,
+        ).unwrap();
+
+        assert!(cont, "missing cache row treated as terminal (continue drain)");
+        assert_eq!(summary.newly_errored, 1, "op must be marked errored");
+        assert_eq!(summary.flushed, 0, "op must NOT count as flushed");
+
+        // Verify the pending_op is marked errored with the right message.
+        let (errored, last_error): (i64, String) = conn.query_row(
+            "SELECT errored, last_error FROM pending_op WHERE id = ?1",
+            rusqlite::params![op.id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert_eq!(errored, 1, "pending_op.errored must be 1");
+        assert!(last_error.contains("cache row vanished"), "error message must explain the race");
+    }
+
+    #[test]
     fn apply_outcome_terminal_marks_errored_and_cascades() {
         // Three ops on uid-bad (will cascade) + one on uid-good (untouched).
         let mut conn = fresh();
@@ -642,6 +710,63 @@ mod tests {
         assert_eq!(total, 2, "both ops still in queue");
     }
 
+    #[tokio::test]
+    async fn flush_pending_handles_absolute_href_from_sync_collection() {
+        // Regression test for CRITICAL-1: build_task_url must handle absolute URL
+        // strings (production format from sync-collection) not just path-only hrefs.
+        use httpmock::prelude::*;
+        use rusqlite::params;
+
+        let server = MockServer::start_async().await;
+        let task_path = "/cal/task.ics";
+        let put_mock = server
+            .mock_async(|when, then| {
+                when.method(PUT)
+                    .path(task_path)
+                    .header("If-Match", "etag-v1");
+                then.status(204).header("ETag", "etag-v2");
+            })
+            .await;
+
+        let mut conn = fresh();
+        let calendar_url: Url = format!("{}/cal/", server.base_url()).parse().unwrap();
+        let absolute_href = format!("{}{}", server.base_url(), task_path);
+        let cached_ical = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VTODO\r\nUID:uid-test\r\n\
+                           SUMMARY:Test\r\nSTATUS:NEEDS-ACTION\r\nDTSTAMP:20260101T000000Z\r\n\
+                           END:VTODO\r\nEND:VCALENDAR\r\n";
+        conn.execute(
+            "INSERT INTO task (calendar_href, href, etag, ical_text, summary, status, due, uid, pending_delete)
+             VALUES (?1, ?2, 'etag-v1', ?3, 'Test', 'needs-action', NULL, 'uid-test', 0)",
+            params![format!("{}/cal/", server.base_url()), absolute_href, cached_ical],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO pending_op (op_type, target_uid, target_calendar_href, payload, enqueued_at)
+             VALUES ('toggle', 'uid-test', ?1, NULL, 0)",
+            params![format!("{}/cal/", server.base_url())],
+        ).unwrap();
+
+        let http = reqwest::Client::new();
+        let summary = flush_pending(&mut conn, &http, ("u", "p"), &calendar_url)
+            .await
+            .expect("flush");
+
+        assert_eq!(summary.flushed, 1, "operation must succeed despite absolute href");
+        assert_eq!(summary.newly_errored, 0);
+        put_mock.assert_async().await;
+
+        // Verify the queue was drained.
+        let remaining: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pending_op", [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(remaining, 0);
+
+        // Verify the cache was updated.
+        let etag: String = conn.query_row(
+            "SELECT etag FROM task WHERE uid = 'uid-test'", [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(etag, "etag-v2");
+    }
+
     #[test]
     fn classify_double_412_as_terminal() {
         let err = anyhow::anyhow!(
@@ -721,6 +846,8 @@ mod tests {
 
         let mut conn = fresh();
         let calendar_url: Url = format!("{}/cal/", server.base_url()).parse().unwrap();
+        let cal_href = format!("{}/cal/", server.base_url());
+        let absolute_href = format!("{}{}", server.base_url(), task_path);
         let cached_ical = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n\
                            BEGIN:VTODO\r\nUID:uid-walk\r\nSUMMARY:Walk\r\n\
                            STATUS:NEEDS-ACTION\r\nDTSTAMP:20260101T000000Z\r\n\
@@ -728,12 +855,12 @@ mod tests {
         conn.execute(
             "INSERT INTO task (calendar_href, href, etag, ical_text, summary, status, due, uid, pending_delete)
              VALUES (?1, ?2, 'etag-cached', ?3, 'Walk', 'needs-action', NULL, 'uid-walk', 0)",
-            params![format!("{}/cal/", server.base_url()), task_path, cached_ical],
+            params![cal_href, absolute_href, cached_ical],
         ).unwrap();
         conn.execute(
             "INSERT INTO pending_op (op_type, target_uid, target_calendar_href, payload, enqueued_at)
              VALUES ('toggle', 'uid-walk', ?1, NULL, 0)",
-            params![format!("{}/cal/", server.base_url())],
+            params![cal_href],
         ).unwrap();
 
         let http = reqwest::Client::new();
@@ -775,11 +902,12 @@ mod tests {
         let mut conn = fresh();
         let calendar_url: Url = format!("{}/cal/", server.base_url()).parse().unwrap();
         let cal_href = format!("{}/cal/", server.base_url());
+        let absolute_href_x = format!("{}/cal/x.ics", server.base_url());
         conn.execute(
             "INSERT INTO task (calendar_href, href, etag, ical_text, summary, status, due, uid, pending_delete)
-             VALUES (?1, '/cal/x.ics', 'etag-a', 'BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:x\r\nSUMMARY:s\r\nEND:VTODO\r\nEND:VCALENDAR\r\n',
+             VALUES (?1, ?2, 'etag-a', 'BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:x\r\nSUMMARY:s\r\nEND:VTODO\r\nEND:VCALENDAR\r\n',
                      's', 'needs-action', NULL, 'uid-x', 0)",
-            params![cal_href],
+            params![cal_href, absolute_href_x],
         ).unwrap();
         // Two queued ops on uid-x AND one on uid-y to prove the transient break
         // does NOT touch uid-y in this pass.
@@ -832,10 +960,11 @@ mod tests {
         let mut conn = fresh();
         let calendar_url: Url = format!("{}/cal/", server.base_url()).parse().unwrap();
         let cal_href = format!("{}/cal/", server.base_url());
+        let absolute_href_x = format!("{}/cal/x.ics", server.base_url());
         conn.execute(
             "INSERT INTO task (calendar_href, href, etag, ical_text, summary, status, due, uid, pending_delete)
-             VALUES (?1, '/cal/x.ics', 'e', '', 's', 'needs-action', NULL, 'uid-x', 0)",
-            params![cal_href],
+             VALUES (?1, ?2, 'e', '', 's', 'needs-action', NULL, 'uid-x', 0)",
+            params![cal_href, absolute_href_x],
         ).unwrap();
         // Seed an op that already has 4 strikes; one more transient promotes it.
         conn.execute(
@@ -878,11 +1007,13 @@ mod tests {
         let mut conn = fresh();
         let calendar_url: Url = format!("{}/cal/", server.base_url()).parse().unwrap();
         let cal_href = format!("{}/cal/", server.base_url());
+        let absolute_href_x = format!("{}/cal/x.ics", server.base_url());
+        let absolute_href_y = format!("{}/cal/y.ics", server.base_url());
         conn.execute(
             "INSERT INTO task (calendar_href, href, etag, ical_text, summary, status, due, uid, pending_delete)
-             VALUES (?1, '/cal/x.ics', 'e', '', 's', 'needs-action', NULL, 'uid-x', 0),
-                    (?1, '/cal/y.ics', 'e', '', 's', 'needs-action', NULL, 'uid-y', 0)",
-            params![cal_href],
+             VALUES (?1, ?2, 'e', '', 's', 'needs-action', NULL, 'uid-x', 0),
+                    (?1, ?3, 'e', '', 's', 'needs-action', NULL, 'uid-y', 0)",
+            params![cal_href, absolute_href_x, absolute_href_y],
         ).unwrap();
         conn.execute(
             "INSERT INTO pending_op (op_type, target_uid, target_calendar_href, payload, enqueued_at)
@@ -934,13 +1065,15 @@ mod tests {
         let mut conn = fresh();
         let calendar_url: Url = format!("{}/cal/", server.base_url()).parse().unwrap();
         let cal_href = format!("{}/cal/", server.base_url());
+        let absolute_href_a = format!("{}/cal/a.ics", server.base_url());
+        let absolute_href_b = format!("{}/cal/b.ics", server.base_url());
         conn.execute(
             "INSERT INTO task (calendar_href, href, etag, ical_text, summary, status, due, uid, pending_delete)
-             VALUES (?1, '/cal/a.ics', 'old', 'BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:a\r\nSUMMARY:s\r\nEND:VTODO\r\nEND:VCALENDAR\r\n',
+             VALUES (?1, ?2, 'old', 'BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:a\r\nSUMMARY:s\r\nEND:VTODO\r\nEND:VCALENDAR\r\n',
                      's', 'needs-action', NULL, 'uid-a', 0),
-                    (?1, '/cal/b.ics', 'old', 'BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:b\r\nSUMMARY:s\r\nEND:VTODO\r\nEND:VCALENDAR\r\n',
+                    (?1, ?3, 'old', 'BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:b\r\nSUMMARY:s\r\nEND:VTODO\r\nEND:VCALENDAR\r\n',
                      's', 'needs-action', NULL, 'uid-b', 0)",
-            params![cal_href],
+            params![cal_href, absolute_href_a, absolute_href_b],
         ).unwrap();
         conn.execute(
             "INSERT INTO pending_op (op_type, target_uid, target_calendar_href, payload, enqueued_at)
