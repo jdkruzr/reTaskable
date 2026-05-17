@@ -363,6 +363,50 @@ pub fn enqueue_toggle(
     Ok(op_id)
 }
 
+pub fn enqueue_edit(
+    conn: &mut Connection,
+    calendar_href: &str,
+    uid: &str,
+    new_summary: &str,
+) -> Result<i64> {
+    let tx = conn.unchecked_transaction()?;
+
+    let row: Option<(String, String)> = tx
+        .query_row(
+            "SELECT href, ical_text FROM task \
+             WHERE calendar_href = ?1 AND uid = ?2 AND pending_delete = 0",
+            params![calendar_href, uid],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let (href, ical_text) = row
+        .ok_or_else(|| anyhow::anyhow!("no live task with uid {uid}"))?;
+
+    let new_ical = crate::nextcloud::replace_summary(&ical_text, new_summary);
+
+    let affected = tx.execute(
+        "UPDATE task SET ical_text = ?1, summary = ?2 \
+         WHERE calendar_href = ?3 AND href = ?4",
+        params![new_ical, new_summary, calendar_href, href],
+    )?;
+    if affected != 1 {
+        return Err(anyhow::anyhow!(
+            "expected exactly 1 task row updated, got {affected}"
+        ));
+    }
+
+    let payload = serde_json::to_string(&serde_json::json!({ "summary": new_summary }))?;
+    let enqueued_at = unix_secs_now();
+    tx.execute(
+        "INSERT INTO pending_op (op_type, target_uid, target_calendar_href, payload, enqueued_at)
+         VALUES ('edit', ?1, ?2, ?3, ?4)",
+        params![uid, calendar_href, payload, enqueued_at],
+    )?;
+    let op_id = tx.last_insert_rowid();
+    tx.commit()?;
+    Ok(op_id)
+}
+
 pub fn get_first_task(
     conn: &Connection,
     calendar_href: &str,
@@ -820,5 +864,96 @@ mod tests {
             "SELECT COUNT(*) FROM pending_op", [], |r| r.get(0),
         ).unwrap();
         assert_eq!(count, 0, "no orphan pending_op should exist");
+    }
+
+    #[test]
+    fn enqueue_edit_rewrites_summary_and_enqueues_op() {
+        let mut conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        conn.execute(
+            "INSERT INTO calendar (href, display_name) VALUES ('/cal/', 'Cal')",
+            [],
+        ).unwrap();
+        let ical = "BEGIN:VCALENDAR\r\n\
+            VERSION:2.0\r\n\
+            BEGIN:VTODO\r\n\
+            UID:uid-e\r\n\
+            DTSTAMP:20260101T000000Z\r\n\
+            SUMMARY:Old\r\n\
+            STATUS:NEEDS-ACTION\r\n\
+            END:VTODO\r\n\
+            END:VCALENDAR\r\n";
+        conn.execute(
+            "INSERT INTO task
+             (calendar_href, href, etag, ical_text, summary, status, due, uid, pending_delete)
+             VALUES ('/cal/', '/cal/e.ics', 'etag-1', ?1, 'Old', 'needs-action', NULL, 'uid-e', 0)",
+            params![ical],
+        ).unwrap();
+
+        let op_id = enqueue_edit(&mut conn, "/cal/", "uid-e", "New summary").expect("enqueue");
+        assert!(op_id > 0);
+
+        let (summary, new_ical): (String, String) = conn.query_row(
+            "SELECT summary, ical_text FROM task WHERE uid = 'uid-e'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert_eq!(summary, "New summary");
+        assert!(new_ical.contains("SUMMARY:New summary\r\n"));
+        assert!(!new_ical.contains("SUMMARY:Old\r\n"));
+
+        let (op_type, payload): (String, String) = conn.query_row(
+            "SELECT op_type, payload FROM pending_op WHERE id = ?1",
+            params![op_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert_eq!(op_type, "edit");
+        assert_eq!(payload, r#"{"summary":"New summary"}"#);
+    }
+
+    #[test]
+    fn enqueue_edit_escapes_special_characters_in_payload() {
+        let mut conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        conn.execute(
+            "INSERT INTO calendar (href, display_name) VALUES ('/cal/', 'Cal')",
+            [],
+        ).unwrap();
+        let ical = "BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:uid-q\r\n\
+                    SUMMARY:plain\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        conn.execute(
+            "INSERT INTO task
+             (calendar_href, href, etag, ical_text, summary, status, due, uid, pending_delete)
+             VALUES ('/cal/', '/cal/q.ics', '', ?1, 'plain', 'needs-action', NULL, 'uid-q', 0)",
+            params![ical],
+        ).unwrap();
+
+        // Summary contains a double-quote and a newline.
+        let weird = "He said \"hi\"\nand left";
+        enqueue_edit(&mut conn, "/cal/", "uid-q", weird).unwrap();
+        let payload: String = conn.query_row(
+            "SELECT payload FROM pending_op WHERE target_uid = 'uid-q'",
+            [],
+            |r| r.get(0),
+        ).unwrap();
+        // Payload must be valid JSON that roundtrips.
+        let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(parsed["summary"], weird);
+    }
+
+    #[test]
+    fn enqueue_edit_unknown_uid_rolls_back() {
+        let mut conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        conn.execute(
+            "INSERT INTO calendar (href, display_name) VALUES ('/cal/', 'Cal')",
+            [],
+        ).unwrap();
+        let err = enqueue_edit(&mut conn, "/cal/", "uid-missing", "anything");
+        assert!(err.is_err());
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pending_op", [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(count, 0);
     }
 }
