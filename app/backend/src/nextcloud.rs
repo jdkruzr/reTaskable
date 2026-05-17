@@ -21,11 +21,26 @@ pub enum TaskStatus {
     Unknown,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 pub struct Task {
     pub summary: String,
     pub status: TaskStatus,
     pub due: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct TaskRecord {
+    pub href: String,
+    pub etag: String,
+    pub ical_text: String,
+    pub task: Task,
+}
+
+#[derive(Debug)]
+pub struct SyncDelta {
+    pub added_or_updated: Vec<TaskRecord>,
+    pub deleted_hrefs: Vec<String>,
+    pub new_sync_token: Option<String>,
 }
 
 const PROBE_BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
@@ -63,19 +78,34 @@ const CALENDAR_LIST_BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 </d:propfind>
 "#;
 
-const CALENDAR_QUERY_BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
-<c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+// RFC 6578 §3.2: an empty sync-token element means "initial sync, return
+// everything." We send the same shape with either an empty or a populated
+// element.
+fn sync_collection_body(sync_token: Option<&str>) -> String {
+    let token_escaped = match sync_token {
+        Some(t) => xml_escape(t),
+        None => String::new(),
+    };
+    format!(
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<d:sync-collection xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:sync-token>{}</d:sync-token>
+  <d:sync-level>1</d:sync-level>
   <d:prop>
     <d:getetag/>
     <c:calendar-data/>
   </d:prop>
-  <c:filter>
-    <c:comp-filter name="VCALENDAR">
-      <c:comp-filter name="VTODO"/>
-    </c:comp-filter>
-  </c:filter>
-</c:calendar-query>
-"#;
+</d:sync-collection>
+"#,
+        token_escaped
+    )
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
 
 struct DavResp {
     status: StatusCode,
@@ -87,7 +117,7 @@ async fn dav_request(
     client: &Client,
     method_bytes: &[u8],
     url: &Url,
-    body: &'static str,
+    body: impl Into<String>,
     depth: &str,
     auth: (&str, &str),
 ) -> Result<DavResp> {
@@ -98,7 +128,7 @@ async fn dav_request(
         .basic_auth(auth.0, Some(auth.1))
         .header("Depth", depth)
         .header("Content-Type", "application/xml; charset=utf-8")
-        .body(body)
+        .body(body.into())
         .send()
         .await
         .with_context(|| format!("sending request to {url}"))?;
@@ -112,6 +142,135 @@ async fn dav_request(
         bail!("{} -> {}: {}", url, status, body);
     }
     Ok(DavResp { status, body, final_url })
+}
+
+/// Returns (delta, was_full_sync). On 412 Precondition Failed (server says our
+/// sync-token is no longer valid) we transparently retry as a full sync.
+pub async fn sync_collection_with_fallback(
+    client: &Client,
+    calendar_url: &Url,
+    sync_token: Option<&str>,
+    auth: (&str, &str),
+) -> Result<(SyncDelta, bool)> {
+    if let Some(token) = sync_token {
+        eprintln!("retaskable: sync-collection incremental with token {token:?}");
+        match sync_collection(client, calendar_url, Some(token), auth).await {
+            Ok(d) => return Ok((d, false)),
+            Err(e) => {
+                let msg = format!("{e:#}");
+                if msg.contains("412") || msg.contains("403") {
+                    eprintln!(
+                        "retaskable: sync-token rejected ({msg}); falling back to full sync"
+                    );
+                } else {
+                    return Err(e);
+                }
+            }
+        }
+    }
+    eprintln!("retaskable: sync-collection full (empty token)");
+    let d = sync_collection(client, calendar_url, None, auth).await?;
+    Ok((d, true))
+}
+
+async fn sync_collection(
+    client: &Client,
+    calendar_url: &Url,
+    sync_token: Option<&str>,
+    auth: (&str, &str),
+) -> Result<SyncDelta> {
+    let body = sync_collection_body(sync_token);
+    let resp = dav_request(client, b"REPORT", calendar_url, body, "1", auth)
+        .await
+        .context("REPORT sync-collection")?;
+    parse_sync_response(&resp.body, &resp.final_url)
+}
+
+fn parse_sync_response(xml: &str, base: &Url) -> Result<SyncDelta> {
+    let doc = roxmltree::Document::parse(xml).context("parsing sync-collection XML")?;
+    let mut added_or_updated = Vec::new();
+    let mut deleted_hrefs = Vec::new();
+
+    // sync-token lives at the multistatus root.
+    let new_sync_token = doc
+        .descendants()
+        .find(|n| n.has_tag_name("sync-token"))
+        .and_then(|n| n.text())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    for response in doc.descendants().filter(|n| n.has_tag_name("response")) {
+        let Some(href_node) = response.children().find(|n| n.has_tag_name("href")) else {
+            continue;
+        };
+        let Some(href_text) = href_node.text() else { continue };
+        let href_text = href_text.trim();
+        if href_text.is_empty() {
+            continue;
+        }
+        let href = base
+            .join(href_text)
+            .map(|u| u.to_string())
+            .unwrap_or_else(|_| href_text.to_string());
+
+        // Response-level <d:status>HTTP/1.1 404 ...</d:status> means deleted.
+        let response_status = response
+            .children()
+            .find(|n| n.has_tag_name("status"))
+            .and_then(|n| n.text());
+        if let Some(s) = response_status {
+            if s.contains(" 404 ") {
+                deleted_hrefs.push(href);
+                continue;
+            }
+        }
+
+        // Otherwise pull getetag + calendar-data from a 200-status propstat.
+        let mut etag = String::new();
+        let mut ical = String::new();
+        for propstat in response.children().filter(|n| n.has_tag_name("propstat")) {
+            if !propstat_is_ok(&propstat) {
+                continue;
+            }
+            let Some(prop) = propstat.children().find(|n| n.has_tag_name("prop")) else {
+                continue;
+            };
+            for child in prop.children() {
+                if child.has_tag_name("getetag") {
+                    if let Some(t) = child.text() {
+                        etag = t.trim().to_string();
+                    }
+                } else if child.has_tag_name("calendar-data") {
+                    if let Some(t) = child.text() {
+                        ical = t.trim().to_string();
+                    }
+                }
+            }
+        }
+        if ical.is_empty() {
+            // Could be a non-VTODO resource we don't care about. Skip silently.
+            continue;
+        }
+        match parse_vtodos(&ical) {
+            Ok(tasks) => {
+                for task in tasks {
+                    added_or_updated.push(TaskRecord {
+                        href: href.clone(),
+                        etag: etag.clone(),
+                        ical_text: ical.clone(),
+                        task,
+                    });
+                }
+            }
+            Err(e) => eprintln!("retaskable: skipping {href}: {e:#}"),
+        }
+    }
+
+    Ok(SyncDelta {
+        added_or_updated,
+        deleted_hrefs,
+        new_sync_token,
+    })
 }
 
 pub async fn probe(cfg: &NextcloudConfig) -> Result<String> {
@@ -175,43 +334,6 @@ pub async fn discover_calendars(cfg: &NextcloudConfig) -> Result<Vec<Calendar>> 
     );
 
     Ok(calendars)
-}
-
-pub async fn fetch_tasks(
-    client: &Client,
-    calendar_url: &Url,
-    auth: (&str, &str),
-) -> Result<Vec<Task>> {
-    eprintln!("retaskable: REPORT calendar-query {calendar_url}");
-    let resp = dav_request(client, b"REPORT", calendar_url, CALENDAR_QUERY_BODY, "1", auth)
-        .await
-        .context("REPORT calendar-query")?;
-
-    let doc = roxmltree::Document::parse(&resp.body).context("parsing REPORT response XML")?;
-    let mut tasks = Vec::new();
-
-    for response in doc.descendants().filter(|n| n.has_tag_name("response")) {
-        let Some(cal_data_node) = response
-            .descendants()
-            .find(|n| n.has_tag_name("calendar-data"))
-        else {
-            continue;
-        };
-        let Some(ical_text) = cal_data_node.text() else {
-            continue;
-        };
-        let trimmed = ical_text.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        match parse_vtodos(trimmed) {
-            Ok(mut parsed) => tasks.append(&mut parsed),
-            Err(e) => eprintln!("retaskable: skipping a VTODO entry: {e:#}"),
-        }
-    }
-
-    eprintln!("retaskable: parsed {} task(s)", tasks.len());
-    Ok(tasks)
 }
 
 fn parse_vtodos(ical_text: &str) -> Result<Vec<Task>> {

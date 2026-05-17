@@ -16,3 +16,4 @@ anyhow = "1"
 roxmltree = "0.20"
 url = "2"
 icalendar = "0.16"
+rusqlite = { version = "0.32", features = ["bundled"] }

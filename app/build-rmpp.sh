@@ -36,6 +36,13 @@ export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="\
 -C link-arg=-mcpu=cortex-a55+crypto \
 -C link-arg=-mbranch-protection=standard"
 
+# cc-rs (used by build scripts of crates with C dependencies like rusqlite's
+# bundled SQLite) prefers per-target env vars. Point them at the SDK
+# toolchain so any C code cross-compiles against the device sysroot.
+export CC_aarch64_unknown_linux_gnu="${CC}"
+export AR_aarch64_unknown_linux_gnu="${AR}"
+export CFLAGS_aarch64_unknown_linux_gnu="${CFLAGS}"
+
 cd "$SCRIPT_DIR"
 rm -rf output-rmpp
 mkdir -p output-rmpp/backend
