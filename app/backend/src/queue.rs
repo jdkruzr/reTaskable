@@ -6,6 +6,7 @@ use anyhow::Result;
 use reqwest::Client;
 use rusqlite::Connection;
 use url::Url;
+use std::error::Error;
 
 use crate::db::{self, PendingOp};
 
@@ -40,6 +41,80 @@ pub enum ExecOutcome {
     Success { retried: bool },
     Transient(String),
     Terminal(String),
+}
+
+/// Classify a failure from one of the `nextcloud::*` retry helpers into a
+/// transient (retry next Sync) or terminal (give up, mark errored) outcome.
+///
+/// Strategy:
+/// 1. Try to downcast to `reqwest::Error` — connect/timeout failures are
+///    transient regardless of any HTTP status that surfaced upstream.
+/// 2. Inspect the error message for known terminal patterns (auth 4xx,
+///    404, the double-412 strings produced by put_task_with_retry /
+///    delete_task_with_retry / create_task, UID collision).
+/// 3. Inspect the error message for a 5xx server status — transient.
+/// 4. Default to transient. A misclassified transient retries; a
+///    misclassified terminal is the worse failure mode (loses retry
+///    budget), so we bias toward transient when unsure.
+pub(crate) fn classify_error(err: &anyhow::Error) -> ExecOutcome {
+    // 1. reqwest::Error downcast (walks source chain through .with_context()).
+    if let Some(rerr) = err.downcast_ref::<reqwest::Error>() {
+        if rerr.is_connect() || rerr.is_timeout() || rerr.is_request() {
+            return ExecOutcome::Transient(format!("network: {rerr}"));
+        }
+    }
+    // Also check the source chain manually in case anyhow's downcast_ref is
+    // shallow against deeper wraps:
+    let mut source: Option<&dyn Error> = err.source();
+    while let Some(s) = source {
+        if let Some(rerr) = s.downcast_ref::<reqwest::Error>() {
+            if rerr.is_connect() || rerr.is_timeout() || rerr.is_request() {
+                return ExecOutcome::Transient(format!("network: {rerr}"));
+            }
+        }
+        source = s.source();
+    }
+
+    let msg = format!("{err:#}"); // alternate format includes the full context chain
+
+    // 2. Terminal patterns.
+    if msg.contains("412 Precondition Failed twice in a row") {
+        return ExecOutcome::Terminal("double-412 (server-side conflict)".to_string());
+    }
+    if msg.contains("412 on create -- UID collision") {
+        return ExecOutcome::Terminal("UID collision on create".to_string());
+    }
+    if msg.contains("then 404 on refetch") {
+        return ExecOutcome::Terminal("task disappeared during PUT retry".to_string());
+    }
+    // Status-code presence in the message (nextcloud helpers format "-> 401 Unauthorized:"
+    // and similar). We scan for a few well-known terminal codes.
+    if has_status(&msg, 401)
+        || has_status(&msg, 403)
+        || has_status(&msg, 404)
+        || has_status(&msg, 409)
+        || has_status(&msg, 410)
+    {
+        return ExecOutcome::Terminal(msg);
+    }
+
+    // 3. 5xx — transient.
+    for code in 500..=599 {
+        if has_status(&msg, code) {
+            return ExecOutcome::Transient(msg);
+        }
+    }
+
+    // 4. Default: transient.
+    ExecOutcome::Transient(msg)
+}
+
+fn has_status(msg: &str, code: u16) -> bool {
+    // The nextcloud helpers format errors as `"-> 412 Precondition Failed:"` and
+    // similar; we look for the status token bracketed by spaces so we don't
+    // accidentally match a substring of another number.
+    let needle = format!(" {code} ");
+    msg.contains(&needle)
 }
 
 /// Drain the pending_op queue in FIFO order. Returns immediately on the first
@@ -285,5 +360,61 @@ mod tests {
             )
             .unwrap();
         assert_eq!(row, (0, 0));
+    }
+
+    #[test]
+    fn classify_double_412_as_terminal() {
+        let err = anyhow::anyhow!(
+            "412 Precondition Failed twice in a row -- task keeps being modified concurrently"
+        );
+        assert!(matches!(classify_error(&err), ExecOutcome::Terminal(_)));
+    }
+
+    #[test]
+    fn classify_uid_collision_as_terminal() {
+        let err = anyhow::anyhow!(
+            "412 on create -- UID collision (should never happen with v4 UUIDs)"
+        );
+        assert!(matches!(classify_error(&err), ExecOutcome::Terminal(_)));
+    }
+
+    #[test]
+    fn classify_404_as_terminal() {
+        let err = anyhow::anyhow!(
+            "PUT https://example.com/cal/x.ics -> 404 Not Found: <html>nope</html>"
+        );
+        assert!(matches!(classify_error(&err), ExecOutcome::Terminal(_)));
+    }
+
+    #[test]
+    fn classify_401_as_terminal() {
+        let err = anyhow::anyhow!(
+            "PUT https://example.com/cal/x.ics -> 401 Unauthorized: bad creds"
+        );
+        assert!(matches!(classify_error(&err), ExecOutcome::Terminal(_)));
+    }
+
+    #[test]
+    fn classify_500_as_transient() {
+        let err = anyhow::anyhow!(
+            "PUT https://example.com/cal/x.ics -> 500 Internal Server Error: oops"
+        );
+        assert!(matches!(classify_error(&err), ExecOutcome::Transient(_)));
+    }
+
+    #[test]
+    fn classify_503_as_transient() {
+        let err = anyhow::anyhow!(
+            "PUT https://example.com/cal/x.ics -> 503 Service Unavailable: maintenance"
+        );
+        assert!(matches!(classify_error(&err), ExecOutcome::Transient(_)));
+    }
+
+    #[test]
+    fn classify_unknown_as_transient_default() {
+        // Defensive: an unrecognised error must be transient so we don't burn
+        // the op's life on a misclassification.
+        let err = anyhow::anyhow!("something weird happened");
+        assert!(matches!(classify_error(&err), ExecOutcome::Transient(_)));
     }
 }
