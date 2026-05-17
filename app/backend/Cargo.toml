@@ -19,3 +19,6 @@ icalendar = "0.16"
 rusqlite = { version = "0.32", features = ["bundled"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+httpmock = "0.7"
