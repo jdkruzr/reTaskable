@@ -316,6 +316,53 @@ pub fn enqueue_create(
     Ok(op_id)
 }
 
+pub fn enqueue_toggle(
+    conn: &mut Connection,
+    calendar_href: &str,
+    uid: &str,
+) -> Result<i64> {
+    let tx = conn.unchecked_transaction()?;
+
+    // Fetch the cached row's ical_text by (calendar_href, uid).
+    let row: Option<(String, String)> = tx
+        .query_row(
+            "SELECT href, ical_text FROM task \
+             WHERE calendar_href = ?1 AND uid = ?2 AND pending_delete = 0",
+            params![calendar_href, uid],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let (href, ical_text) = row
+        .ok_or_else(|| anyhow::anyhow!("no live task with uid {uid}"))?;
+
+    // Mutate via the existing M5 helper. toggle_completion returns
+    // (new_ical, prior_status, new_status).
+    let (new_ical, _prior, new_status) =
+        crate::nextcloud::toggle_completion(&ical_text)?;
+    let new_status_str = status_to_str(new_status);
+
+    let affected = tx.execute(
+        "UPDATE task SET ical_text = ?1, status = ?2 \
+         WHERE calendar_href = ?3 AND href = ?4",
+        params![new_ical, new_status_str, calendar_href, href],
+    )?;
+    if affected != 1 {
+        return Err(anyhow::anyhow!(
+            "expected exactly 1 task row updated, got {affected}"
+        ));
+    }
+
+    let enqueued_at = unix_secs_now();
+    tx.execute(
+        "INSERT INTO pending_op (op_type, target_uid, target_calendar_href, payload, enqueued_at)
+         VALUES ('toggle', ?1, ?2, NULL, ?3)",
+        params![uid, calendar_href, enqueued_at],
+    )?;
+    let op_id = tx.last_insert_rowid();
+    tx.commit()?;
+    Ok(op_id)
+}
+
 pub fn get_first_task(
     conn: &Connection,
     calendar_href: &str,
@@ -708,5 +755,70 @@ mod tests {
         let rows = list_tasks(&conn, "/cal/").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].summary, "hello");
+    }
+
+    #[test]
+    fn enqueue_toggle_flips_status_and_inserts_op() {
+        let mut conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        conn.execute(
+            "INSERT INTO calendar (href, display_name) VALUES ('/cal/', 'Cal')",
+            [],
+        ).unwrap();
+        let ical = "BEGIN:VCALENDAR\r\n\
+            VERSION:2.0\r\n\
+            BEGIN:VTODO\r\n\
+            UID:uid-t\r\n\
+            DTSTAMP:20260101T000000Z\r\n\
+            SUMMARY:Walk dog\r\n\
+            STATUS:NEEDS-ACTION\r\n\
+            END:VTODO\r\n\
+            END:VCALENDAR\r\n";
+        conn.execute(
+            "INSERT INTO task
+             (calendar_href, href, etag, ical_text, summary, status, due, uid, pending_delete)
+             VALUES ('/cal/', '/cal/t.ics', 'etag-1', ?1, 'Walk dog', 'needs-action', NULL, 'uid-t', 0)",
+            params![ical],
+        ).unwrap();
+
+        let op_id = enqueue_toggle(&mut conn, "/cal/", "uid-t").expect("enqueue");
+        assert!(op_id > 0);
+
+        // Status flipped, ical_text mutated (now contains COMPLETED markers).
+        let (status, new_ical): (String, String) = conn.query_row(
+            "SELECT status, ical_text FROM task WHERE uid = 'uid-t'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert_eq!(status, "completed");
+        assert!(new_ical.contains("STATUS:COMPLETED\r\n"));
+        assert!(new_ical.contains("COMPLETED:"));
+        assert!(new_ical.contains("PERCENT-COMPLETE:100\r\n"));
+
+        // pending_op: toggle, payload NULL.
+        let (op_type, payload): (String, Option<String>) = conn.query_row(
+            "SELECT op_type, payload FROM pending_op WHERE id = ?1",
+            params![op_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert_eq!(op_type, "toggle");
+        assert!(payload.is_none());
+    }
+
+    #[test]
+    fn enqueue_toggle_unknown_uid_leaves_no_pending_op() {
+        // AC2.6: failure to find the cache row rolls back the pending_op insert.
+        let mut conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        conn.execute(
+            "INSERT INTO calendar (href, display_name) VALUES ('/cal/', 'Cal')",
+            [],
+        ).unwrap();
+        let err = enqueue_toggle(&mut conn, "/cal/", "uid-missing");
+        assert!(err.is_err(), "expected error for missing uid");
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pending_op", [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(count, 0, "no orphan pending_op should exist");
     }
 }
