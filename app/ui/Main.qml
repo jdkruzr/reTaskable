@@ -17,7 +17,7 @@ Rectangle {
         applicationID: "us.reticulum.retaskable"
 
         onMessageReceived: (type, contents) => {
-            if (type === 101 || type === 102 || type === 103 || type === 104 || type === 105 || type === 106) {
+            if (type === 101 || type === 102 || type === 103 || type === 104 || type === 105 || type === 106 || type === 107) {
                 responseText.text = contents
             }
         }
@@ -32,7 +32,7 @@ Rectangle {
 
         Text {
             anchors.horizontalCenter: parent.horizontalCenter
-            text: "reTaskable — M5"
+            text: "reTaskable — M6"
             font.pixelSize: 36
             color: "black"
         }
@@ -123,6 +123,37 @@ Rectangle {
                 MouseArea {
                     anchors.fill: parent
                     onClicked: endpoint.sendMessage(6, "")
+                }
+            }
+            Rectangle {
+                id: deleteBtn
+                property bool armed: false
+                width: 280; height: 80
+                color: deleteBtn.armed ? "black" : "white"
+                border.color: "black"; border.width: 3
+                Text {
+                    anchors.centerIn: parent
+                    text: deleteBtn.armed ? "Tap again to confirm" : "Delete First"
+                    font.pixelSize: 20
+                    color: deleteBtn.armed ? "white" : "black"
+                }
+                Timer {
+                    id: deleteArmTimer
+                    interval: 3000
+                    onTriggered: deleteBtn.armed = false
+                }
+                MouseArea {
+                    anchors.fill: parent
+                    onClicked: {
+                        if (deleteBtn.armed) {
+                            deleteBtn.armed = false
+                            deleteArmTimer.stop()
+                            endpoint.sendMessage(7, "")
+                        } else {
+                            deleteBtn.armed = true
+                            deleteArmTimer.restart()
+                        }
+                    }
                 }
             }
         }

@@ -97,7 +97,9 @@ Launch from the AppLoad menu. Tap **Ping**; the text should change to
 - [x] M3: read-only task list
 - [x] M4: SQLite cache + sync-collection
 - [x] M5: toggle complete
-- [ ] M6: full CRUD with 412 handling
-- [ ] M7: offline queue + conflict resolution
-- [ ] M8: polish for v1
-- [ ] M9: companion xovi extension — sidebar tile in xochitl that launches reTaskable via `AppLoadLauncher.launchApplication`
+- [x] M6: 412 auto-retry helper + delete first task
+- [ ] M7: create task (minimal VCALENDAR/VTODO + If-None-Match)
+- [ ] M8: edit summary (reuses retry helper)
+- [ ] M9: offline queue + conflict-aware retry UI
+- [ ] M10: polish for v1
+- [ ] M11: companion xovi extension — sidebar tile in xochitl that launches reTaskable via `AppLoadLauncher.launchApplication`

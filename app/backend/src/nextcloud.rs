@@ -338,13 +338,26 @@ pub async fn discover_calendars(cfg: &NextcloudConfig) -> Result<Vec<Calendar>> 
     Ok(calendars)
 }
 
-pub async fn put_task(
+// M6 write-path types. Kept private to the module; callers go through the
+// `*_with_retry` wrappers and never see these directly.
+enum WriteOutcome {
+    Updated(String /* new etag */),
+    PreconditionFailed,
+}
+
+enum DeleteOutcome {
+    Deleted,
+    NotFound,
+    PreconditionFailed,
+}
+
+async fn put_task_once(
     client: &Client,
     task_url: &Url,
     ical_text: &str,
     if_match_etag: &str,
     auth: (&str, &str),
-) -> Result<String> {
+) -> Result<WriteOutcome> {
     eprintln!("retaskable: PUT {task_url} (if-match {if_match_etag:?})");
     let resp = client
         .put(task_url.clone())
@@ -358,7 +371,7 @@ pub async fn put_task(
 
     let status = resp.status();
     if status == StatusCode::PRECONDITION_FAILED {
-        bail!("412 Precondition Failed -- task was changed elsewhere; tap Sync, then Toggle again");
+        return Ok(WriteOutcome::PreconditionFailed);
     }
 
     let new_etag = resp
@@ -372,7 +385,151 @@ pub async fn put_task(
         bail!("PUT {task_url} -> {status}: {body}");
     }
 
-    new_etag.ok_or_else(|| anyhow!("PUT {task_url} succeeded ({status}) but no ETag in response"))
+    let etag = new_etag
+        .ok_or_else(|| anyhow!("PUT {task_url} succeeded ({status}) but no ETag in response"))?;
+    Ok(WriteOutcome::Updated(etag))
+}
+
+async fn delete_task_once(
+    client: &Client,
+    task_url: &Url,
+    if_match_etag: &str,
+    auth: (&str, &str),
+) -> Result<DeleteOutcome> {
+    eprintln!("retaskable: DELETE {task_url} (if-match {if_match_etag:?})");
+    let resp = client
+        .delete(task_url.clone())
+        .basic_auth(auth.0, Some(auth.1))
+        .header(header::IF_MATCH, if_match_etag)
+        .send()
+        .await
+        .with_context(|| format!("DELETE {task_url}"))?;
+
+    let status = resp.status();
+    if status == StatusCode::PRECONDITION_FAILED {
+        return Ok(DeleteOutcome::PreconditionFailed);
+    }
+    if status == StatusCode::NOT_FOUND || status == StatusCode::GONE {
+        return Ok(DeleteOutcome::NotFound);
+    }
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        bail!("DELETE {task_url} -> {status}: {body}");
+    }
+    Ok(DeleteOutcome::Deleted)
+}
+
+/// GET a task resource. Returns `Some((etag, ical_text))` on 2xx, or `None` if
+/// the server returned 404/410 (resource already gone). Other failures bail.
+/// Body is ensure_crlf'd defensively.
+async fn get_task(
+    client: &Client,
+    task_url: &Url,
+    auth: (&str, &str),
+) -> Result<Option<(String, String)>> {
+    eprintln!("retaskable: GET {task_url} (for retry)");
+    let resp = client
+        .get(task_url.clone())
+        .basic_auth(auth.0, Some(auth.1))
+        .send()
+        .await
+        .with_context(|| format!("GET {task_url}"))?;
+
+    let status = resp.status();
+    if status == StatusCode::NOT_FOUND || status == StatusCode::GONE {
+        return Ok(None);
+    }
+
+    let etag = resp
+        .headers()
+        .get(header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let body = resp
+        .text()
+        .await
+        .with_context(|| format!("reading GET body from {task_url}"))?;
+    if !status.is_success() {
+        bail!("GET {task_url} -> {status}: {body}");
+    }
+    let etag = etag.ok_or_else(|| anyhow!("GET {task_url} succeeded but no ETag in response"))?;
+    Ok(Some((etag, ensure_crlf(&body))))
+}
+
+/// Mutate-and-PUT with one-shot 412 auto-retry.
+///
+/// The closure produces the iCalendar text to PUT. On the first attempt the
+/// closure is fed `cached_ical`. On 412 we refetch the server's current view,
+/// re-run the closure on that fresh text, and PUT once more with the fresh
+/// ETag. A second 412 bails.
+///
+/// Returns `(new_etag, ical_actually_written, retried)` so the caller can
+/// cache the body that actually landed on the server (which on retry differs
+/// from what they passed in).
+pub async fn put_task_with_retry<F>(
+    client: &Client,
+    task_url: &Url,
+    auth: (&str, &str),
+    cached_etag: &str,
+    cached_ical: &str,
+    mutate: F,
+) -> Result<(String, String, bool)>
+where
+    F: Fn(&str) -> Result<String>,
+{
+    let first_ical = mutate(cached_ical).context("computing first-attempt iCalendar body")?;
+    match put_task_once(client, task_url, &first_ical, cached_etag, auth).await? {
+        WriteOutcome::Updated(etag) => Ok((etag, first_ical, false)),
+        WriteOutcome::PreconditionFailed => {
+            eprintln!("retaskable: PUT got 412; refetching and retrying once");
+            let Some((fresh_etag, fresh_ical)) = get_task(client, task_url, auth).await? else {
+                bail!(
+                    "412 on PUT, then 404 on refetch -- task was deleted between attempts. \
+                     Tap Sync to reconcile."
+                );
+            };
+            let retry_ical = mutate(&fresh_ical)
+                .context("reapplying mutation to fresh iCalendar body for 412 retry")?;
+            match put_task_once(client, task_url, &retry_ical, &fresh_etag, auth).await? {
+                WriteOutcome::Updated(etag) => Ok((etag, retry_ical, true)),
+                WriteOutcome::PreconditionFailed => bail!(
+                    "412 Precondition Failed twice in a row -- task keeps being modified \
+                     concurrently. Tap Sync, then try again."
+                ),
+            }
+        }
+    }
+}
+
+/// DELETE with one-shot 412 auto-retry. Returns `retried`.
+///
+/// On 412 we GET the resource just for its current ETag, then DELETE again
+/// with that fresh ETag. 404/410 at any point counts as success since
+/// "already gone" is the desired end state.
+pub async fn delete_task_with_retry(
+    client: &Client,
+    task_url: &Url,
+    auth: (&str, &str),
+    cached_etag: &str,
+) -> Result<bool> {
+    match delete_task_once(client, task_url, cached_etag, auth).await? {
+        DeleteOutcome::Deleted | DeleteOutcome::NotFound => Ok(false),
+        DeleteOutcome::PreconditionFailed => {
+            eprintln!("retaskable: DELETE got 412; refetching etag and retrying once");
+            match get_task(client, task_url, auth).await? {
+                None => Ok(true), // task already gone -- success.
+                Some((fresh_etag, _)) => {
+                    match delete_task_once(client, task_url, &fresh_etag, auth).await? {
+                        DeleteOutcome::Deleted | DeleteOutcome::NotFound => Ok(true),
+                        DeleteOutcome::PreconditionFailed => bail!(
+                            "412 Precondition Failed twice in a row on DELETE -- task keeps \
+                             being modified concurrently. Tap Sync, then try again."
+                        ),
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Pure function: read STATUS from the iCalendar text, decide what the new

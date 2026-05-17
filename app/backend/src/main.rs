@@ -16,12 +16,14 @@ const MSG_LIST_CALENDARS: u32 = 3;
 const MSG_SHOW_TASKS: u32 = 4;
 const MSG_SYNC: u32 = 5;
 const MSG_TOGGLE_FIRST: u32 = 6;
+const MSG_DELETE_FIRST: u32 = 7;
 const MSG_PONG: u32 = 101;
 const MSG_NEXTCLOUD_RESPONSE: u32 = 102;
 const MSG_CALENDARS_RESPONSE: u32 = 103;
 const MSG_TASKS_RESPONSE: u32 = 104;
 const MSG_SYNC_RESPONSE: u32 = 105;
 const MSG_TOGGLE_RESPONSE: u32 = 106;
+const MSG_DELETE_RESPONSE: u32 = 107;
 
 #[tokio::main]
 async fn main() {
@@ -88,6 +90,15 @@ impl AppLoadBackend for Backend {
                 };
                 eprintln!("retaskable: toggle first result:\n{response}");
                 send(replier, MSG_TOGGLE_RESPONSE, &response);
+            }
+            MSG_DELETE_FIRST => {
+                eprintln!("retaskable: delete first task requested");
+                let response = match delete_first(&mut self.db).await {
+                    Ok(s) => s,
+                    Err(e) => format!("error: {e:#}"),
+                };
+                eprintln!("retaskable: delete first result:\n{response}");
+                send(replier, MSG_DELETE_RESPONSE, &response);
             }
             t => eprintln!("retaskable: ignoring unknown msg type {t}"),
         }
@@ -239,7 +250,11 @@ async fn toggle_first(db: &mut Connection) -> anyhow::Result<String> {
         return Ok("no tasks in cache -- tap Sync first.".to_string());
     };
 
-    let (new_ical, old_status, new_status) = nextcloud::toggle_completion(&task.ical_text)?;
+    // Preview the toggle off the cached state so we can report the status
+    // transition in the response. On a 412 retry the retry helper recomputes
+    // this against fresh server state, which may differ -- the response just
+    // reports the cached-state transition with a `(via retry)` suffix.
+    let (_preview_ical, old_status, new_status) = nextcloud::toggle_completion(&task.ical_text)?;
 
     let task_url = url::Url::parse(&task.href)?;
     let client = reqwest::Client::new();
@@ -247,16 +262,60 @@ async fn toggle_first(db: &mut Connection) -> anyhow::Result<String> {
         cfg.nextcloud.username.as_str(),
         cfg.nextcloud.app_password.as_str(),
     );
-    let new_etag = nextcloud::put_task(&client, &task_url, &new_ical, &task.etag, auth).await?;
+    let (new_etag, written_ical, retried) = nextcloud::put_task_with_retry(
+        &client,
+        &task_url,
+        auth,
+        &task.etag,
+        &task.ical_text,
+        |fresh| nextcloud::toggle_completion(fresh).map(|(s, _, _)| s),
+    )
+    .await?;
 
-    // Re-parse so the cache's denormalised fields match the new state.
-    let parsed = nextcloud::parse_vtodos_first(&new_ical)?;
-    db::upsert_task(db, &cal_href, &task.href, &new_etag, &new_ical, &parsed)?;
+    // Cache the body that actually landed on the server (which on retry is the
+    // mutation re-applied to fresh server state, not our cached state).
+    let parsed = nextcloud::parse_vtodos_first(&written_ical)?;
+    db::upsert_task(db, &cal_href, &task.href, &new_etag, &written_ical, &parsed)?;
 
+    let suffix = if retried { " (via retry)" } else { "" };
     Ok(format!(
-        "Toggled \"{}\": {:?} -> {:?} (new etag {})",
-        task.summary, old_status, new_status, new_etag
+        "Toggled \"{}\": {:?} -> {:?} (new etag {}){}",
+        task.summary, old_status, new_status, new_etag, suffix
     ))
+}
+
+async fn delete_first(db: &mut Connection) -> anyhow::Result<String> {
+    let cfg = config::load()?;
+    let wanted = cfg.nextcloud.calendar.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "config is missing `calendar = \"...\"` under [nextcloud]. \
+             Run List Calendars to see options."
+        )
+    })?;
+
+    let Some(cal_href) = db::get_calendar_href_by_display_name(db, wanted)? else {
+        return Ok(format!(
+            "calendar {wanted:?} not yet synced -- tap Sync first."
+        ));
+    };
+
+    let Some(task) = db::get_first_task(db, &cal_href)? else {
+        return Ok("no tasks in cache -- tap Sync first.".to_string());
+    };
+
+    let task_url = url::Url::parse(&task.href)?;
+    let client = reqwest::Client::new();
+    let auth = (
+        cfg.nextcloud.username.as_str(),
+        cfg.nextcloud.app_password.as_str(),
+    );
+    let retried =
+        nextcloud::delete_task_with_retry(&client, &task_url, auth, &task.etag).await?;
+
+    db::delete_task(db, &cal_href, &task.href)?;
+
+    let suffix = if retried { " (via retry)" } else { "" };
+    Ok(format!("Deleted \"{}\"{}", task.summary, suffix))
 }
 
 fn humanize_since(t: SystemTime) -> String {
