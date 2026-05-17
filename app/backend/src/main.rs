@@ -8,8 +8,10 @@ mod nextcloud;
 
 const MSG_PING: u32 = 1;
 const MSG_TEST_NEXTCLOUD: u32 = 2;
+const MSG_LIST_CALENDARS: u32 = 3;
 const MSG_PONG: u32 = 101;
 const MSG_NEXTCLOUD_RESPONSE: u32 = 102;
+const MSG_CALENDARS_RESPONSE: u32 = 103;
 
 #[tokio::main]
 async fn main() {
@@ -38,6 +40,15 @@ impl AppLoadBackend for Backend {
                 eprintln!("retaskable: nextcloud probe result:\n{response}");
                 send(replier, MSG_NEXTCLOUD_RESPONSE, &response);
             }
+            MSG_LIST_CALENDARS => {
+                eprintln!("retaskable: list calendars requested");
+                let response = match list_calendars().await {
+                    Ok(s) => s,
+                    Err(e) => format!("error: {e:#}"),
+                };
+                eprintln!("retaskable: list calendars result:\n{response}");
+                send(replier, MSG_CALENDARS_RESPONSE, &response);
+            }
             t => eprintln!("retaskable: ignoring unknown msg type {t}"),
         }
     }
@@ -46,6 +57,12 @@ impl AppLoadBackend for Backend {
 async fn probe_nextcloud() -> anyhow::Result<String> {
     let cfg = config::load()?;
     nextcloud::probe(&cfg.nextcloud).await
+}
+
+async fn list_calendars() -> anyhow::Result<String> {
+    let cfg = config::load()?;
+    let calendars = nextcloud::discover_calendars(&cfg.nextcloud).await?;
+    Ok(serde_json::to_string_pretty(&calendars)?)
 }
 
 fn send(replier: &BackendReplier<Backend>, msg_type: u32, body: &str) {

@@ -17,7 +17,7 @@ Rectangle {
         applicationID: "us.reticulum.retaskable"
 
         onMessageReceived: (type, contents) => {
-            if (type === 101 || type === 102) {
+            if (type === 101 || type === 102 || type === 103) {
                 responseText.text = contents
             }
         }
@@ -25,60 +25,66 @@ Rectangle {
 
     Column {
         anchors.centerIn: parent
-        spacing: 36
+        spacing: 24
 
         Text {
             anchors.horizontalCenter: parent.horizontalCenter
-            text: "reTaskable — M1"
-            font.pixelSize: 40
+            text: "reTaskable — M2"
+            font.pixelSize: 36
             color: "black"
         }
 
-        Rectangle {
+        Row {
             anchors.horizontalCenter: parent.horizontalCenter
-            width: 360
-            height: 100
-            color: "white"
-            border.color: "black"
-            border.width: 3
+            spacing: 16
 
-            Text {
-                anchors.centerIn: parent
-                text: "Ping"
-                font.pixelSize: 28
-                color: "black"
+            Rectangle {
+                width: 200; height: 80
+                color: "white"; border.color: "black"; border.width: 3
+                Text {
+                    anchors.centerIn: parent
+                    text: "Ping"
+                    font.pixelSize: 24
+                    color: "black"
+                }
+                MouseArea {
+                    anchors.fill: parent
+                    onClicked: endpoint.sendMessage(1, "ping")
+                }
             }
-
-            MouseArea {
-                anchors.fill: parent
-                onClicked: endpoint.sendMessage(1, "ping")
+            Rectangle {
+                width: 240; height: 80
+                color: "white"; border.color: "black"; border.width: 3
+                Text {
+                    anchors.centerIn: parent
+                    text: "Test Nextcloud"
+                    font.pixelSize: 22
+                    color: "black"
+                }
+                MouseArea {
+                    anchors.fill: parent
+                    onClicked: endpoint.sendMessage(2, "")
+                }
+            }
+            Rectangle {
+                width: 240; height: 80
+                color: "white"; border.color: "black"; border.width: 3
+                Text {
+                    anchors.centerIn: parent
+                    text: "List Calendars"
+                    font.pixelSize: 22
+                    color: "black"
+                }
+                MouseArea {
+                    anchors.fill: parent
+                    onClicked: endpoint.sendMessage(3, "")
+                }
             }
         }
 
         Rectangle {
             anchors.horizontalCenter: parent.horizontalCenter
-            width: 360
-            height: 100
-            color: "white"
-            border.color: "black"
-            border.width: 3
-
-            Text {
-                anchors.centerIn: parent
-                text: "Test Nextcloud"
-                font.pixelSize: 28
-                color: "black"
-            }
-
-            MouseArea {
-                anchors.fill: parent
-                onClicked: endpoint.sendMessage(2, "")
-            }
-        }
-
-        Rectangle {
-            anchors.horizontalCenter: parent.horizontalCenter
-            width: 800
+            width: 1000
             height: responseText.implicitHeight + 24
             color: "white"
             border.color: "black"
@@ -90,7 +96,7 @@ Rectangle {
                 anchors.margins: 12
                 wrapMode: Text.Wrap
                 text: "(no response yet)"
-                font.pixelSize: 20
+                font.pixelSize: 18
                 font.family: "monospace"
                 color: "black"
             }
