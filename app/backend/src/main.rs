@@ -163,6 +163,94 @@ fn show_tasks(db: &mut Connection) -> anyhow::Result<String> {
     Ok(format!("{freshness}{}", nextcloud::format_tasks(&tasks)))
 }
 
+/// Build the Sync response string from the queue-flush result and the
+/// sync-collection result. Pure function — no DB or HTTP access — so it's
+/// trivially unit-testable.
+///
+/// Variants:
+/// * Queue empty: returns just the sync-collection line (AC1.1).
+/// * Queue had activity, sync-collection ran: prepends Flushed line (AC1.3).
+/// * Queue hit transient failure: prepends Flushed line, appends
+///   "network failed; sync-collection skipped" (AC1.4). `sync_kind` may be
+///   None in that case.
+fn compose_sync_response(
+    flush: &queue::FlushSummary,
+    sync_kind: Option<&str>,
+    updated: usize,
+    deleted: usize,
+) -> String {
+    let flush_line = if flush.is_empty() {
+        None
+    } else {
+        // "M errored" rolls up newly_errored + cascade_errored; transient
+        // failures are not counted in that total (they remain in the queue).
+        Some(format!(
+            "Flushed {} / {} errored ({} retried).",
+            flush.flushed,
+            flush.newly_errored + flush.cascade_errored,
+            flush.retried,
+        ))
+    };
+
+    let sync_line = match sync_kind {
+        Some(kind) => format!(
+            "Sync complete: {kind}, +{updated} updated, -{deleted} deleted."
+        ),
+        None => "network failed; sync-collection skipped".to_string(),
+    };
+
+    match flush_line {
+        Some(f) => format!("{f}\n{sync_line}"),
+        None => sync_line,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::queue::FlushSummary;
+
+    #[test]
+    fn compose_empty_queue_matches_legacy_format() {
+        // AC1.1
+        let empty = FlushSummary::default();
+        let out = compose_sync_response(&empty, Some("incremental"), 3, 1);
+        assert_eq!(out, "Sync complete: incremental, +3 updated, -1 deleted.");
+        // byte-for-byte: no prefix, no suffix.
+        assert!(!out.contains("Flushed"));
+        assert!(!out.contains("skipped"));
+    }
+
+    #[test]
+    fn compose_flush_then_sync_prepends_flushed_line() {
+        // AC1.3
+        let flush = FlushSummary { flushed: 5, retried: 1, ..Default::default() };
+        let out = compose_sync_response(&flush, Some("incremental"), 0, 0);
+        assert_eq!(out, "Flushed 5 / 0 errored (1 retried).\nSync complete: incremental, +0 updated, -0 deleted.");
+    }
+
+    #[test]
+    fn compose_transient_break_appends_skipped_line() {
+        // AC1.4
+        let flush = FlushSummary { flushed: 2, transient_failed: 1, ..Default::default() };
+        let out = compose_sync_response(&flush, None, 0, 0);
+        assert_eq!(out, "Flushed 2 / 0 errored (0 retried).\nnetwork failed; sync-collection skipped");
+    }
+
+    #[test]
+    fn compose_errored_and_cascade_count_toward_errored_total() {
+        let flush = FlushSummary {
+            flushed: 1,
+            newly_errored: 1,
+            cascade_errored: 2,
+            ..Default::default()
+        };
+        let out = compose_sync_response(&flush, Some("full"), 10, 0);
+        // "M errored" = newly_errored + cascade_errored
+        assert!(out.contains("Flushed 1 / 3 errored (0 retried)."));
+    }
+}
+
 async fn sync(db: &mut Connection) -> anyhow::Result<String> {
     let cfg = config::load()?;
     let wanted = cfg.nextcloud.calendar.as_ref().ok_or_else(|| {
