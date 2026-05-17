@@ -5,6 +5,7 @@ use appload_client::{
 };
 use async_trait::async_trait;
 use rusqlite::Connection;
+use uuid::Uuid;
 
 mod config;
 mod db;
@@ -89,7 +90,7 @@ impl AppLoadBackend for Backend {
             }
             MSG_TOGGLE_FIRST => {
                 eprintln!("retaskable: toggle first task requested");
-                let response = match toggle_first(&mut self.db).await {
+                let response = match toggle_first(&mut self.db) {
                     Ok(s) => s,
                     Err(e) => format!("error: {e:#}"),
                 };
@@ -98,7 +99,7 @@ impl AppLoadBackend for Backend {
             }
             MSG_DELETE_FIRST => {
                 eprintln!("retaskable: delete first task requested");
-                let response = match delete_first(&mut self.db).await {
+                let response = match delete_first(&mut self.db) {
                     Ok(s) => s,
                     Err(e) => format!("error: {e:#}"),
                 };
@@ -107,7 +108,7 @@ impl AppLoadBackend for Backend {
             }
             MSG_CREATE_TASK => {
                 eprintln!("retaskable: create task requested ({} chars)", msg.contents.len());
-                let response = match create(&mut self.db, &msg.contents).await {
+                let response = match create(&mut self.db, &msg.contents) {
                     Ok(s) => s,
                     Err(e) => format!("error: {e:#}"),
                 };
@@ -116,7 +117,7 @@ impl AppLoadBackend for Backend {
             }
             MSG_EDIT_FIRST => {
                 eprintln!("retaskable: edit first task requested ({} chars)", msg.contents.len());
-                let response = match edit_first(&mut self.db, &msg.contents).await {
+                let response = match edit_first(&mut self.db, &msg.contents) {
                     Ok(s) => s,
                     Err(e) => format!("error: {e:#}"),
                 };
@@ -256,7 +257,7 @@ async fn sync(db: &mut Connection) -> anyhow::Result<String> {
     ))
 }
 
-async fn toggle_first(db: &mut Connection) -> anyhow::Result<String> {
+fn toggle_first(db: &mut Connection) -> anyhow::Result<String> {
     let cfg = config::load()?;
     let wanted = cfg.nextcloud.calendar.as_ref().ok_or_else(|| {
         anyhow::anyhow!(
@@ -275,41 +276,20 @@ async fn toggle_first(db: &mut Connection) -> anyhow::Result<String> {
         return Ok("no tasks in cache -- tap Sync first.".to_string());
     };
 
-    // Preview the toggle off the cached state so we can report the status
-    // transition in the response. On a 412 retry the retry helper recomputes
-    // this against fresh server state, which may differ -- the response just
-    // reports the cached-state transition with a `(via retry)` suffix.
-    let (_preview_ical, old_status, new_status) = nextcloud::toggle_completion(&task.ical_text)?;
+    let summary = task.summary.clone();
+    let new_state = if task.status == "completed" {
+        "needs-action"
+    } else {
+        "completed"
+    };
 
-    let task_url = url::Url::parse(&task.href)?;
-    let client = reqwest::Client::new();
-    let auth = (
-        cfg.nextcloud.username.as_str(),
-        cfg.nextcloud.app_password.as_str(),
-    );
-    let (new_etag, written_ical, retried) = nextcloud::put_task_with_retry(
-        &client,
-        &task_url,
-        auth,
-        &task.etag,
-        &task.ical_text,
-        |fresh| nextcloud::toggle_completion(fresh).map(|(s, _, _)| s),
-    )
-    .await?;
-
-    // Cache the body that actually landed on the server (which on retry is the
-    // mutation re-applied to fresh server state, not our cached state).
-    let parsed = nextcloud::parse_vtodos_first(&written_ical)?;
-    db::upsert_task(db, &cal_href, &task.href, &new_etag, &written_ical, &parsed.uid, &parsed)?;
-
-    let suffix = if retried { " (via retry)" } else { "" };
+    let op_id = db::enqueue_toggle(db, &cal_href, &task.uid)?;
     Ok(format!(
-        "Toggled \"{}\": {:?} -> {:?} (new etag {}){}",
-        task.summary, old_status, new_status, new_etag, suffix
+        "Queued: toggle \"{summary}\" -> {new_state} (#{op_id})"
     ))
 }
 
-async fn create(db: &mut Connection, summary: &str) -> anyhow::Result<String> {
+fn create(db: &mut Connection, summary: &str) -> anyhow::Result<String> {
     let summary = summary.trim();
     if summary.is_empty() {
         anyhow::bail!("summary cannot be empty");
@@ -329,25 +309,14 @@ async fn create(db: &mut Connection, summary: &str) -> anyhow::Result<String> {
         ));
     };
 
-    let cal_url = url::Url::parse(&cal_href)?;
-    let client = reqwest::Client::new();
-    let auth = (
-        cfg.nextcloud.username.as_str(),
-        cfg.nextcloud.app_password.as_str(),
-    );
-
-    let (task_url, etag, ical) =
-        nextcloud::create_task(&client, &cal_url, auth, summary).await?;
-
-    let parsed = nextcloud::parse_vtodos_first(&ical)?;
-    db::upsert_task(db, &cal_href, &task_url, &etag, &ical, &parsed.uid, &parsed)?;
-
-    Ok(format!("Created \"{}\" (etag {})", parsed.summary, etag))
+    let uid = Uuid::new_v4().to_string();
+    let op_id = db::enqueue_create(db, &cal_href, &uid, summary)?;
+    Ok(format!("Queued: create \"{summary}\" (#{op_id})"))
 }
 
-async fn edit_first(db: &mut Connection, summary: &str) -> anyhow::Result<String> {
-    let summary = summary.trim();
-    if summary.is_empty() {
+fn edit_first(db: &mut Connection, summary: &str) -> anyhow::Result<String> {
+    let new_summary = summary.trim();
+    if new_summary.is_empty() {
         anyhow::bail!("summary cannot be empty");
     }
 
@@ -370,34 +339,13 @@ async fn edit_first(db: &mut Connection, summary: &str) -> anyhow::Result<String
     };
 
     let old_summary = task.summary.clone();
-
-    let task_url = url::Url::parse(&task.href)?;
-    let client = reqwest::Client::new();
-    let auth = (
-        cfg.nextcloud.username.as_str(),
-        cfg.nextcloud.app_password.as_str(),
-    );
-    let (new_etag, written_ical, retried) = nextcloud::put_task_with_retry(
-        &client,
-        &task_url,
-        auth,
-        &task.etag,
-        &task.ical_text,
-        |fresh| Ok(nextcloud::replace_summary(fresh, summary)),
-    )
-    .await?;
-
-    let parsed = nextcloud::parse_vtodos_first(&written_ical)?;
-    db::upsert_task(db, &cal_href, &task.href, &new_etag, &written_ical, &parsed.uid, &parsed)?;
-
-    let suffix = if retried { " (via retry)" } else { "" };
+    let op_id = db::enqueue_edit(db, &cal_href, &task.uid, new_summary)?;
     Ok(format!(
-        "Edited \"{}\" -> \"{}\" (etag {}){}",
-        old_summary, parsed.summary, new_etag, suffix
+        "Queued: edit \"{old_summary}\" -> \"{new_summary}\" (#{op_id})"
     ))
 }
 
-async fn delete_first(db: &mut Connection) -> anyhow::Result<String> {
+fn delete_first(db: &mut Connection) -> anyhow::Result<String> {
     let cfg = config::load()?;
     let wanted = cfg.nextcloud.calendar.as_ref().ok_or_else(|| {
         anyhow::anyhow!(
@@ -416,19 +364,9 @@ async fn delete_first(db: &mut Connection) -> anyhow::Result<String> {
         return Ok("no tasks in cache -- tap Sync first.".to_string());
     };
 
-    let task_url = url::Url::parse(&task.href)?;
-    let client = reqwest::Client::new();
-    let auth = (
-        cfg.nextcloud.username.as_str(),
-        cfg.nextcloud.app_password.as_str(),
-    );
-    let retried =
-        nextcloud::delete_task_with_retry(&client, &task_url, auth, &task.etag).await?;
-
-    db::delete_task(db, &cal_href, &task.href)?;
-
-    let suffix = if retried { " (via retry)" } else { "" };
-    Ok(format!("Deleted \"{}\"{}", task.summary, suffix))
+    let summary = task.summary.clone();
+    let op_id = db::enqueue_delete(db, &cal_href, &task.uid)?;
+    Ok(format!("Queued: delete \"{summary}\" (#{op_id})"))
 }
 
 fn humanize_since(t: SystemTime) -> String {
