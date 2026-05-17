@@ -30,6 +30,17 @@ pub struct PendingOp {
     pub errored: i64,
 }
 
+#[derive(Debug)]
+pub struct PendingOpView {
+    pub id: i64,
+    pub op_type: String,
+    pub summary: String,           // COALESCE'd; "(unknown)" if no cache row
+    pub enqueued_at: i64,
+    pub error_count: i64,
+    pub last_error: Option<String>,
+    pub errored: i64,
+}
+
 const SCHEMA_V2: &str = "
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
@@ -606,6 +617,83 @@ pub fn list_tasks(conn: &Connection, calendar_href: &str) -> Result<Vec<Task>> {
         });
     }
     Ok(out)
+}
+
+/// Fetch all pending_op rows (errored and not) for display in the Show
+/// Pending response. Joined against task by target_uid for the summary
+/// column.
+pub fn list_pending_ops(conn: &Connection) -> Result<Vec<PendingOpView>> {
+    let mut stmt = conn.prepare(
+        "SELECT p.id, p.op_type, COALESCE(t.summary, '(unknown)'),
+                p.enqueued_at, p.error_count, p.last_error, p.errored
+           FROM pending_op p
+           LEFT JOIN task t
+             ON t.calendar_href = p.target_calendar_href
+            AND t.uid = p.target_uid
+          ORDER BY p.id ASC",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(PendingOpView {
+            id: r.get(0)?,
+            op_type: r.get(1)?,
+            summary: r.get(2)?,
+            enqueued_at: r.get(3)?,
+            error_count: r.get(4)?,
+            last_error: r.get(5)?,
+            errored: r.get(6)?,
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.into())
+}
+
+/// Clear all errored pending_op rows and reset their cache-side effects:
+/// - For errored Deletes, unset `pending_delete = 0` on the corresponding
+///   task rows (so the row becomes live again and sync-collection can
+///   reconcile it).
+/// - For errored Creates, drop the locally-created task rows
+///   (`href LIKE 'pending:%'`) that never reached the server.
+/// - DELETE all `pending_op WHERE errored = 1`.
+///
+/// Returns the number of pending_op rows cleared.
+pub fn clear_errored(conn: &mut Connection) -> Result<usize> {
+    let tx = conn.unchecked_transaction()?;
+
+    // Collect target_uids of errored deletes and creates.
+    let mut delete_uids: Vec<String> = Vec::new();
+    let mut create_uids: Vec<String> = Vec::new();
+    {
+        let mut stmt = tx.prepare(
+            "SELECT target_uid, op_type FROM pending_op \
+             WHERE errored = 1 AND op_type IN ('delete', 'create')",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (uid, op_type) = row?;
+            match op_type.as_str() {
+                "delete" => delete_uids.push(uid),
+                "create" => create_uids.push(uid),
+                _ => {}
+            }
+        }
+    }
+
+    for uid in &delete_uids {
+        tx.execute(
+            "UPDATE task SET pending_delete = 0 WHERE uid = ?1",
+            params![uid],
+        )?;
+    }
+    for uid in &create_uids {
+        tx.execute(
+            "DELETE FROM task WHERE uid = ?1 AND href LIKE 'pending:%'",
+            params![uid],
+        )?;
+    }
+    let cleared = tx.execute("DELETE FROM pending_op WHERE errored = 1", [])?;
+    tx.commit()?;
+    Ok(cleared)
 }
 
 fn status_to_str(s: TaskStatus) -> &'static str {
@@ -1308,5 +1396,94 @@ mod tests {
             "SELECT errored FROM pending_op WHERE target_uid = 'uid-y'", [], |r| r.get(0),
         ).unwrap();
         assert_eq!(y_errored, 0);
+    }
+
+    #[test]
+    fn list_pending_ops_returns_id_ascending_with_summary() {
+        let mut conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        conn.execute(
+            "INSERT INTO calendar (href, display_name) VALUES ('/cal/', 'Cal')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO task (calendar_href, href, etag, ical_text, summary, status, due, uid, pending_delete)
+             VALUES ('/cal/', '/cal/a.ics', '', '', 'Apple', 'needs-action', NULL, 'uid-a', 0),
+                    ('/cal/', '/cal/b.ics', '', '', 'Banana', 'needs-action', NULL, 'uid-b', 0)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO pending_op (op_type, target_uid, target_calendar_href, payload, enqueued_at, errored, error_count, last_error)
+             VALUES ('toggle', 'uid-a', '/cal/', NULL, 100, 0, 0, NULL),
+                    ('edit', 'uid-b', '/cal/', '{\"summary\":\"newb\"}', 101, 1, 1, '404 not found'),
+                    ('toggle', 'uid-missing', '/cal/', NULL, 102, 0, 0, NULL)",
+            [],
+        ).unwrap();
+
+        let ops = list_pending_ops(&conn).unwrap();
+        assert_eq!(ops.len(), 3);
+        assert_eq!(ops[0].summary, "Apple");
+        assert_eq!(ops[1].summary, "Banana");
+        assert_eq!(ops[1].errored, 1);
+        assert_eq!(ops[1].last_error.as_deref(), Some("404 not found"));
+        assert_eq!(ops[2].summary, "(unknown)", "LEFT JOIN fills (unknown)");
+    }
+
+    #[test]
+    fn clear_errored_drops_errored_ops_and_resets_cache_effects() {
+        let mut conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        conn.execute(
+            "INSERT INTO calendar (href, display_name) VALUES ('/cal/', 'Cal')",
+            [],
+        ).unwrap();
+        // Two cache rows: one tombstoned (errored delete will reset it), one
+        // locally-created (errored create will drop it).
+        conn.execute(
+            "INSERT INTO task (calendar_href, href, etag, ical_text, summary, status, due, uid, pending_delete)
+             VALUES ('/cal/', '/cal/keep.ics', 'e', '', 'Keep me', 'needs-action', NULL, 'uid-keep', 1),
+                    ('/cal/', 'pending:uid-new', '', '', 'Locally made', 'needs-action', NULL, 'uid-new', 0)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO pending_op (op_type, target_uid, target_calendar_href, payload, enqueued_at, errored, last_error)
+             VALUES ('delete', 'uid-keep', '/cal/', NULL, 0, 1, '404'),
+                    ('create', 'uid-new', '/cal/', '{\"summary\":\"Locally made\"}', 1, 1, 'auth'),
+                    ('toggle', 'uid-other', '/cal/', NULL, 2, 0, NULL)",
+            [],
+        ).unwrap();
+
+        let cleared = clear_errored(&mut conn).unwrap();
+        assert_eq!(cleared, 2);
+
+        // Tombstoned Keep is restored (pending_delete = 0).
+        let pd: i64 = conn.query_row(
+            "SELECT pending_delete FROM task WHERE uid = 'uid-keep'", [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(pd, 0);
+
+        // Locally-created row dropped.
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM task WHERE uid = 'uid-new'", [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(count, 0);
+
+        // Only the non-errored toggle remains in pending_op.
+        let remaining: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pending_op", [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(remaining, 1);
+        let kind: String = conn.query_row(
+            "SELECT op_type FROM pending_op", [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(kind, "toggle");
+    }
+
+    #[test]
+    fn clear_errored_is_idempotent_on_empty() {
+        let mut conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        let cleared = clear_errored(&mut conn).unwrap();
+        assert_eq!(cleared, 0);
     }
 }
