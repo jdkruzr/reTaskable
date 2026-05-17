@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::nextcloud::{Task, TaskStatus};
+use chrono::Utc;
 
 #[derive(Debug)]
 pub struct CachedTask {
@@ -262,6 +263,57 @@ pub fn delete_tasks_not_in(
     }
     tx.commit()?;
     Ok(deleted)
+}
+
+fn unix_secs_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_secs() as i64
+}
+
+pub fn enqueue_create(
+    conn: &mut Connection,
+    calendar_href: &str,
+    uid: &str,
+    summary: &str,
+) -> Result<i64> {
+    let now_iso = Utc::now()
+        .format("%Y%m%dT%H%M%SZ")
+        .to_string();
+    let escaped = crate::nextcloud::escape_ical_text(summary);
+    let ical_text = format!(
+        "BEGIN:VCALENDAR\r\n\
+         VERSION:2.0\r\n\
+         PRODID:-//reTaskable//EN\r\n\
+         BEGIN:VTODO\r\n\
+         UID:{uid}\r\n\
+         DTSTAMP:{now_iso}\r\n\
+         CREATED:{now_iso}\r\n\
+         LAST-MODIFIED:{now_iso}\r\n\
+         SUMMARY:{escaped}\r\n\
+         STATUS:NEEDS-ACTION\r\n\
+         END:VTODO\r\n\
+         END:VCALENDAR\r\n"
+    );
+    let sentinel_href = format!("pending:{uid}");
+    let payload = serde_json::to_string(&serde_json::json!({ "summary": summary }))?;
+    let enqueued_at = unix_secs_now();
+
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "INSERT INTO task (calendar_href, href, etag, ical_text, summary, status, due, uid, pending_delete)
+         VALUES (?1, ?2, '', ?3, ?4, 'needs-action', NULL, ?5, 0)",
+        params![calendar_href, sentinel_href, ical_text, summary, uid],
+    )?;
+    tx.execute(
+        "INSERT INTO pending_op (op_type, target_uid, target_calendar_href, payload, enqueued_at)
+         VALUES ('create', ?1, ?2, ?3, ?4)",
+        params![uid, calendar_href, payload, enqueued_at],
+    )?;
+    let op_id = tx.last_insert_rowid();
+    tx.commit()?;
+    Ok(op_id)
 }
 
 pub fn get_first_task(
@@ -582,5 +634,79 @@ mod tests {
         let rows = list_tasks(&conn, "/cal/").expect("list");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].summary, "live");
+    }
+
+    #[test]
+    fn enqueue_create_atomically_inserts_task_and_pending_op() {
+        let mut conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        conn.execute(
+            "INSERT INTO calendar (href, display_name) VALUES ('/cal/', 'Cal')",
+            [],
+        )
+        .unwrap();
+
+        let op_id = enqueue_create(&mut conn, "/cal/", "uid-new-1", "Buy milk")
+            .expect("enqueue");
+        assert!(op_id > 0);
+
+        // Task row: sentinel href, empty etag, NEEDS-ACTION, pending_delete=0.
+        let (href, etag, status, summary, uid, pending_delete): (
+            String, String, String, String, String, i64,
+        ) = conn.query_row(
+            "SELECT href, etag, status, summary, uid, pending_delete \
+             FROM task WHERE calendar_href = '/cal/' AND uid = 'uid-new-1'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+        ).unwrap();
+        assert_eq!(href, "pending:uid-new-1");
+        assert_eq!(etag, "");
+        assert_eq!(status, "needs-action");
+        assert_eq!(summary, "Buy milk");
+        assert_eq!(uid, "uid-new-1");
+        assert_eq!(pending_delete, 0);
+
+        // ical_text contains the VTODO with the UID and summary.
+        let ical: String = conn.query_row(
+            "SELECT ical_text FROM task WHERE uid = 'uid-new-1'",
+            [],
+            |r| r.get(0),
+        ).unwrap();
+        assert!(ical.contains("UID:uid-new-1\r\n"));
+        assert!(ical.contains("SUMMARY:Buy milk\r\n"));
+        assert!(ical.contains("STATUS:NEEDS-ACTION\r\n"));
+        assert!(ical.starts_with("BEGIN:VCALENDAR\r\n"));
+        assert!(ical.ends_with("END:VCALENDAR\r\n"));
+
+        // pending_op row: op_type=create, target_uid, JSON payload.
+        let (op_type, target_uid, target_cal, payload, error_count, errored): (
+            String, String, String, String, i64, i64,
+        ) = conn.query_row(
+            "SELECT op_type, target_uid, target_calendar_href, payload, error_count, errored \
+             FROM pending_op WHERE id = ?1",
+            params![op_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+        ).unwrap();
+        assert_eq!(op_type, "create");
+        assert_eq!(target_uid, "uid-new-1");
+        assert_eq!(target_cal, "/cal/");
+        assert_eq!(payload, r#"{"summary":"Buy milk"}"#);
+        assert_eq!(error_count, 0);
+        assert_eq!(errored, 0);
+    }
+
+    #[test]
+    fn enqueue_create_optimistically_visible_in_list_tasks() {
+        let mut conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        conn.execute(
+            "INSERT INTO calendar (href, display_name) VALUES ('/cal/', 'Cal')",
+            [],
+        )
+        .unwrap();
+        enqueue_create(&mut conn, "/cal/", "uid-x", "hello").unwrap();
+        let rows = list_tasks(&conn, "/cal/").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].summary, "hello");
     }
 }
