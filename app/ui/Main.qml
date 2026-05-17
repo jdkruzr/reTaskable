@@ -17,7 +17,7 @@ Rectangle {
         applicationID: "us.reticulum.retaskable"
 
         onMessageReceived: (type, contents) => {
-            if (type === 101) {
+            if (type === 101 || type === 102) {
                 responseText.text = contents
             }
         }
@@ -25,11 +25,11 @@ Rectangle {
 
     Column {
         anchors.centerIn: parent
-        spacing: 48
+        spacing: 36
 
         Text {
             anchors.horizontalCenter: parent.horizontalCenter
-            text: "reTaskable — M0"
+            text: "reTaskable — M1"
             font.pixelSize: 40
             color: "black"
         }
@@ -37,7 +37,7 @@ Rectangle {
         Rectangle {
             anchors.horizontalCenter: parent.horizontalCenter
             width: 360
-            height: 120
+            height: 100
             color: "white"
             border.color: "black"
             border.width: 3
@@ -45,7 +45,7 @@ Rectangle {
             Text {
                 anchors.centerIn: parent
                 text: "Ping"
-                font.pixelSize: 32
+                font.pixelSize: 28
                 color: "black"
             }
 
@@ -55,12 +55,45 @@ Rectangle {
             }
         }
 
-        Text {
-            id: responseText
+        Rectangle {
             anchors.horizontalCenter: parent.horizontalCenter
-            text: "(no response yet)"
-            font.pixelSize: 28
-            color: "black"
+            width: 360
+            height: 100
+            color: "white"
+            border.color: "black"
+            border.width: 3
+
+            Text {
+                anchors.centerIn: parent
+                text: "Test Nextcloud"
+                font.pixelSize: 28
+                color: "black"
+            }
+
+            MouseArea {
+                anchors.fill: parent
+                onClicked: endpoint.sendMessage(2, "")
+            }
+        }
+
+        Rectangle {
+            anchors.horizontalCenter: parent.horizontalCenter
+            width: 800
+            height: responseText.implicitHeight + 24
+            color: "white"
+            border.color: "black"
+            border.width: 1
+
+            Text {
+                id: responseText
+                anchors.fill: parent
+                anchors.margins: 12
+                wrapMode: Text.Wrap
+                text: "(no response yet)"
+                font.pixelSize: 20
+                font.family: "monospace"
+                color: "black"
+            }
         }
     }
 }

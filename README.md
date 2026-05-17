@@ -31,6 +31,26 @@ reTaskable/
   the `aarch64-remarkable-linux-gcc` linker)
 - For on-device install: an RMPPM with xovi + AppLoad already installed
 
+## Configure
+
+Starting with M1, the backend reads CalDAV credentials from a TOML config
+file. **The file is not in this repo** — you create it locally on each
+host that runs reTaskable.
+
+`~/.config/retaskable/config.toml` (resolves to
+`/home/root/.config/retaskable/config.toml` on the device):
+
+```toml
+[nextcloud]
+base_url     = "https://nextcloud.example.com"
+username     = "yourname"
+app_password = "xxx-xxx-xxx-xxx-xxx"
+```
+
+Generate the app-password in Nextcloud under *Settings → Security → Devices &
+sessions → Create new app password*. Use HTTPS only — Basic auth over plain
+HTTP would leak the password.
+
 ## Build
 
 ```bash

@@ -3,8 +3,13 @@ use appload_client::{
 };
 use async_trait::async_trait;
 
+mod config;
+mod nextcloud;
+
 const MSG_PING: u32 = 1;
+const MSG_TEST_NEXTCLOUD: u32 = 2;
 const MSG_PONG: u32 = 101;
+const MSG_NEXTCLOUD_RESPONSE: u32 = 102;
 
 #[tokio::main]
 async fn main() {
@@ -22,11 +27,29 @@ impl AppLoadBackend for Backend {
             }
             MSG_PING => {
                 eprintln!("retaskable: ping received ({:?})", msg.contents);
-                if let Err(e) = replier.send_message(MSG_PONG, "pong from reTaskable") {
-                    eprintln!("retaskable: send failed: {e}");
-                }
+                send(replier, MSG_PONG, "pong from reTaskable");
+            }
+            MSG_TEST_NEXTCLOUD => {
+                eprintln!("retaskable: nextcloud probe requested");
+                let response = match probe_nextcloud().await {
+                    Ok(s) => s,
+                    Err(e) => format!("error: {e:#}"),
+                };
+                eprintln!("retaskable: nextcloud probe result:\n{response}");
+                send(replier, MSG_NEXTCLOUD_RESPONSE, &response);
             }
             t => eprintln!("retaskable: ignoring unknown msg type {t}"),
         }
+    }
+}
+
+async fn probe_nextcloud() -> anyhow::Result<String> {
+    let cfg = config::load()?;
+    nextcloud::probe(&cfg.nextcloud).await
+}
+
+fn send(replier: &BackendReplier<Backend>, msg_type: u32, body: &str) {
+    if let Err(e) = replier.send_message(msg_type, body) {
+        eprintln!("retaskable: send (type={msg_type}) failed: {e}");
     }
 }
