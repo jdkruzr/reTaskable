@@ -210,19 +210,21 @@ pub fn upsert_task(
     task_href: &str,
     etag: &str,
     ical_text: &str,
+    uid: &str,
     parsed: &Task,
 ) -> Result<()> {
     let status = status_to_str(parsed.status);
     conn.execute(
-        "INSERT INTO task (calendar_href, href, etag, ical_text, summary, status, due)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "INSERT INTO task (calendar_href, href, etag, ical_text, summary, status, due, uid, pending_delete)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)
          ON CONFLICT(calendar_href, href) DO UPDATE SET
             etag = excluded.etag,
             ical_text = excluded.ical_text,
             summary = excluded.summary,
             status = excluded.status,
-            due = excluded.due",
-        params![calendar_href, task_href, etag, ical_text, parsed.summary, status, parsed.due],
+            due = excluded.due,
+            uid = excluded.uid",
+        params![calendar_href, task_href, etag, ical_text, parsed.summary, status, parsed.due, uid],
     )?;
     Ok(())
 }
@@ -301,7 +303,7 @@ pub fn list_tasks(conn: &Connection, calendar_href: &str) -> Result<Vec<Task>> {
     // SQLite gives us here -- so Show Tasks's first row and get_first_task's
     // first row come from the same total ordering.
     let mut stmt = conn.prepare(
-        "SELECT summary, status, due FROM task WHERE calendar_href = ?1 \
+        "SELECT uid, summary, status, due FROM task WHERE calendar_href = ?1 \
          ORDER BY \
            CASE WHEN status = 'completed' THEN 1 ELSE 0 END, \
            CASE WHEN due IS NULL THEN 1 ELSE 0 END, \
@@ -309,15 +311,17 @@ pub fn list_tasks(conn: &Connection, calendar_href: &str) -> Result<Vec<Task>> {
            href",
     )?;
     let rows = stmt.query_map(params![calendar_href], |row| {
-        let summary: String = row.get(0)?;
-        let status_str: Option<String> = row.get(1)?;
-        let due: Option<String> = row.get(2)?;
-        Ok((summary, status_str, due))
+        let uid: String = row.get(0)?;
+        let summary: String = row.get(1)?;
+        let status_str: Option<String> = row.get(2)?;
+        let due: Option<String> = row.get(3)?;
+        Ok((uid, summary, status_str, due))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (summary, status_str, due) = row?;
+        let (uid, summary, status_str, due) = row?;
         out.push(Task {
+            uid,
             summary,
             status: status_from_str(status_str.as_deref()),
             due,
@@ -482,5 +486,78 @@ mod tests {
             )
             .unwrap();
         assert_eq!(token, "tok-xyz", "second migrate should be a no-op");
+    }
+
+    #[test]
+    fn upsert_task_stores_uid_and_roundtrips() {
+        use crate::nextcloud::{Task, TaskStatus};
+
+        let conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        // calendar row required because task is keyed by calendar_href even without FKs
+        conn.execute(
+            "INSERT INTO calendar (href, display_name, sync_token, last_synced_at)
+             VALUES ('/cal/', 'Tasks', NULL, NULL)",
+            [],
+        )
+        .unwrap();
+
+        let parsed = Task {
+            uid: "task-uid-1@retaskable".into(),
+            summary: "hello".into(),
+            status: TaskStatus::NeedsAction,
+            due: None,
+        };
+
+        upsert_task(
+            &conn,
+            "/cal/",
+            "/cal/task-1.ics",
+            "etag-1",
+            "BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:task-uid-1@retaskable\r\nSUMMARY:hello\r\nEND:VTODO\r\nEND:VCALENDAR\r\n",
+            &parsed.uid,
+            &parsed,
+        )
+        .expect("insert");
+
+        let (stored_uid, pending_delete): (String, i64) = conn
+            .query_row(
+                "SELECT uid, pending_delete FROM task WHERE calendar_href = '/cal/'
+                 AND href = '/cal/task-1.ics'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored_uid, "task-uid-1@retaskable");
+        assert_eq!(pending_delete, 0);
+
+        // Upsert again with a new summary (different etag) and confirm the row updated.
+        let parsed2 = Task {
+            uid: "task-uid-1@retaskable".into(),
+            summary: "hello again".into(),
+            status: TaskStatus::Completed,
+            due: None,
+        };
+        upsert_task(
+            &conn,
+            "/cal/",
+            "/cal/task-1.ics",
+            "etag-2",
+            "BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:task-uid-1@retaskable\r\nSUMMARY:hello again\r\nSTATUS:COMPLETED\r\nEND:VTODO\r\nEND:VCALENDAR\r\n",
+            &parsed2.uid,
+            &parsed2,
+        )
+        .expect("upsert");
+
+        let (etag, summary): (String, Option<String>) = conn
+            .query_row(
+                "SELECT etag, summary FROM task WHERE calendar_href = '/cal/'
+                 AND href = '/cal/task-1.ics'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(etag, "etag-2");
+        assert_eq!(summary.as_deref(), Some("hello again"));
     }
 }

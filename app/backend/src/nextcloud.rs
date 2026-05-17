@@ -25,6 +25,7 @@ pub enum TaskStatus {
 
 #[derive(Debug, Serialize, Clone)]
 pub struct Task {
+    pub uid: String,
     pub summary: String,
     pub status: TaskStatus,
     pub due: Option<String>,
@@ -807,6 +808,10 @@ fn parse_vtodos(ical_text: &str) -> Result<Vec<Task>> {
         let CalendarComponent::Todo(todo) = component else {
             continue;
         };
+        let uid = todo
+            .property_value("UID")
+            .unwrap_or("")
+            .to_string();
         let summary = todo
             .property_value("SUMMARY")
             .unwrap_or("(no summary)")
@@ -816,7 +821,7 @@ fn parse_vtodos(ical_text: &str) -> Result<Vec<Task>> {
             .map(parse_status)
             .unwrap_or(TaskStatus::Unknown);
         let due = todo.property_value("DUE").map(|s| s.to_string());
-        out.push(Task { summary, status, due });
+        out.push(Task { uid, summary, status, due });
     }
     Ok(out)
 }

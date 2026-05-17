@@ -216,6 +216,7 @@ async fn sync(db: &mut Connection) -> anyhow::Result<String> {
                 &record.href,
                 &record.etag,
                 &record.ical_text,
+                &record.task.uid,
                 &record.task,
             )?;
             updated += 1;
@@ -229,6 +230,7 @@ async fn sync(db: &mut Connection) -> anyhow::Result<String> {
                 &record.href,
                 &record.etag,
                 &record.ical_text,
+                &record.task.uid,
                 &record.task,
             )?;
             updated += 1;
@@ -297,7 +299,7 @@ async fn toggle_first(db: &mut Connection) -> anyhow::Result<String> {
     // Cache the body that actually landed on the server (which on retry is the
     // mutation re-applied to fresh server state, not our cached state).
     let parsed = nextcloud::parse_vtodos_first(&written_ical)?;
-    db::upsert_task(db, &cal_href, &task.href, &new_etag, &written_ical, &parsed)?;
+    db::upsert_task(db, &cal_href, &task.href, &new_etag, &written_ical, &parsed.uid, &parsed)?;
 
     let suffix = if retried { " (via retry)" } else { "" };
     Ok(format!(
@@ -337,7 +339,7 @@ async fn create(db: &mut Connection, summary: &str) -> anyhow::Result<String> {
         nextcloud::create_task(&client, &cal_url, auth, summary).await?;
 
     let parsed = nextcloud::parse_vtodos_first(&ical)?;
-    db::upsert_task(db, &cal_href, &task_url, &etag, &ical, &parsed)?;
+    db::upsert_task(db, &cal_href, &task_url, &etag, &ical, &parsed.uid, &parsed)?;
 
     Ok(format!("Created \"{}\" (etag {})", parsed.summary, etag))
 }
@@ -385,7 +387,7 @@ async fn edit_first(db: &mut Connection, summary: &str) -> anyhow::Result<String
     .await?;
 
     let parsed = nextcloud::parse_vtodos_first(&written_ical)?;
-    db::upsert_task(db, &cal_href, &task.href, &new_etag, &written_ical, &parsed)?;
+    db::upsert_task(db, &cal_href, &task.href, &new_etag, &written_ical, &parsed.uid, &parsed)?;
 
     let suffix = if retried { " (via retry)" } else { "" };
     Ok(format!(
