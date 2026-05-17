@@ -517,6 +517,27 @@ pub fn cascade_uid(
     Ok(affected)
 }
 
+/// Increment a pending_op row's error_count and stamp last_error. Returns
+/// the post-increment value so the caller can detect the 5-strike threshold.
+/// Takes a `&Transaction` so it composes with apply_outcome's tx.
+pub fn bump_error_count_tx(
+    tx: &rusqlite::Transaction,
+    id: i64,
+    msg: &str,
+) -> Result<i64> {
+    tx.execute(
+        "UPDATE pending_op SET error_count = error_count + 1, last_error = ?1 \
+         WHERE id = ?2",
+        params![msg, id],
+    )?;
+    let count: i64 = tx.query_row(
+        "SELECT error_count FROM pending_op WHERE id = ?1",
+        params![id],
+        |r| r.get(0),
+    )?;
+    Ok(count)
+}
+
 pub fn get_first_task(
     conn: &Connection,
     calendar_href: &str,

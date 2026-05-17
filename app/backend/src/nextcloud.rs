@@ -599,6 +599,42 @@ pub async fn create_task(
     }
 }
 
+/// Create a new VTODO with a pre-determined UID (for queue-based creates).
+/// Uses `If-None-Match: *` like `create_task`, but accepts a pre-built
+/// `task_url`, `uid`, and `summary` instead of minting a new UUID.
+///
+/// Returns `(etag, ical_text)` on success.
+pub async fn put_task_create_with_uid(
+    client: &Client,
+    task_url: &Url,
+    auth: (&str, &str),
+    uid: &str,
+    summary: &str,
+) -> Result<(String, String)> {
+    let now = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let escaped_summary = escape_ical_text(summary);
+    let ical_text = format!(
+        "BEGIN:VCALENDAR\r\n\
+         VERSION:2.0\r\n\
+         PRODID:-//reTaskable//EN\r\n\
+         BEGIN:VTODO\r\n\
+         UID:{uid}\r\n\
+         DTSTAMP:{now}\r\n\
+         CREATED:{now}\r\n\
+         LAST-MODIFIED:{now}\r\n\
+         SUMMARY:{escaped_summary}\r\n\
+         STATUS:NEEDS-ACTION\r\n\
+         END:VTODO\r\n\
+         END:VCALENDAR\r\n"
+    );
+    match put_task_create_once(client, task_url, &ical_text, auth).await? {
+        WriteOutcome::Updated(etag) => Ok((etag, ical_text)),
+        WriteOutcome::PreconditionFailed => bail!(
+            "412 on create -- UID collision (should never happen with v4 UUIDs). Tap Create again."
+        ),
+    }
+}
+
 /// DELETE with one-shot 412 auto-retry. Returns `retried`.
 ///
 /// On 412 we GET the resource just for its current ETag, then DELETE again

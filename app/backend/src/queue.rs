@@ -4,7 +4,7 @@
 
 use anyhow::Result;
 use reqwest::Client;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use url::Url;
 use std::error::Error;
 
@@ -38,8 +38,28 @@ impl FlushSummary {
 /// into the `Transient` / `Terminal` variants.
 #[derive(Debug)]
 pub enum ExecOutcome {
-    Success { retried: bool },
+    /// Server confirmed a create. Cache row's sentinel href + empty etag is
+    /// replaced with the server's resource URL and the real etag.
+    SuccessCreate {
+        task_url: String,
+        etag: String,
+        ical_text: String,
+    },
+    /// Server confirmed an edit or toggle. Cache row's etag + ical_text are
+    /// refreshed with the server-canonical values.
+    SuccessUpdate {
+        new_etag: String,
+        new_ical: String,
+        retried: bool,
+    },
+    /// Server confirmed a delete. Cache row is removed entirely.
+    SuccessDelete {
+        retried: bool,
+    },
+    /// Recoverable (network / 5xx). Mid-drain break; op stays queued.
     Transient(String),
+    /// Unrecoverable (auth / 404 / double-412 / UID collision). Op flips
+    /// errored = 1; sibling ops on the same uid cascade.
     Terminal(String),
 }
 
@@ -130,7 +150,8 @@ pub async fn flush_pending(
 ) -> Result<FlushSummary> {
     let mut summary = FlushSummary::default();
     while let Some(op) = db::fetch_next_drainable(conn)? {
-        let outcome = dispatch_op(http, auth, calendar_url, &op).await;
+        // Borrow conn immutably for dispatch_op, then re-borrow mutably for apply_outcome.
+        let outcome = dispatch_op(conn, http, auth, calendar_url, &op).await;
         let cont = apply_outcome(conn, &op, outcome, &mut summary)?;
         if !cont {
             break;
@@ -139,21 +160,212 @@ pub async fn flush_pending(
     Ok(summary)
 }
 
-/// Phase 3 stub: every op type returns Success. Phase 4 replaces each arm
-/// with real HTTP calls into `crate::nextcloud::*`.
 async fn dispatch_op(
-    _http: &Client,
-    _auth: (&str, &str),
-    _calendar_url: &Url,
+    conn: &Connection,
+    http: &Client,
+    auth: (&str, &str),
+    calendar_url: &Url,
     op: &PendingOp,
 ) -> ExecOutcome {
     match op.op_type.as_str() {
-        "create" | "toggle" | "edit" | "delete" => {
-            eprintln!("retaskable: queue: stub-dispatch op #{} ({})", op.id, op.op_type);
-            ExecOutcome::Success { retried: false }
-        }
+        "create" => dispatch_create(http, auth, calendar_url, op).await,
+        "toggle" => dispatch_toggle(conn, http, auth, calendar_url, op).await,
+        "edit" => dispatch_edit(conn, http, auth, calendar_url, op).await,
+        "delete" => dispatch_delete(conn, http, auth, calendar_url, op).await,
         other => ExecOutcome::Terminal(format!("unknown op_type: {other}")),
     }
+}
+
+async fn dispatch_create(
+    http: &Client,
+    auth: (&str, &str),
+    calendar_url: &Url,
+    op: &PendingOp,
+) -> ExecOutcome {
+    // Recover summary from the JSON payload. Fallback to "(no summary)" if
+    // the payload is malformed (defensive — should never happen, since
+    // enqueue_create writes valid JSON).
+    let summary = op
+        .payload
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .and_then(|v| v.get("summary").and_then(|s| s.as_str()).map(String::from))
+        .unwrap_or_else(|| "(no summary)".to_string());
+
+    // Reconstruct the task URL the way nextcloud::create_task would (caller
+    // doesn't pass a URL because create-time it didn't exist yet). Reuse the
+    // same UID minted at enqueue time so the server-side resource matches
+    // the cached row's uid column.
+    match build_create_url(calendar_url, &op.target_uid) {
+        Ok(task_url) => match crate::nextcloud::put_task_create_with_uid(
+            http, &task_url, auth, &op.target_uid, &summary,
+        )
+        .await
+        {
+            Ok((etag, ical_text)) => ExecOutcome::SuccessCreate {
+                task_url: task_url.to_string(),
+                etag,
+                ical_text,
+            },
+            Err(err) => classify_error(&err),
+        },
+        Err(err) => ExecOutcome::Terminal(format!("invalid calendar URL: {err}")),
+    }
+}
+
+fn build_create_url(calendar_url: &Url, uid: &str) -> Result<Url> {
+    let mut base = calendar_url.clone();
+    if !base.path().ends_with('/') {
+        base.set_path(&format!("{}/", base.path()));
+    }
+    base.join(&format!("{uid}.ics")).map_err(|e| e.into())
+}
+
+async fn dispatch_toggle(
+    conn: &Connection,
+    http: &Client,
+    auth: (&str, &str),
+    calendar_url: &Url,
+    op: &PendingOp,
+) -> ExecOutcome {
+    let cached = match fetch_cached_for_dispatch(conn, &op.target_calendar_href, &op.target_uid) {
+        Ok(opt) => opt,
+        Err(err) => return ExecOutcome::Terminal(format!("db: {err}")),
+    };
+    let Some((href, cached_etag, cached_ical)) = cached else {
+        // Cache row disappeared — sibling op or external race. Treat as
+        // terminal so the queue is cleaned up.
+        return ExecOutcome::Terminal("cache row missing for toggle".to_string());
+    };
+
+    let task_url = match build_task_url(calendar_url, &href) {
+        Ok(u) => u,
+        Err(err) => return ExecOutcome::Terminal(format!("invalid task URL: {err}")),
+    };
+
+    match crate::nextcloud::put_task_with_retry(
+        http,
+        &task_url,
+        auth,
+        &cached_etag,
+        &cached_ical,
+        |ical| Ok(crate::nextcloud::toggle_completion(ical).map(|(s, _, _)| s)?),
+    )
+    .await
+    {
+        Ok((new_etag, new_ical, retried)) => ExecOutcome::SuccessUpdate {
+            new_etag,
+            new_ical,
+            retried,
+        },
+        Err(err) => classify_error(&err),
+    }
+}
+
+async fn dispatch_edit(
+    conn: &Connection,
+    http: &Client,
+    auth: (&str, &str),
+    calendar_url: &Url,
+    op: &PendingOp,
+) -> ExecOutcome {
+    let new_summary = op
+        .payload
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .and_then(|v| v.get("summary").and_then(|s| s.as_str()).map(String::from));
+    let Some(new_summary) = new_summary else {
+        return ExecOutcome::Terminal("edit op missing summary payload".to_string());
+    };
+
+    let cached = match fetch_cached_for_dispatch(conn, &op.target_calendar_href, &op.target_uid) {
+        Ok(opt) => opt,
+        Err(err) => return ExecOutcome::Terminal(format!("db: {err}")),
+    };
+    let Some((href, cached_etag, cached_ical)) = cached else {
+        return ExecOutcome::Terminal("cache row missing for edit".to_string());
+    };
+
+    let task_url = match build_task_url(calendar_url, &href) {
+        Ok(u) => u,
+        Err(err) => return ExecOutcome::Terminal(format!("invalid task URL: {err}")),
+    };
+
+    let new_summary_for_closure = new_summary.clone();
+    match crate::nextcloud::put_task_with_retry(
+        http,
+        &task_url,
+        auth,
+        &cached_etag,
+        &cached_ical,
+        move |ical| Ok(crate::nextcloud::replace_summary(ical, &new_summary_for_closure)),
+    )
+    .await
+    {
+        Ok((new_etag, new_ical, retried)) => ExecOutcome::SuccessUpdate {
+            new_etag,
+            new_ical,
+            retried,
+        },
+        Err(err) => classify_error(&err),
+    }
+}
+
+async fn dispatch_delete(
+    conn: &Connection,
+    http: &Client,
+    auth: (&str, &str),
+    calendar_url: &Url,
+    op: &PendingOp,
+) -> ExecOutcome {
+    let cached = match fetch_cached_for_dispatch(conn, &op.target_calendar_href, &op.target_uid) {
+        Ok(opt) => opt,
+        Err(err) => return ExecOutcome::Terminal(format!("db: {err}")),
+    };
+    let Some((href, cached_etag, _cached_ical)) = cached else {
+        // Already gone — server may have lost track; let queue proceed.
+        return ExecOutcome::SuccessDelete { retried: false };
+    };
+
+    let task_url = match build_task_url(calendar_url, &href) {
+        Ok(u) => u,
+        Err(err) => return ExecOutcome::Terminal(format!("invalid task URL: {err}")),
+    };
+
+    match crate::nextcloud::delete_task_with_retry(http, &task_url, auth, &cached_etag).await {
+        Ok(retried) => ExecOutcome::SuccessDelete { retried },
+        Err(err) => classify_error(&err),
+    }
+}
+
+/// Helper: pull (href, etag, ical_text) for a task by (calendar_href, uid).
+/// Returns Ok(None) if the row is not in the cache. Does NOT filter on
+/// pending_delete (the queue runner must operate on tombstoned rows too —
+/// Delete arm wants them).
+fn fetch_cached_for_dispatch(
+    conn: &Connection,
+    calendar_href: &str,
+    uid: &str,
+) -> Result<Option<(String, String, String)>> {
+    let row: Option<(String, String, String)> = conn
+        .query_row(
+            "SELECT href, etag, ical_text FROM task \
+             WHERE calendar_href = ?1 AND uid = ?2",
+            rusqlite::params![calendar_href, uid],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    Ok(row)
+}
+
+fn build_task_url(calendar_url: &Url, href: &str) -> Result<Url> {
+    // Calendar URLs are absolute origins; href is the server-relative path
+    // (sync-collection writes `href` as the full path component, e.g.,
+    // "/remote.php/dav/calendars/user/Tasks/abc.ics"). Reconstruct by setting
+    // the path directly on a cloned base.
+    let mut url = calendar_url.clone();
+    url.set_path(href);
+    Ok(url)
 }
 
 /// Apply a dispatch outcome to the DB. Returns Ok(true) to continue draining,
@@ -164,31 +376,87 @@ fn apply_outcome(
     outcome: ExecOutcome,
     summary: &mut FlushSummary,
 ) -> Result<bool> {
+    use ExecOutcome::*;
     match outcome {
-        ExecOutcome::Success { retried } => {
-            // Phase 3: no cache write needed (stub). Phase 4 will wrap the
-            // cache write + this DELETE in a single tx via apply_outcome's
-            // caller. For now, just remove the op row.
-            db::delete_pending_op(conn, op.id)?;
+        SuccessCreate { task_url, etag, ical_text } => {
+            let tx = conn.unchecked_transaction()?;
+            // Replace the sentinel row with the real href + etag.
+            tx.execute(
+                "UPDATE task SET href = ?1, etag = ?2, ical_text = ?3 \
+                 WHERE calendar_href = ?4 AND uid = ?5",
+                rusqlite::params![task_url, etag, ical_text, op.target_calendar_href, op.target_uid],
+            )?;
+            tx.execute("DELETE FROM pending_op WHERE id = ?1", rusqlite::params![op.id])?;
+            tx.commit()?;
+            summary.flushed += 1;
+            eprintln!("retaskable: queue: flushed create #{} -> {task_url}", op.id);
+            Ok(true)
+        }
+        SuccessUpdate { new_etag, new_ical, retried } => {
+            let tx = conn.unchecked_transaction()?;
+            // The cached row was optimistically updated at enqueue time; here
+            // we replace etag + ical_text with the server-canonical version
+            // by uid (not href, since href is stable for edit/toggle).
+            tx.execute(
+                "UPDATE task SET etag = ?1, ical_text = ?2 \
+                 WHERE calendar_href = ?3 AND uid = ?4",
+                rusqlite::params![new_etag, new_ical, op.target_calendar_href, op.target_uid],
+            )?;
+            tx.execute("DELETE FROM pending_op WHERE id = ?1", rusqlite::params![op.id])?;
+            tx.commit()?;
             summary.flushed += 1;
             if retried {
                 summary.retried += 1;
             }
-            eprintln!("retaskable: queue: flushed op #{} ({})", op.id, op.op_type);
+            eprintln!("retaskable: queue: flushed {} #{} (retried={retried})", op.op_type, op.id);
             Ok(true)
         }
-        ExecOutcome::Transient(msg) => {
-            // Phase 3 never produces Transient (stub always succeeds). Phase 4
-            // will implement: bump error_count; on 5th strike, mark errored
-            // and cascade; mid-drain break either way.
-            eprintln!("retaskable: queue: transient #{} ({}): {msg}", op.id, op.op_type);
-            summary.transient_failed += 1;
-            Ok(false)
+        SuccessDelete { retried } => {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
+                "DELETE FROM task WHERE calendar_href = ?1 AND uid = ?2",
+                rusqlite::params![op.target_calendar_href, op.target_uid],
+            )?;
+            tx.execute("DELETE FROM pending_op WHERE id = ?1", rusqlite::params![op.id])?;
+            tx.commit()?;
+            summary.flushed += 1;
+            if retried {
+                summary.retried += 1;
+            }
+            eprintln!("retaskable: queue: flushed delete #{}", op.id);
+            Ok(true)
         }
-        ExecOutcome::Terminal(msg) => {
-            // Mark this op errored, then cascade to siblings on the same uid.
-            db::mark_op_errored(conn, op.id, &msg)?;
-            let cascaded = db::cascade_uid(conn, &op.target_uid, &op.op_type)?;
+        Transient(msg) => {
+            let tx = conn.unchecked_transaction()?;
+            let new_count = db::bump_error_count_tx(&tx, op.id, &msg)?;
+            if new_count >= 5 {
+                // Five-strike promotion.
+                tx.execute(
+                    "UPDATE pending_op SET errored = 1 WHERE id = ?1",
+                    rusqlite::params![op.id],
+                )?;
+                let cascaded = cascade_uid_tx(&tx, &op.target_uid, &op.op_type)?;
+                summary.newly_errored += 1;
+                summary.cascade_errored += cascaded;
+                eprintln!(
+                    "retaskable: queue: 5-strike #{} ({}) -> errored; cascaded {cascaded}",
+                    op.id, op.op_type
+                );
+            } else {
+                summary.transient_failed += 1;
+                eprintln!("retaskable: queue: transient #{} ({}): {msg}", op.id, op.op_type);
+            }
+            tx.commit()?;
+            Ok(false) // mid-drain break per AC1.4
+        }
+        Terminal(msg) => {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
+                "UPDATE pending_op SET errored = 1, last_error = ?1 WHERE id = ?2",
+                rusqlite::params![msg, op.id],
+            )?;
+            let cascaded = cascade_uid_tx(&tx, &op.target_uid, &op.op_type)?;
+            tx.commit()?;
             summary.newly_errored += 1;
             summary.cascade_errored += cascaded;
             eprintln!(
@@ -198,6 +466,20 @@ fn apply_outcome(
             Ok(true)
         }
     }
+}
+
+fn cascade_uid_tx(
+    tx: &rusqlite::Transaction,
+    target_uid: &str,
+    blocking_op_type: &str,
+) -> Result<usize> {
+    let msg = format!("blocked by failed {blocking_op_type}");
+    let affected = tx.execute(
+        "UPDATE pending_op SET errored = 1, last_error = ?1 \
+         WHERE target_uid = ?2 AND errored = 0",
+        rusqlite::params![msg, target_uid],
+    )?;
+    Ok(affected)
 }
 
 #[cfg(test)]
@@ -237,51 +519,45 @@ mod tests {
         assert_eq!(summary.flushed, 0);
     }
 
-    #[tokio::test]
-    async fn flush_pending_drains_in_fifo_with_stub_dispatch() {
-        let mut conn = fresh();
-        seed_op(&conn, "create", "uid-1");
-        seed_op(&conn, "toggle", "uid-2");
-        seed_op(&conn, "edit", "uid-3");
-        let http = reqwest::Client::new();
-        let url: Url = "http://example.invalid/cal/".parse().unwrap();
-        let summary = flush_pending(&mut conn, &http, ("u", "p"), &url)
-            .await
-            .unwrap();
-        // All three drained.
-        assert_eq!(summary.flushed, 3);
-        assert_eq!(summary.retried, 0);
-        let remaining: i64 = conn
-            .query_row("SELECT COUNT(*) FROM pending_op", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(remaining, 0);
-    }
 
     #[test]
-    fn apply_outcome_success_with_retry_increments_retried() {
-        // AC3.2: retried=true flows through to FlushSummary.retried.
+    fn apply_outcome_success_update_with_retry_increments_retried() {
         let mut conn = fresh();
-        seed_op(&conn, "toggle", "uid-x");
+        // Seed a real task row so the UPDATE in SuccessUpdate's tx affects one row.
+        conn.execute(
+            "INSERT INTO task (calendar_href, href, etag, ical_text, summary, status, due, uid, pending_delete)
+             VALUES ('/cal/', '/cal/t.ics', 'old-etag', 'old-ical', 's', 'needs-action', NULL, 'uid-x', 0)",
+            [],
+        ).unwrap();
+        seed_op(&conn, "edit", "uid-x");
         let op = db::fetch_next_drainable(&conn).unwrap().unwrap();
         let mut summary = FlushSummary::default();
         let cont = apply_outcome(
             &mut conn,
             &op,
-            ExecOutcome::Success { retried: true },
+            ExecOutcome::SuccessUpdate {
+                new_etag: "new-etag".into(),
+                new_ical: "new-ical".into(),
+                retried: true,
+            },
             &mut summary,
-        )
-        .unwrap();
+        ).unwrap();
         assert!(cont);
         assert_eq!(summary.flushed, 1);
         assert_eq!(summary.retried, 1);
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM pending_op WHERE id = ?1",
-                rusqlite::params![op.id],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(count, 0, "AC3.1: op DELETEd on success");
+        // pending_op gone.
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pending_op WHERE id = ?1",
+            rusqlite::params![op.id], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(count, 0);
+        // Cache row updated.
+        let (etag, ical): (String, String) = conn.query_row(
+            "SELECT etag, ical_text FROM task WHERE uid = 'uid-x'",
+            [], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert_eq!(etag, "new-etag");
+        assert_eq!(ical, "new-ical");
     }
 
     #[test]
@@ -350,8 +626,7 @@ mod tests {
         assert_eq!(summary.transient_failed, 1);
         assert_eq!(summary.newly_errored, 0);
         assert_eq!(summary.cascade_errored, 0);
-        // The transient op is still in the queue, still errored=0 (Phase 4 will
-        // do the bump-error-count + 5-strike promotion; Phase 3 just leaves it).
+        // The transient op's error_count is bumped to 1, still errored=0.
         let row: (i64, i64) = conn
             .query_row(
                 "SELECT error_count, errored FROM pending_op WHERE id = ?1",
@@ -359,7 +634,12 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(row, (0, 0));
+        assert_eq!(row, (1, 0), "first transient strike increments error_count");
+        // Both ops remain in the queue (drain broke, uid-b was never fetched).
+        let total: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pending_op", [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(total, 2, "both ops still in queue");
     }
 
     #[test]
