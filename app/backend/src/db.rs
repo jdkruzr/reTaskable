@@ -407,6 +407,35 @@ pub fn enqueue_edit(
     Ok(op_id)
 }
 
+pub fn enqueue_delete(
+    conn: &mut Connection,
+    calendar_href: &str,
+    uid: &str,
+) -> Result<i64> {
+    let tx = conn.unchecked_transaction()?;
+
+    let affected = tx.execute(
+        "UPDATE task SET pending_delete = 1 \
+         WHERE calendar_href = ?1 AND uid = ?2 AND pending_delete = 0",
+        params![calendar_href, uid],
+    )?;
+    if affected != 1 {
+        return Err(anyhow::anyhow!(
+            "no live task with uid {uid} (already deleted or missing)"
+        ));
+    }
+
+    let enqueued_at = unix_secs_now();
+    tx.execute(
+        "INSERT INTO pending_op (op_type, target_uid, target_calendar_href, payload, enqueued_at)
+         VALUES ('delete', ?1, ?2, NULL, ?3)",
+        params![uid, calendar_href, enqueued_at],
+    )?;
+    let op_id = tx.last_insert_rowid();
+    tx.commit()?;
+    Ok(op_id)
+}
+
 pub fn get_first_task(
     conn: &Connection,
     calendar_href: &str,
@@ -955,5 +984,82 @@ mod tests {
             "SELECT COUNT(*) FROM pending_op", [], |r| r.get(0),
         ).unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn enqueue_delete_tombstones_row_and_hides_from_list() {
+        let mut conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        conn.execute(
+            "INSERT INTO calendar (href, display_name) VALUES ('/cal/', 'Cal')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO task
+             (calendar_href, href, etag, ical_text, summary, status, due, uid, pending_delete)
+             VALUES ('/cal/', '/cal/d.ics', 'etag', '', 'Doomed', 'needs-action', NULL, 'uid-d', 0)",
+            [],
+        ).unwrap();
+
+        let op_id = enqueue_delete(&mut conn, "/cal/", "uid-d").unwrap();
+        assert!(op_id > 0);
+
+        let pending_delete: i64 = conn.query_row(
+            "SELECT pending_delete FROM task WHERE uid = 'uid-d'", [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(pending_delete, 1);
+
+        // Task disappears from the displayed list.
+        let rows = list_tasks(&conn, "/cal/").unwrap();
+        assert!(rows.is_empty(), "tombstoned task must not appear in list_tasks");
+
+        let (op_type, payload): (String, Option<String>) = conn.query_row(
+            "SELECT op_type, payload FROM pending_op WHERE id = ?1",
+            params![op_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert_eq!(op_type, "delete");
+        assert!(payload.is_none());
+    }
+
+    #[test]
+    fn enqueue_delete_unknown_uid_rolls_back() {
+        let mut conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        conn.execute(
+            "INSERT INTO calendar (href, display_name) VALUES ('/cal/', 'Cal')",
+            [],
+        ).unwrap();
+        let err = enqueue_delete(&mut conn, "/cal/", "uid-nope");
+        assert!(err.is_err());
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pending_op", [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn enqueue_delete_twice_returns_error_second_time() {
+        let mut conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        conn.execute(
+            "INSERT INTO calendar (href, display_name) VALUES ('/cal/', 'Cal')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO task
+             (calendar_href, href, etag, ical_text, summary, status, due, uid, pending_delete)
+             VALUES ('/cal/', '/cal/d.ics', '', '', 's', 'needs-action', NULL, 'uid-dup', 0)",
+            [],
+        ).unwrap();
+        enqueue_delete(&mut conn, "/cal/", "uid-dup").unwrap();
+        let again = enqueue_delete(&mut conn, "/cal/", "uid-dup");
+        assert!(again.is_err());
+        // Only one delete op exists.
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pending_op WHERE target_uid = 'uid-dup'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(count, 1);
     }
 }
