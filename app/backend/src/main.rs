@@ -41,7 +41,7 @@ struct Backend {
     db: Connection,
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl AppLoadBackend for Backend {
     async fn handle_message(&mut self, replier: &BackendReplier<Self>, msg: Message) {
         match msg.msg_type {
@@ -283,15 +283,9 @@ async fn sync(db: &mut Connection) -> anyhow::Result<String> {
     );
 
     // --- Phase 1: drain the queue ---
-    // Use block_in_place to allow the async flush_pending call to work with
-    // non-Send Connection in the handle_message context.
-    let flush = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(
-            queue::flush_pending(db, &client, auth, &calendar_url)
-        )
-    })?;
+    let flush = queue::flush_pending(db, &client, auth, &calendar_url).await?;
 
-    // If a transient failure broke the drain, skip sync-collection and report.
+    // Phase 4 invariant: flush_pending stops at the first transient, so this is 0 or 1.
     if flush.transient_failed > 0 {
         return Ok(compose_sync_response(&flush, None, 0, 0));
     }

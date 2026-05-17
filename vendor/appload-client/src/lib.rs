@@ -44,7 +44,7 @@ impl <T: AppLoadBackend> BackendReplier<T> {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 pub trait AppLoadBackend {
     async fn handle_message(&mut self, functionality: &BackendReplier<Self>, message: Message);
 }
