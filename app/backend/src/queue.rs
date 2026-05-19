@@ -767,6 +767,75 @@ mod tests {
         assert_eq!(etag, "etag-v2");
     }
 
+    #[tokio::test]
+    async fn dispatch_toggle_sends_cached_post_mutation_body_not_re_mutated() {
+        // Regression test: the M9a queue runner's cached ical_text is the
+        // POST-mutation state (Phase 2's enqueue_toggle ran toggle_completion
+        // and stored the toggled body in task.ical_text). put_task_with_retry
+        // must send that cached body as-is on the first attempt; re-applying
+        // the mutator at the wrong moment double-toggles a toggle back to its
+        // original state, silently corrupting the user's intent.
+        //
+        // Production symptom (rMPP 2026-05-17): tap Toggle First on a
+        // needs-action task; cache flips to completed; tap Sync; server-side
+        // reflection of the task reverts to needs-action because the PUT body
+        // had been re-toggled before being sent.
+        use httpmock::prelude::*;
+        use rusqlite::params;
+
+        let server = MockServer::start_async().await;
+        let task_path = "/cal/toggle.ics";
+        let put_mock = server
+            .mock_async(|when, then| {
+                when.method(PUT)
+                    .path(task_path)
+                    .header("If-Match", "etag-cached")
+                    .body_contains("STATUS:COMPLETED");
+                then.status(204).header("ETag", "etag-fresh");
+            })
+            .await;
+
+        let mut conn = fresh();
+        let calendar_url: Url = format!("{}/cal/", server.base_url()).parse().unwrap();
+        let absolute_href = format!("{}{}", server.base_url(), task_path);
+        let cal_href = format!("{}/cal/", server.base_url());
+
+        // Cached ical_text reflects the post-enqueue_toggle state:
+        // original server state was STATUS:NEEDS-ACTION; toggle flipped it.
+        let cached_ical = "BEGIN:VCALENDAR\r\n\
+                           VERSION:2.0\r\n\
+                           BEGIN:VTODO\r\n\
+                           UID:uid-toggle-test\r\n\
+                           SUMMARY:Test toggle\r\n\
+                           STATUS:COMPLETED\r\n\
+                           PERCENT-COMPLETE:100\r\n\
+                           COMPLETED:20260518T000000Z\r\n\
+                           DTSTAMP:20260518T000000Z\r\n\
+                           END:VTODO\r\n\
+                           END:VCALENDAR\r\n";
+        conn.execute(
+            "INSERT INTO task (calendar_href, href, etag, ical_text, summary, status, due, uid, pending_delete)
+             VALUES (?1, ?2, 'etag-cached', ?3, 'Test toggle', 'completed', NULL, 'uid-toggle-test', 0)",
+            params![cal_href, absolute_href, cached_ical],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO pending_op (op_type, target_uid, target_calendar_href, payload, enqueued_at)
+             VALUES ('toggle', 'uid-toggle-test', ?1, NULL, 0)",
+            params![cal_href],
+        ).unwrap();
+
+        let http = reqwest::Client::new();
+        let summary = flush_pending(&mut conn, &http, ("u", "p"), &calendar_url)
+            .await
+            .expect("flush");
+
+        assert_eq!(summary.flushed, 1, "toggle must flush successfully");
+        // The body_contains("STATUS:COMPLETED") mock match is the assertion:
+        // under the bug, the body has STATUS:NEEDS-ACTION (double-toggled) and
+        // this assert_async panics with "expected to be called 1 time, was 0".
+        put_mock.assert_async().await;
+    }
+
     #[test]
     fn classify_double_412_as_terminal() {
         let err = anyhow::anyhow!(
@@ -1028,15 +1097,15 @@ mod tests {
             .await
             .expect("flush");
 
-        assert_eq!(summary.newly_errored, 1);
-        assert_eq!(summary.cascade_errored, 1);
         // Terminal does NOT break the drain (AC1.4 only applies to transient);
-        // uid-y's op should still get attempted. Since the mock returns 404 for
-        // ANY path matching /cal/x.ics but not /cal/y.ics, we need a separate mock
-        // for /cal/y.ics; let's verify uid-y was attempted by checking it's still
-        // queued (no mock match for it → connect succeeded but no response config
-        // → in httpmock this defaults to 404 too). For the strict-cascade assert,
-        // we focus on uid-x: 1 errored + 1 cascade = 2 rows now errored on uid-x.
+        // uid-y's op gets attempted after the uid-x cascade. The mock matches
+        // only /cal/x.ics → 404; the unmocked PUT to /cal/y.ics also returns
+        // httpmock's default 404. Both classify Terminal, so:
+        //   #1 edit uid-x       → terminal (newly_errored += 1)
+        //   #2 toggle uid-x     → cascaded by #1 (cascade_errored += 1)
+        //   #3 toggle uid-y     → terminal (newly_errored += 1, no siblings)
+        assert_eq!(summary.newly_errored, 2);
+        assert_eq!(summary.cascade_errored, 1);
         let errored_on_x: i64 = conn.query_row(
             "SELECT COUNT(*) FROM pending_op WHERE target_uid = 'uid-x' AND errored = 1",
             [], |r| r.get(0),

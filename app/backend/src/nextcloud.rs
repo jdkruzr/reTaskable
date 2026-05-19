@@ -458,16 +458,23 @@ async fn get_task(
     Ok(Some((etag, ensure_crlf(&body))))
 }
 
-/// Mutate-and-PUT with one-shot 412 auto-retry.
+/// PUT `cached_ical` with one-shot 412 auto-retry.
 ///
-/// The closure produces the iCalendar text to PUT. On the first attempt the
-/// closure is fed `cached_ical`. On 412 we refetch the server's current view,
-/// re-run the closure on that fresh text, and PUT once more with the fresh
-/// ETag. A second 412 bails.
+/// First attempt: PUT `cached_ical` directly with `If-Match: cached_etag`.
+/// The caller is responsible for having already applied any desired mutation
+/// to `cached_ical` before calling this (e.g. M9a's `enqueue_*` helpers store
+/// the post-mutation body in the cache; the queue runner then ships that body
+/// here unchanged). On 412, we refetch the server's current view, run the
+/// closure on that fresh text to re-derive the desired body, and PUT once
+/// more with the fresh ETag. A second 412 bails.
+///
+/// The `mutate` closure exists only for the 412 retry path. It must be able
+/// to derive the desired body given the server's current state — for toggle
+/// that's `toggle_completion`; for edit that's `replace_summary(_, new)`.
 ///
 /// Returns `(new_etag, ical_actually_written, retried)` so the caller can
 /// cache the body that actually landed on the server (which on retry differs
-/// from what they passed in).
+/// from `cached_ical`).
 pub async fn put_task_with_retry<F>(
     client: &Client,
     task_url: &Url,
@@ -479,9 +486,8 @@ pub async fn put_task_with_retry<F>(
 where
     F: Fn(&str) -> Result<String>,
 {
-    let first_ical = mutate(cached_ical).context("computing first-attempt iCalendar body")?;
-    match put_task_once(client, task_url, &first_ical, cached_etag, auth).await? {
-        WriteOutcome::Updated(etag) => Ok((etag, first_ical, false)),
+    match put_task_once(client, task_url, cached_ical, cached_etag, auth).await? {
+        WriteOutcome::Updated(etag) => Ok((etag, cached_ical.to_string(), false)),
         WriteOutcome::PreconditionFailed => {
             eprintln!("retaskable: PUT got 412; refetching and retrying once");
             let Some((fresh_etag, fresh_ical)) = get_task(client, task_url, auth).await? else {
