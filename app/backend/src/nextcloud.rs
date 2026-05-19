@@ -803,9 +803,15 @@ pub fn replace_summary(ical_text: &str, new_summary: &str) -> String {
 /// iCalendar (RFC 5545) requires CRLF line terminators. roxmltree normalises
 /// to LF per the XML 1.0 spec, so calendar-data extracted from XML loses its
 /// CRs and some parsers + folding code paths trip on the result. This restores
-/// CRLF whether the input has none, LF-only, or already-CRLF endings.
+/// CRLF whether the input has none, LF-only, already-CRLF, or -- the case that
+/// surfaced on M9b hardware -- ends with a trailing bare CR (Nextcloud's GET
+/// response for a fresh task can end `END:VCALENDAR\r` with no LF, and the
+/// icalendar crate then can't close the VCALENDAR block).
+///
+/// Strategy: collapse CRLF pairs to LF first, then convert any orphan CRs
+/// to LF, then expand all LFs to CRLF. Idempotent on already-CRLF input.
 pub fn ensure_crlf(s: &str) -> String {
-    s.replace("\r\n", "\n").replace('\n', "\r\n")
+    s.replace("\r\n", "\n").replace('\r', "\n").replace('\n', "\r\n")
 }
 
 /// Escape a text value for inclusion in an iCalendar property (RFC 5545
@@ -1072,6 +1078,42 @@ mod tests {
         let input = "BEGIN:VCALENDAR\r\nVERSION:2.0\nPRODID:foo\r\n";
         let out = ensure_crlf(input);
         assert_eq!(out, "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:foo\r\n");
+    }
+
+    #[test]
+    fn ensure_crlf_handles_trailing_bare_cr() {
+        // Discovered on rMPP hardware (2026-05-19): Nextcloud's PUT-then-GET
+        // for a fresh task returns the body with a trailing bare CR (no LF
+        // after END:VCALENDAR). The icalendar crate's parser then can't
+        // close the VCALENDAR block and produces zero components.
+        // ensure_crlf must repair that.
+        let input = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nEND:VCALENDAR\r";
+        let out = ensure_crlf(input);
+        assert_eq!(out, "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nEND:VCALENDAR\r\n");
+    }
+
+    #[test]
+    fn ensure_crlf_normalizes_classic_mac_cr_line_endings() {
+        // While we're here: be defensive against bare-CR line endings in
+        // the middle of a body too (no real client emits these, but the
+        // normalization is free).
+        let input = "BEGIN:VCALENDAR\rVERSION:2.0\rEND:VCALENDAR\r";
+        let out = ensure_crlf(input);
+        assert_eq!(out, "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nEND:VCALENDAR\r\n");
+    }
+
+    #[test]
+    fn parse_vtodos_first_works_against_trailing_bare_cr_body() {
+        // End-to-end: ensure_crlf -> parse_vtodos_first happy path with
+        // the same body shape Nextcloud emits on GET.
+        let body = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//test//EN\r\n\
+                    BEGIN:VTODO\r\nUID:uid-x\r\nDTSTAMP:20260101T000000Z\r\n\
+                    SUMMARY:Hello\r\nSTATUS:NEEDS-ACTION\r\n\
+                    END:VTODO\r\nEND:VCALENDAR\r";
+        let repaired = ensure_crlf(body);
+        let task = super::parse_vtodos_first(&repaired).expect("parses");
+        assert_eq!(task.uid, "uid-x");
+        assert_eq!(task.summary, "Hello");
     }
 
     #[tokio::test]
