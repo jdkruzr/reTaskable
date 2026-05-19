@@ -778,6 +778,178 @@ mod tests {
         assert_eq!(errored, 1);
     }
 
+    // --- M9b Phase 4: apply_take_theirs_inner ---
+
+    #[tokio::test]
+    async fn apply_take_theirs_inner_overwrites_cache_with_server_state() {
+        use httpmock::prelude::*;
+        use rusqlite::params;
+        let server = MockServer::start_async().await;
+        // Server has a different summary AND completion than cache.
+        let server_ical = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n\
+                           BEGIN:VTODO\r\nUID:uid-walk\r\n\
+                           SUMMARY:Walk the dog (server's version)\r\n\
+                           STATUS:COMPLETED\r\nDTSTAMP:20260518T120000Z\r\n\
+                           END:VTODO\r\nEND:VCALENDAR\r\n";
+        let _get = server
+            .mock_async(|when, then| {
+                when.method(GET).path("/cal/walk.ics");
+                then.status(200).header("ETag", "\"etag-fresh\"").body(server_ical);
+            })
+            .await;
+
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        db::ensure_schema_v2(&conn).unwrap();
+        let cal_href = format!("{}/cal/", server.base_url());
+        let absolute_href = format!("{}/cal/walk.ics", server.base_url());
+        // Local intent (cache): different summary, NEEDS-ACTION.
+        let cached_ical = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n\
+                           BEGIN:VTODO\r\nUID:uid-walk\r\nSUMMARY:Walk the dog (local)\r\n\
+                           STATUS:NEEDS-ACTION\r\nDTSTAMP:20260518T100000Z\r\n\
+                           END:VTODO\r\nEND:VCALENDAR\r\n";
+        conn.execute(
+            "INSERT INTO task (calendar_href, href, etag, ical_text, summary, status, due, uid, pending_delete)
+             VALUES (?1, ?2, 'etag-stale', ?3, 'Walk the dog (local)', 'needs-action', NULL, 'uid-walk', 0)",
+            params![cal_href, absolute_href, cached_ical],
+        ).unwrap();
+        // Parent edit errored, plus one cascaded toggle.
+        conn.execute(
+            "INSERT INTO pending_op (op_type, target_uid, target_calendar_href, payload,
+                                     enqueued_at, errored, last_error)
+             VALUES ('edit',   'uid-walk', ?1, '{\"summary\":\"local\"}', 100, 1, 'double-412 (server-side conflict)'),
+                    ('toggle', 'uid-walk', ?1, NULL, 101, 1, 'blocked by failed edit')",
+            params![cal_href],
+        ).unwrap();
+
+        let calendar_url: url::Url = cal_href.parse().unwrap();
+        let client = reqwest::Client::new();
+        let out = apply_take_theirs_inner(&mut conn, &client, ("u", "p"), &calendar_url, 1)
+            .await
+            .expect("ok");
+
+        assert!(out.contains("Took server version"), "got: {out}");
+        assert!(out.contains("Walk the dog (server's version)"));
+        assert!(out.contains("completed"));
+        assert!(out.contains("1 cascaded"));
+
+        // Cache row replaced with server state.
+        let (summary, status, etag): (String, String, String) = conn.query_row(
+            "SELECT summary, status, etag FROM task WHERE uid = 'uid-walk'",
+            [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).unwrap();
+        assert_eq!(summary, "Walk the dog (server's version)");
+        assert_eq!(status, "completed");
+        assert_eq!(etag, "\"etag-fresh\"");
+        // Both pending_op rows gone.
+        let remaining: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pending_op", [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(remaining, 0);
+    }
+
+    #[tokio::test]
+    async fn apply_take_theirs_inner_server_404_deletes_local_cache_row() {
+        use httpmock::prelude::*;
+        use rusqlite::params;
+        let server = MockServer::start_async().await;
+        let _get = server
+            .mock_async(|when, then| {
+                when.method(GET).path("/cal/gone.ics");
+                then.status(404);
+            })
+            .await;
+
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        db::ensure_schema_v2(&conn).unwrap();
+        let cal_href = format!("{}/cal/", server.base_url());
+        let absolute_href = format!("{}/cal/gone.ics", server.base_url());
+        let cached_ical = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n\
+                           BEGIN:VTODO\r\nUID:uid-g\r\nSUMMARY:G\r\n\
+                           STATUS:NEEDS-ACTION\r\nDTSTAMP:20260518T100000Z\r\n\
+                           END:VTODO\r\nEND:VCALENDAR\r\n";
+        conn.execute(
+            "INSERT INTO task (calendar_href, href, etag, ical_text, summary, status, due, uid, pending_delete)
+             VALUES (?1, ?2, 'etag-stale', ?3, 'G', 'needs-action', NULL, 'uid-g', 0)",
+            params![cal_href, absolute_href, cached_ical],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO pending_op (op_type, target_uid, target_calendar_href, payload,
+                                     enqueued_at, errored, last_error)
+             VALUES ('edit', 'uid-g', ?1, '{\"summary\":\"x\"}', 100, 1, 'double-412 (server-side conflict)')",
+            params![cal_href],
+        ).unwrap();
+
+        let calendar_url: url::Url = cal_href.parse().unwrap();
+        let client = reqwest::Client::new();
+        let out = apply_take_theirs_inner(&mut conn, &client, ("u", "p"), &calendar_url, 1)
+            .await
+            .expect("ok");
+
+        assert!(
+            out.contains("deleted server-side") && out.contains("Local row removed"),
+            "got: {out}"
+        );
+        // Cache row gone.
+        let cache_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM task WHERE uid = 'uid-g'", [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(cache_count, 0);
+        // Op gone.
+        let op_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pending_op WHERE id = 1", [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(op_count, 0);
+    }
+
+    #[tokio::test]
+    async fn apply_decision_dispatches_take_branch() {
+        // End-to-end: parse "take:1" payload through parse_decision_payload
+        // and verify the Take branch is reached (proven by hitting the GET
+        // mock). Phase 3 had the dispatcher bailing on Take; Phase 4 must
+        // route it through.
+        use httpmock::prelude::*;
+        use rusqlite::params;
+        let server = MockServer::start_async().await;
+        let server_ical = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n\
+                           BEGIN:VTODO\r\nUID:uid-d\r\nSUMMARY:S\r\n\
+                           STATUS:COMPLETED\r\nDTSTAMP:20260518T120000Z\r\n\
+                           END:VTODO\r\nEND:VCALENDAR\r\n";
+        let get_mock = server
+            .mock_async(|when, then| {
+                when.method(GET).path("/cal/d.ics");
+                then.status(200).header("ETag", "\"e\"").body(server_ical);
+            })
+            .await;
+
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        db::ensure_schema_v2(&conn).unwrap();
+        let cal_href = format!("{}/cal/", server.base_url());
+        let absolute_href = format!("{}/cal/d.ics", server.base_url());
+        let cached_ical = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n\
+                           BEGIN:VTODO\r\nUID:uid-d\r\nSUMMARY:Local\r\n\
+                           STATUS:NEEDS-ACTION\r\nDTSTAMP:20260518T100000Z\r\n\
+                           END:VTODO\r\nEND:VCALENDAR\r\n";
+        conn.execute(
+            "INSERT INTO task (calendar_href, href, etag, ical_text, summary, status, due, uid, pending_delete)
+             VALUES (?1, ?2, 'e-stale', ?3, 'Local', 'needs-action', NULL, 'uid-d', 0)",
+            params![cal_href, absolute_href, cached_ical],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO pending_op (op_type, target_uid, target_calendar_href, payload,
+                                     enqueued_at, errored, last_error)
+             VALUES ('edit', 'uid-d', ?1, '{\"summary\":\"Local\"}', 100, 1, 'double-412 (server-side conflict)')",
+            params![cal_href],
+        ).unwrap();
+
+        let calendar_url: url::Url = cal_href.parse().unwrap();
+        let client = reqwest::Client::new();
+        let out = apply_decision_inner(&mut conn, &client, ("u", "p"), &calendar_url, "take:1")
+            .await
+            .expect("ok");
+        get_mock.assert_async().await;
+        assert!(out.contains("Took server version"), "got: {out}");
+    }
+
     #[tokio::test]
     async fn resolve_first_conflict_inner_handles_server_404() {
         use httpmock::prelude::*;
@@ -1127,11 +1299,10 @@ fn parse_decision_payload(payload: &str) -> anyhow::Result<(DecisionKind, i64)> 
     Ok((decision, id))
 }
 
-/// MSG_CONFLICT_DECISION handler. Parses payload, then dispatches to
-/// Keep Mine (Phase 3) or Take Theirs (Phase 4).
+/// MSG_CONFLICT_DECISION handler. Config-loading wrapper around
+/// `apply_decision_inner`; mirrors the resolve_first_conflict shape so
+/// the inner is testable with an injected http mock.
 async fn apply_decision(db: &mut Connection, payload: &str) -> anyhow::Result<String> {
-    let (kind, op_id) = parse_decision_payload(payload)?;
-
     let cfg = config::load()?;
     let wanted = cfg.nextcloud.calendar.as_ref().ok_or_else(|| {
         anyhow::anyhow!(
@@ -1150,14 +1321,25 @@ async fn apply_decision(db: &mut Connection, payload: &str) -> anyhow::Result<St
         cfg.nextcloud.username.as_str(),
         cfg.nextcloud.app_password.as_str(),
     );
+    apply_decision_inner(db, &client, auth, &calendar_url, payload).await
+}
 
+/// Parses the MSG 13 payload, then dispatches to Keep Mine or Take Theirs.
+/// Testable in isolation (no `config::load()`).
+async fn apply_decision_inner(
+    db: &mut Connection,
+    client: &reqwest::Client,
+    auth: (&str, &str),
+    calendar_url: &url::Url,
+    payload: &str,
+) -> anyhow::Result<String> {
+    let (kind, op_id) = parse_decision_payload(payload)?;
     match kind {
         DecisionKind::Keep => {
-            apply_keep_mine_inner(db, &client, auth, &calendar_url, op_id).await
+            apply_keep_mine_inner(db, client, auth, calendar_url, op_id).await
         }
         DecisionKind::Take => {
-            // Phase 4 will implement this.
-            anyhow::bail!("Take Theirs is not yet implemented (Phase 4)")
+            apply_take_theirs_inner(db, client, auth, calendar_url, op_id).await
         }
     }
 }
@@ -1288,6 +1470,115 @@ async fn apply_keep_mine_inner(
             ))
         }
     }
+}
+
+/// MSG_CONFLICT_DECISION Take Theirs path. The user explicitly accepts
+/// the server's view; we overwrite the local cache with whatever the
+/// server holds and drop the queued ops (parent + cascaded siblings).
+///
+/// Two branches on the GET:
+///   - Server returns 200: parse the body and `upsert_task` into the
+///     cache row (etag + ical_text + summary + status + due all come
+///     from the server's parsed view).
+///   - Server returns 404: the task is server-side deleted. Convergence
+///     direction matches: drop the local cache row too.
+///
+/// In both cases the resolved op + all errored siblings on the same UID
+/// are removed from `pending_op`.
+async fn apply_take_theirs_inner(
+    db: &mut Connection,
+    client: &reqwest::Client,
+    auth: (&str, &str),
+    calendar_url: &url::Url,
+    op_id: i64,
+) -> anyhow::Result<String> {
+    use anyhow::Context;
+
+    let op = match load_resolvable_op(db, op_id)? {
+        Ok(op) => op,
+        Err(msg) => return Ok(msg),
+    };
+
+    let Some(cached) =
+        db::get_cached_task_by_uid(db, &op.target_calendar_href, &op.target_uid)?
+    else {
+        return Ok(format!(
+            "Conflict #{op_id} has no matching cache row. Tap Clear Errored."
+        ));
+    };
+
+    let task_url = queue::build_task_url(calendar_url, &cached.href)?;
+    let fresh = nextcloud::get_task(client, &task_url, auth).await?;
+
+    let tx = db.unchecked_transaction()?;
+    let response = match fresh {
+        Some((server_etag, server_ical)) => {
+            let parsed = nextcloud::parse_vtodos_first(&server_ical)
+                .context("parsing server iCalendar for Take Theirs")?;
+            let status_str = match parsed.status {
+                nextcloud::TaskStatus::Completed => "completed",
+                nextcloud::TaskStatus::NeedsAction => "needs-action",
+                nextcloud::TaskStatus::InProcess => "in-process",
+                nextcloud::TaskStatus::Cancelled => "cancelled",
+                nextcloud::TaskStatus::Unknown => "",
+            };
+            let affected = tx
+                .execute(
+                    "UPDATE task SET etag = ?1, ical_text = ?2, summary = ?3, \
+                                     status = ?4, due = ?5 \
+                     WHERE calendar_href = ?6 AND uid = ?7",
+                    rusqlite::params![
+                        server_etag,
+                        server_ical,
+                        parsed.summary,
+                        status_str,
+                        parsed.due,
+                        op.target_calendar_href,
+                        op.target_uid,
+                    ],
+                )
+                .context("overwriting cache row with server state")?;
+            if affected == 0 {
+                anyhow::bail!(
+                    "Take Theirs: cache row vanished mid-write for uid {}",
+                    op.target_uid
+                );
+            }
+            let completion = if matches!(parsed.status, nextcloud::TaskStatus::Completed) {
+                "completed"
+            } else {
+                "not completed"
+            };
+            format!(
+                "Took server version: \"{}\" ({completion}).",
+                parsed.summary
+            )
+        }
+        None => {
+            tx.execute(
+                "DELETE FROM task WHERE calendar_href = ?1 AND uid = ?2",
+                rusqlite::params![op.target_calendar_href, op.target_uid],
+            )
+            .context("deleting cache row after server-side 404")?;
+            "Took server version: task is deleted server-side. Local row removed.".to_string()
+        }
+    };
+
+    let dropped = tx
+        .execute(
+            "DELETE FROM pending_op WHERE target_uid = ?1 AND errored = 1",
+            rusqlite::params![op.target_uid],
+        )
+        .context("dropping resolved + cascaded ops")?;
+    tx.commit()?;
+
+    let cascaded = dropped.saturating_sub(1);
+    let line2 = if cascaded == 0 {
+        format!("#{op_id} resolved.")
+    } else {
+        format!("#{op_id} resolved ({cascaded} cascaded op(s) cleared).")
+    };
+    Ok(format!("{response}\n{line2}"))
 }
 
 fn delete_first(db: &mut Connection) -> anyhow::Result<String> {
