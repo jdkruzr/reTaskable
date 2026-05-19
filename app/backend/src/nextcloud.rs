@@ -424,7 +424,7 @@ async fn delete_task_once(
 /// GET a task resource. Returns `Some((etag, ical_text))` on 2xx, or `None` if
 /// the server returned 404/410 (resource already gone). Other failures bail.
 /// Body is ensure_crlf'd defensively.
-async fn get_task(
+pub async fn get_task(
     client: &Client,
     task_url: &Url,
     auth: (&str, &str),
@@ -1003,7 +1003,7 @@ fn propstat_is_ok(propstat: &roxmltree::Node) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_crlf, escape_ical_text, replace_summary};
+    use super::{ensure_crlf, escape_ical_text, get_task, replace_summary};
 
     #[test]
     fn replace_summary_preserves_unrelated_properties() {
@@ -1070,6 +1070,64 @@ mod tests {
         let input = "BEGIN:VCALENDAR\r\nVERSION:2.0\nPRODID:foo\r\n";
         let out = ensure_crlf(input);
         assert_eq!(out, "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:foo\r\n");
+    }
+
+    #[tokio::test]
+    async fn get_task_returns_etag_and_crlf_body_on_200() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        // Note: LF-only body on the wire — get_task must restore CRLF.
+        let lf_body = "BEGIN:VCALENDAR\nVERSION:2.0\nEND:VCALENDAR\n";
+        let _mock = server
+            .mock_async(|when, then| {
+                when.method(GET).path("/cal/t.ics");
+                then.status(200).header("ETag", "\"etag-fresh\"").body(lf_body);
+            })
+            .await;
+        let url: url::Url = format!("{}/cal/t.ics", server.base_url()).parse().unwrap();
+        let client = reqwest::Client::new();
+        let got = get_task(&client, &url, ("u", "p"))
+            .await
+            .expect("get_task should succeed");
+        let (etag, body) = got.expect("200 should yield Some");
+        assert_eq!(etag, "\"etag-fresh\"");
+        assert_eq!(body, "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nEND:VCALENDAR\r\n");
+    }
+
+    #[tokio::test]
+    async fn get_task_returns_none_on_404() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        let _mock = server
+            .mock_async(|when, then| {
+                when.method(GET).path("/cal/gone.ics");
+                then.status(404);
+            })
+            .await;
+        let url: url::Url = format!("{}/cal/gone.ics", server.base_url()).parse().unwrap();
+        let client = reqwest::Client::new();
+        let got = get_task(&client, &url, ("u", "p"))
+            .await
+            .expect("get_task should not error on 404");
+        assert!(got.is_none(), "404 should yield None, got {got:?}");
+    }
+
+    #[tokio::test]
+    async fn get_task_returns_none_on_410() {
+        use httpmock::prelude::*;
+        let server = MockServer::start_async().await;
+        let _mock = server
+            .mock_async(|when, then| {
+                when.method(GET).path("/cal/gone.ics");
+                then.status(410);
+            })
+            .await;
+        let url: url::Url = format!("{}/cal/gone.ics", server.base_url()).parse().unwrap();
+        let client = reqwest::Client::new();
+        let got = get_task(&client, &url, ("u", "p"))
+            .await
+            .expect("get_task should not error on 410");
+        assert!(got.is_none(), "410 should yield None, got {got:?}");
     }
 
     #[test]
