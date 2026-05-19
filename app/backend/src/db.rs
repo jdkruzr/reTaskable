@@ -658,6 +658,55 @@ pub fn first_resolvable_conflict(conn: &Connection) -> Result<Option<PendingOp>>
     Ok(row)
 }
 
+/// Look up a single pending_op row by id. Used by the M9b conflict
+/// resolution path to verify an op is still resolvable between the user's
+/// "Resolve" tap and their "Keep Mine" / "Take Theirs" tap (the op could
+/// have been Clear-Errored in the meantime by another action).
+pub fn get_pending_op_by_id(conn: &Connection, id: i64) -> Result<Option<PendingOp>> {
+    let row = conn
+        .query_row(
+            "SELECT id, op_type, target_uid, target_calendar_href, payload, \
+                    enqueued_at, error_count, last_error, errored \
+             FROM pending_op \
+             WHERE id = ?1",
+            params![id],
+            |r| {
+                Ok(PendingOp {
+                    id: r.get(0)?,
+                    op_type: r.get(1)?,
+                    target_uid: r.get(2)?,
+                    target_calendar_href: r.get(3)?,
+                    payload: r.get(4)?,
+                    enqueued_at: r.get(5)?,
+                    error_count: r.get(6)?,
+                    last_error: r.get(7)?,
+                    errored: r.get(8)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(row)
+}
+
+/// After a successful Keep Mine / Take Theirs decision, drop the resolved
+/// op AND all errored siblings on the same `target_uid` in one go.
+/// Non-errored ops on the same UID survive — they represent fresh intent
+/// the user queued after the conflict was already errored.
+///
+/// Returns the number of rows deleted (parent + cascaded siblings).
+///
+/// The cascade unwind semantics here are the M9b scoping decision: the
+/// user resolving the parent inherits the same decision for everything
+/// cascaded by it. See docs/design-plans/.../m9b-... and the M9b plan in
+/// `/home/jtd/.claude/plans/curious-jingling-taco.md`.
+pub fn drop_resolved_conflict(conn: &Connection, target_uid: &str) -> Result<usize> {
+    let affected = conn.execute(
+        "DELETE FROM pending_op WHERE target_uid = ?1 AND errored = 1",
+        params![target_uid],
+    )?;
+    Ok(affected)
+}
+
 /// Look up a cache row by `(calendar_href, uid)`. Mirrors
 /// `queue::fetch_cached_for_dispatch` but exposes the full
 /// `CachedTask` shape for callers that need summary/status (e.g.
@@ -1657,4 +1706,69 @@ mod tests {
         ensure_schema_v2(&conn).expect("migrate");
         assert!(get_cached_task_by_uid(&conn, "/cal/", "nope").unwrap().is_none());
     }
+
+    // --- M9b Phase 3: get_pending_op_by_id + drop_resolved_conflict ---
+
+    #[test]
+    fn get_pending_op_by_id_returns_row_or_none() {
+        let conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        assert!(get_pending_op_by_id(&conn, 99).unwrap().is_none());
+        conn.execute(
+            "INSERT INTO pending_op (op_type, target_uid, target_calendar_href, payload,
+                                     enqueued_at, errored, last_error)
+             VALUES ('toggle', 'uid-x', '/cal/', NULL, 100, 1, 'double-412 (server-side conflict)')",
+            [],
+        ).unwrap();
+        let op = get_pending_op_by_id(&conn, 1).unwrap().expect("some");
+        assert_eq!(op.target_uid, "uid-x");
+        assert_eq!(op.errored, 1);
+        assert_eq!(op.last_error.as_deref(), Some("double-412 (server-side conflict)"));
+    }
+
+    #[test]
+    fn drop_resolved_conflict_clears_parent_and_errored_siblings() {
+        let conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        // id 1: errored toggle on uid-X (the parent — what user resolved)
+        // id 2: cascaded edit on uid-X (errored=1)
+        // id 3: cascaded edit on uid-X (errored=1)
+        // id 4: errored op on a DIFFERENT uid (should be untouched)
+        // id 5: non-errored op on uid-X enqueued after the cascade (must
+        //       survive — represents fresh intent on top of resolved state)
+        conn.execute(
+            "INSERT INTO pending_op (op_type, target_uid, target_calendar_href, payload,
+                                     enqueued_at, errored, last_error)
+             VALUES ('toggle', 'uid-X', '/cal/', NULL, 100, 1, 'double-412 (server-side conflict)'),
+                    ('edit',   'uid-X', '/cal/', '{}', 101, 1, 'blocked by failed toggle'),
+                    ('edit',   'uid-X', '/cal/', '{}', 102, 1, 'blocked by failed toggle'),
+                    ('toggle', 'uid-Y', '/cal/', NULL, 103, 1, 'HTTP 401 Unauthorized'),
+                    ('edit',   'uid-X', '/cal/', '{}', 104, 0, NULL)",
+            [],
+        ).unwrap();
+        let dropped = drop_resolved_conflict(&conn, "uid-X").unwrap();
+        // Parent + 2 cascaded siblings = 3 dropped (id 1, 2, 3).
+        assert_eq!(dropped, 3);
+        // Remaining: id 4 (different uid, untouched) + id 5 (fresh intent).
+        let remaining: Vec<(i64, String, i64)> = conn
+            .prepare("SELECT id, target_uid, errored FROM pending_op ORDER BY id ASC")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(remaining, vec![
+            (4, "uid-Y".to_string(), 1),
+            (5, "uid-X".to_string(), 0),
+        ]);
+    }
+
+    #[test]
+    fn drop_resolved_conflict_zero_when_nothing_matches() {
+        let conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        let dropped = drop_resolved_conflict(&conn, "uid-nonexistent").unwrap();
+        assert_eq!(dropped, 0);
+    }
+
 }

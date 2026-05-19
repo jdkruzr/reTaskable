@@ -340,9 +340,11 @@ pub async fn discover_calendars(cfg: &NextcloudConfig) -> Result<Vec<Calendar>> 
     Ok(calendars)
 }
 
-// M6 write-path types. Kept private to the module; callers go through the
-// `*_with_retry` wrappers and never see these directly.
-enum WriteOutcome {
+// M6 write-path types. Most callers go through the `*_with_retry` wrappers
+// and never see these directly. M9b's Keep Mine handler is the exception:
+// it needs a single-shot PUT with the user-explicit "no silent retry"
+// contract, so it consumes `put_task_once` + `WriteOutcome` directly.
+pub enum WriteOutcome {
     Updated(String /* new etag */),
     PreconditionFailed,
 }
@@ -353,7 +355,7 @@ enum DeleteOutcome {
     PreconditionFailed,
 }
 
-async fn put_task_once(
+pub async fn put_task_once(
     client: &Client,
     task_url: &Url,
     ical_text: &str,
