@@ -23,6 +23,7 @@ const MSG_CREATE_TASK: u32 = 8;
 const MSG_EDIT_FIRST: u32 = 9;
 const MSG_SHOW_PENDING: u32 = 10;
 const MSG_CLEAR_ERRORED: u32 = 11;
+const MSG_RESOLVE_FIRST_CONFLICT: u32 = 12;
 const MSG_PONG: u32 = 101;
 const MSG_NEXTCLOUD_RESPONSE: u32 = 102;
 const MSG_CALENDARS_RESPONSE: u32 = 103;
@@ -34,6 +35,7 @@ const MSG_CREATE_RESPONSE: u32 = 108;
 const MSG_EDIT_RESPONSE: u32 = 109;
 const MSG_SHOW_PENDING_RESPONSE: u32 = 110;
 const MSG_CLEAR_ERRORED_RESPONSE: u32 = 111;
+const MSG_RESOLVE_FIRST_CONFLICT_RESPONSE: u32 = 112;
 
 #[tokio::main]
 async fn main() {
@@ -145,6 +147,15 @@ impl AppLoadBackend for Backend {
                 };
                 eprintln!("retaskable: clear errored result:\n{response}");
                 send(replier, MSG_CLEAR_ERRORED_RESPONSE, &response);
+            }
+            MSG_RESOLVE_FIRST_CONFLICT => {
+                eprintln!("retaskable: resolve first conflict requested");
+                let response = match resolve_first_conflict(&mut self.db).await {
+                    Ok(s) => s,
+                    Err(e) => format!("error: {e:#}"),
+                };
+                eprintln!("retaskable: resolve first conflict result:\n{response}");
+                send(replier, MSG_RESOLVE_FIRST_CONFLICT_RESPONSE, &response);
             }
             t => eprintln!("retaskable: ignoring unknown msg type {t}"),
         }
@@ -260,6 +271,60 @@ fn compose_sync_response(
     }
 }
 
+/// Pure formatter for the conflict-resolution preview returned by
+/// `resolve_first_conflict` over MSG 112. The first line is the
+/// `OPID:<n>` sentinel that QML parses to know which op the user is
+/// resolving (and to drive visibility of the Keep/Take/Cancel row).
+///
+/// `server` is `None` when the GET returned 404 (server-side delete
+/// between the failed PUT and the user tapping Resolve). The keep/take
+/// handlers in Phases 3/4 handle that case; here we just communicate it.
+fn format_conflict_preview(
+    op_id: i64,
+    op_type: &str,
+    uid: &str,
+    local_summary: &str,
+    local_completed: bool,
+    server: Option<(&str, bool)>,
+) -> String {
+    let uid_short = if uid.chars().count() > 8 {
+        // Take last 8 chars; preserves grapheme tail for typical UUIDs.
+        let skip = uid.chars().count() - 8;
+        format!("\u{2026}{}", uid.chars().skip(skip).collect::<String>())
+    } else {
+        uid.to_string()
+    };
+
+    let header_summary = match server {
+        Some((s, _)) => s,
+        None => local_summary,
+    };
+
+    let local_marker = if local_completed { "completed" } else { "not completed" };
+    let server_line = match server {
+        Some((s, c)) => {
+            let m = if c { "completed" } else { "not completed" };
+            format!("Server: \"{s}\" ({m})")
+        }
+        None => "Server: (deleted server-side)".to_string(),
+    };
+
+    format!(
+        "OPID:{op_id}\n\
+         Conflict on \"{header_summary}\" (UID {uid_short})\n\
+         Op: {op_type}\n\
+         Local:  \"{local_summary}\" ({local_marker})\n\
+         {server_line}\n\
+         Tap Keep Mine, Take Theirs, or Cancel."
+    )
+}
+
+/// Companion to format_conflict_preview when no resolvable conflict exists.
+/// `OPID:0` tells QML not to enable the Keep/Take/Cancel row.
+fn format_no_conflict_preview() -> String {
+    "OPID:0\nNo conflicts to resolve.".to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,6 +368,212 @@ mod tests {
         let out = compose_sync_response(&flush, Some("full"), 10, 0);
         // "M errored" = newly_errored + cascade_errored
         assert!(out.contains("Flushed 1 / 3 errored (0 retried)."));
+    }
+
+    // --- M9b Phase 2: format_conflict_preview ---
+
+    #[test]
+    fn format_conflict_preview_toggle_completion_diff() {
+        // Toggle conflict: same summary, different completion. Server has
+        // completed=true; user's pending toggle wants completed=false.
+        let out = format_conflict_preview(
+            42,
+            "toggle",
+            "b8c9a2e1-4f5d-6789-0abc-def012345678",
+            "Walk the dog",
+            false,
+            Some(("Walk the dog", true)),
+        );
+        assert_eq!(
+            out,
+            "OPID:42\n\
+             Conflict on \"Walk the dog\" (UID \u{2026}12345678)\n\
+             Op: toggle\n\
+             Local:  \"Walk the dog\" (not completed)\n\
+             Server: \"Walk the dog\" (completed)\n\
+             Tap Keep Mine, Take Theirs, or Cancel."
+        );
+    }
+
+    #[test]
+    fn format_conflict_preview_edit_summary_diff() {
+        let out = format_conflict_preview(
+            7,
+            "edit",
+            "uid-milk",
+            "Buy 2% milk",
+            false,
+            Some(("Buy whole milk", false)),
+        );
+        assert!(out.starts_with("OPID:7\n"));
+        assert!(out.contains("Op: edit\n"));
+        assert!(out.contains("Local:  \"Buy 2% milk\" (not completed)\n"));
+        assert!(out.contains("Server: \"Buy whole milk\" (not completed)\n"));
+    }
+
+    #[test]
+    fn format_conflict_preview_uses_local_summary_in_header_when_server_gone() {
+        let out = format_conflict_preview(
+            99,
+            "edit",
+            "uid-zzzz",
+            "Local-only task",
+            false,
+            None,
+        );
+        assert!(out.starts_with("OPID:99\n"));
+        assert!(out.contains("Conflict on \"Local-only task\""));
+        assert!(out.contains("Server: (deleted server-side)\n"));
+    }
+
+    #[test]
+    fn format_conflict_preview_short_uid_renders_without_ellipsis() {
+        let out = format_conflict_preview(1, "toggle", "abc", "S", false, Some(("S", true)));
+        // UIDs shorter than 8 chars should render as-is, no ellipsis prefix.
+        assert!(out.contains("(UID abc)"), "short UID rendered as: {out}");
+    }
+
+    #[test]
+    fn format_no_conflict_preview_uses_opid_zero() {
+        let out = format_no_conflict_preview();
+        assert_eq!(out, "OPID:0\nNo conflicts to resolve.");
+    }
+
+    // --- M9b Phase 2: resolve_first_conflict_inner (end-to-end with httpmock) ---
+
+    #[tokio::test]
+    async fn resolve_first_conflict_inner_returns_no_conflict_when_queue_clean() {
+        use rusqlite::Connection;
+        let mut conn = Connection::open_in_memory().unwrap();
+        db::ensure_schema_v2(&conn).unwrap();
+        let calendar_url: url::Url = "http://example.invalid/cal/".parse().unwrap();
+        let client = reqwest::Client::new();
+        // No errored ops at all — should report OPID:0.
+        let out = resolve_first_conflict_inner(&mut conn, &client, ("u", "p"), &calendar_url)
+            .await
+            .expect("inner ok");
+        assert_eq!(out, "OPID:0\nNo conflicts to resolve.");
+    }
+
+    #[tokio::test]
+    async fn resolve_first_conflict_inner_renders_toggle_completion_diff() {
+        use httpmock::prelude::*;
+        use rusqlite::params;
+        let server = MockServer::start_async().await;
+
+        // Server returns the task with STATUS:COMPLETED — server-side it's done.
+        let server_ical = "BEGIN:VCALENDAR\r\n\
+                           VERSION:2.0\r\n\
+                           PRODID:-//reTaskable test//EN\r\n\
+                           BEGIN:VTODO\r\n\
+                           UID:uid-walk\r\n\
+                           DTSTAMP:20260518T120000Z\r\n\
+                           SUMMARY:Walk the dog\r\n\
+                           STATUS:COMPLETED\r\n\
+                           END:VTODO\r\n\
+                           END:VCALENDAR\r\n";
+        let _mock = server
+            .mock_async(|when, then| {
+                when.method(GET).path("/cal/walk.ics");
+                then.status(200).header("ETag", "\"server-etag\"").body(server_ical);
+            })
+            .await;
+
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        db::ensure_schema_v2(&conn).unwrap();
+        let cal_href = format!("{}/cal/", server.base_url());
+        let absolute_href = format!("{}/cal/walk.ics", server.base_url());
+
+        // Local intent (cached post-mutation): STATUS:NEEDS-ACTION — user
+        // toggled it un-done, but PUT lost the race and double-412'd.
+        let local_ical = "BEGIN:VCALENDAR\r\n\
+                          VERSION:2.0\r\n\
+                          BEGIN:VTODO\r\n\
+                          UID:uid-walk\r\n\
+                          SUMMARY:Walk the dog\r\n\
+                          STATUS:NEEDS-ACTION\r\n\
+                          DTSTAMP:20260518T100000Z\r\n\
+                          END:VTODO\r\n\
+                          END:VCALENDAR\r\n";
+        conn.execute(
+            "INSERT INTO task (calendar_href, href, etag, ical_text, summary, status, due, uid, pending_delete)
+             VALUES (?1, ?2, 'etag-stale', ?3, 'Walk the dog', 'needs-action', NULL, 'uid-walk', 0)",
+            params![cal_href, absolute_href, local_ical],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO pending_op
+                 (op_type, target_uid, target_calendar_href, payload,
+                  enqueued_at, errored, last_error)
+             VALUES ('toggle', 'uid-walk', ?1, NULL, 100, 1,
+                     'double-412 (server-side conflict)')",
+            params![cal_href],
+        ).unwrap();
+
+        let calendar_url: url::Url = cal_href.parse().unwrap();
+        let client = reqwest::Client::new();
+        let out = resolve_first_conflict_inner(&mut conn, &client, ("u", "p"), &calendar_url)
+            .await
+            .expect("inner ok");
+
+        assert!(out.starts_with("OPID:1\n"), "expected OPID:1, got:\n{out}");
+        assert!(out.contains("Op: toggle\n"), "missing op type:\n{out}");
+        assert!(
+            out.contains("Local:  \"Walk the dog\" (not completed)"),
+            "missing local line:\n{out}"
+        );
+        assert!(
+            out.contains("Server: \"Walk the dog\" (completed)"),
+            "missing server line:\n{out}"
+        );
+        assert!(out.contains("Tap Keep Mine, Take Theirs, or Cancel."));
+    }
+
+    #[tokio::test]
+    async fn resolve_first_conflict_inner_handles_server_404() {
+        use httpmock::prelude::*;
+        use rusqlite::params;
+        let server = MockServer::start_async().await;
+
+        // GET 404: task was deleted server-side between the original PUT
+        // failure and the user tapping Resolve. We still want a sane preview.
+        let _mock = server
+            .mock_async(|when, then| {
+                when.method(GET).path("/cal/gone.ics");
+                then.status(404);
+            })
+            .await;
+
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        db::ensure_schema_v2(&conn).unwrap();
+        let cal_href = format!("{}/cal/", server.base_url());
+        let absolute_href = format!("{}/cal/gone.ics", server.base_url());
+        let local_ical = "BEGIN:VCALENDAR\r\n\
+                          BEGIN:VTODO\r\nUID:uid-gone\r\n\
+                          SUMMARY:Local edit\r\nSTATUS:NEEDS-ACTION\r\n\
+                          DTSTAMP:20260518T100000Z\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        conn.execute(
+            "INSERT INTO task (calendar_href, href, etag, ical_text, summary, status, due, uid, pending_delete)
+             VALUES (?1, ?2, 'etag-stale', ?3, 'Local edit', 'needs-action', NULL, 'uid-gone', 0)",
+            params![cal_href, absolute_href, local_ical],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO pending_op
+                 (op_type, target_uid, target_calendar_href, payload,
+                  enqueued_at, errored, last_error)
+             VALUES ('edit', 'uid-gone', ?1, '{\"summary\":\"Local edit\"}', 100, 1,
+                     'double-412 (server-side conflict)')",
+            params![cal_href],
+        ).unwrap();
+
+        let calendar_url: url::Url = cal_href.parse().unwrap();
+        let client = reqwest::Client::new();
+        let out = resolve_first_conflict_inner(&mut conn, &client, ("u", "p"), &calendar_url)
+            .await
+            .expect("inner ok");
+
+        assert!(out.starts_with("OPID:1\n"));
+        assert!(out.contains("Op: edit\n"));
+        assert!(out.contains("Server: (deleted server-side)"), "got:\n{out}");
     }
 }
 
@@ -492,6 +763,90 @@ fn edit_first(db: &mut Connection, summary: &str) -> anyhow::Result<String> {
     let op_id = db::enqueue_edit(db, &cal_href, &task.uid, new_summary)?;
     Ok(format!(
         "Queued: edit \"{old_summary}\" -> \"{new_summary}\" (#{op_id})"
+    ))
+}
+
+/// MSG_RESOLVE_FIRST_CONFLICT handler. Finds the first conflict-resolvable
+/// errored op (toggle/edit + double-412), fetches the server's current
+/// view of the task, and formats a preview the user can act on by tapping
+/// Keep Mine / Take Theirs / Cancel (Phases 3/4 implement those decisions).
+///
+/// This thin wrapper does the config loading + http client construction;
+/// the actual logic lives in `resolve_first_conflict_inner` so tests can
+/// inject a mock server without touching `~/.config/retaskable/config.toml`.
+async fn resolve_first_conflict(db: &mut Connection) -> anyhow::Result<String> {
+    let cfg = config::load()?;
+    let wanted = cfg.nextcloud.calendar.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "config is missing `calendar = \"...\"` under [nextcloud]. \
+             Run List Calendars to see options."
+        )
+    })?;
+
+    let Some(cal_href) = db::get_calendar_href_by_display_name(db, wanted)? else {
+        return Ok(format!(
+            "calendar {wanted:?} not yet synced -- tap Sync first."
+        ));
+    };
+
+    let calendar_url = url::Url::parse(&cal_href)?;
+    let client = reqwest::Client::new();
+    let auth = (
+        cfg.nextcloud.username.as_str(),
+        cfg.nextcloud.app_password.as_str(),
+    );
+    resolve_first_conflict_inner(db, &client, auth, &calendar_url).await
+}
+
+async fn resolve_first_conflict_inner(
+    db: &mut Connection,
+    client: &reqwest::Client,
+    auth: (&str, &str),
+    calendar_url: &url::Url,
+) -> anyhow::Result<String> {
+    use anyhow::Context;
+
+    let Some(op) = db::first_resolvable_conflict(db)? else {
+        return Ok(format_no_conflict_preview());
+    };
+
+    let Some(cached) =
+        db::get_cached_task_by_uid(db, &op.target_calendar_href, &op.target_uid)?
+    else {
+        // Defensive: a resolvable conflict implies a cache row exists
+        // (enqueue_toggle/edit insist on one). If it's gone, the queue
+        // is in an unexpected state — surface honestly, OPID:0 so QML
+        // doesn't enable Keep/Take.
+        return Ok(format!(
+            "OPID:0\nConflict op #{} has no matching cache row. Tap Clear Errored.",
+            op.id
+        ));
+    };
+
+    let local = nextcloud::parse_vtodos_first(&cached.ical_text)
+        .context("parsing cached iCalendar (local intent)")?;
+    let local_completed = matches!(local.status, nextcloud::TaskStatus::Completed);
+
+    let task_url = queue::build_task_url(calendar_url, &cached.href)?;
+    let server = nextcloud::get_task(client, &task_url, auth).await?;
+
+    let server_view = match server {
+        Some((_etag, ical)) => {
+            let s = nextcloud::parse_vtodos_first(&ical)
+                .context("parsing server iCalendar (fresh state)")?;
+            let completed = matches!(s.status, nextcloud::TaskStatus::Completed);
+            Some((s.summary, completed))
+        }
+        None => None,
+    };
+
+    Ok(format_conflict_preview(
+        op.id,
+        &op.op_type,
+        &op.target_uid,
+        &local.summary,
+        local_completed,
+        server_view.as_ref().map(|(s, c)| (s.as_str(), *c)),
     ))
 }
 

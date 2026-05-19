@@ -619,6 +619,75 @@ pub fn list_tasks(conn: &Connection, calendar_href: &str) -> Result<Vec<Task>> {
     Ok(out)
 }
 
+/// Return the lowest-id `pending_op` row that is currently a
+/// **conflict-resolvable** error: `errored = 1` AND `op_type IN
+/// ('toggle','edit')` AND `last_error` contains `double-412`.
+///
+/// The string match is fragile but localised: the producer is
+/// `queue::classify_error` (search for `"double-412"` there).
+/// M9b deliberately scopes to toggle + edit; delete/create double-412s
+/// remain only recoverable via Clear Errored. M10 will replace the
+/// string match with a typed `error_kind` column.
+pub fn first_resolvable_conflict(conn: &Connection) -> Result<Option<PendingOp>> {
+    let row = conn
+        .query_row(
+            "SELECT id, op_type, target_uid, target_calendar_href, payload, \
+                    enqueued_at, error_count, last_error, errored \
+             FROM pending_op \
+             WHERE errored = 1 \
+               AND op_type IN ('toggle','edit') \
+               AND last_error LIKE '%double-412%' \
+             ORDER BY id ASC \
+             LIMIT 1",
+            [],
+            |r| {
+                Ok(PendingOp {
+                    id: r.get(0)?,
+                    op_type: r.get(1)?,
+                    target_uid: r.get(2)?,
+                    target_calendar_href: r.get(3)?,
+                    payload: r.get(4)?,
+                    enqueued_at: r.get(5)?,
+                    error_count: r.get(6)?,
+                    last_error: r.get(7)?,
+                    errored: r.get(8)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(row)
+}
+
+/// Look up a cache row by `(calendar_href, uid)`. Mirrors
+/// `queue::fetch_cached_for_dispatch` but exposes the full
+/// `CachedTask` shape for callers that need summary/status (e.g.
+/// the conflict-resolution preview). Does NOT filter on
+/// `pending_delete` — callers must decide.
+pub fn get_cached_task_by_uid(
+    conn: &Connection,
+    calendar_href: &str,
+    uid: &str,
+) -> Result<Option<CachedTask>> {
+    let row = conn
+        .query_row(
+            "SELECT href, etag, ical_text, summary, uid, status \
+             FROM task WHERE calendar_href = ?1 AND uid = ?2",
+            params![calendar_href, uid],
+            |r| {
+                Ok(CachedTask {
+                    href: r.get(0)?,
+                    etag: r.get(1)?,
+                    ical_text: r.get(2)?,
+                    summary: r.get(3)?,
+                    uid: r.get(4)?,
+                    status: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                })
+            },
+        )
+        .optional()?;
+    Ok(row)
+}
+
 /// Fetch all pending_op rows (errored and not) for display in the Show
 /// Pending response. Joined against task by target_uid for the summary
 /// column.
@@ -1485,5 +1554,107 @@ mod tests {
         ensure_schema_v2(&conn).expect("migrate");
         let cleared = clear_errored(&mut conn).unwrap();
         assert_eq!(cleared, 0);
+    }
+
+    // --- M9b Phase 2: first_resolvable_conflict + get_cached_task_by_uid ---
+
+    #[test]
+    fn first_resolvable_conflict_returns_none_when_no_errored_ops() {
+        let conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        assert!(first_resolvable_conflict(&conn).unwrap().is_none());
+        // Healthy queue: no errored ops, none should be picked up.
+        conn.execute(
+            "INSERT INTO pending_op (op_type, target_uid, target_calendar_href, payload, enqueued_at, errored)
+             VALUES ('toggle', 'a', '/cal/', NULL, 100, 0)",
+            [],
+        ).unwrap();
+        assert!(first_resolvable_conflict(&conn).unwrap().is_none());
+    }
+
+    #[test]
+    fn first_resolvable_conflict_skips_non_conflict_errors() {
+        // Errored ops exist but none have the double-412 marker: 401 (auth)
+        // and 404 (not-found) should NOT be surfaced to conflict resolution.
+        let conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        conn.execute(
+            "INSERT INTO pending_op (op_type, target_uid, target_calendar_href, payload, enqueued_at, errored, last_error)
+             VALUES ('toggle', 'a', '/cal/', NULL, 100, 1, 'HTTP 401 Unauthorized'),
+                    ('edit',   'b', '/cal/', NULL, 101, 1, 'HTTP 404 Not Found')",
+            [],
+        ).unwrap();
+        assert!(first_resolvable_conflict(&conn).unwrap().is_none());
+    }
+
+    #[test]
+    fn first_resolvable_conflict_returns_lowest_id_double_412_toggle_or_edit() {
+        let conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        // id 1: 401 (skip). id 2: cascaded blocked-by (skip — not double-412).
+        // id 3: toggle with double-412 (THIS). id 4: edit with double-412.
+        conn.execute(
+            "INSERT INTO pending_op (op_type, target_uid, target_calendar_href, payload, enqueued_at, errored, last_error)
+             VALUES ('toggle', 'a', '/cal/', NULL, 100, 1, 'HTTP 401 Unauthorized'),
+                    ('edit',   'b', '/cal/', NULL, 101, 1, 'blocked by failed toggle'),
+                    ('toggle', 'c', '/cal/', NULL, 102, 1, 'double-412 (server-side conflict)'),
+                    ('edit',   'd', '/cal/', NULL, 103, 1, 'double-412 (server-side conflict)')",
+            [],
+        ).unwrap();
+        let op = first_resolvable_conflict(&conn).unwrap().expect("some");
+        assert_eq!(op.target_uid, "c");
+        assert_eq!(op.op_type, "toggle");
+    }
+
+    #[test]
+    fn first_resolvable_conflict_excludes_unsupported_op_types() {
+        // M9b scope: only toggle + edit. delete/create double-412s exist but
+        // aren't resolvable in this milestone — they should NOT be returned.
+        let conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        conn.execute(
+            "INSERT INTO pending_op (op_type, target_uid, target_calendar_href, payload, enqueued_at, errored, last_error)
+             VALUES ('delete', 'a', '/cal/', NULL, 100, 1, 'double-412 (server-side conflict)'),
+                    ('create', 'b', '/cal/', '{}', 101, 1, 'double-412 (server-side conflict)')",
+            [],
+        ).unwrap();
+        assert!(first_resolvable_conflict(&conn).unwrap().is_none());
+    }
+
+    #[test]
+    fn get_cached_task_by_uid_returns_row() {
+        let conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        conn.execute(
+            "INSERT INTO task (calendar_href, href, etag, ical_text, summary, status, due, uid, pending_delete)
+             VALUES ('/cal/', '/cal/t.ics', 'e', 'ical', 'walk', 'completed', NULL, 'uid-1', 0)",
+            [],
+        ).unwrap();
+        let cached = get_cached_task_by_uid(&conn, "/cal/", "uid-1").unwrap().expect("some");
+        assert_eq!(cached.uid, "uid-1");
+        assert_eq!(cached.summary, "walk");
+        assert_eq!(cached.etag, "e");
+        assert_eq!(cached.href, "/cal/t.ics");
+    }
+
+    #[test]
+    fn get_cached_task_by_uid_finds_pending_delete_rows_too() {
+        // After enqueue_delete the row has pending_delete = 1. Conflict
+        // resolution must still find it (parallel to fetch_cached_for_dispatch).
+        let conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        conn.execute(
+            "INSERT INTO task (calendar_href, href, etag, ical_text, summary, status, due, uid, pending_delete)
+             VALUES ('/cal/', '/cal/t.ics', 'e', 'ical', 'walk', 'completed', NULL, 'uid-1', 1)",
+            [],
+        ).unwrap();
+        assert!(get_cached_task_by_uid(&conn, "/cal/", "uid-1").unwrap().is_some());
+    }
+
+    #[test]
+    fn get_cached_task_by_uid_returns_none_for_missing() {
+        let conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        assert!(get_cached_task_by_uid(&conn, "/cal/", "nope").unwrap().is_none());
     }
 }

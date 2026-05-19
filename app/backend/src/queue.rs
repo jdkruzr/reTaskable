@@ -362,7 +362,7 @@ fn fetch_cached_for_dispatch(
     Ok(row)
 }
 
-fn build_task_url(calendar_url: &Url, href: &str) -> Result<Url> {
+pub fn build_task_url(calendar_url: &Url, href: &str) -> Result<Url> {
     // href in the cache is whatever sync-collection stored. nextcloud::sync_collection
     // canonicalises to absolute URL strings via base.join().to_string(); CalDAV servers
     // also legally emit absolute-path hrefs. Url::parse handles the former; base.join
