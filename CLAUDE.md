@@ -1,10 +1,10 @@
 # reTaskable
 
-Last verified: 2026-05-18
+Last verified: 2026-05-19
 
 A CalDAV task client for the reMarkable Paper Pro (rMPP), running under the AppLoad on-device harness. Rust backend + QML frontend. Speaks to any RFC-compliant CalDAV server; primary test target is Nextcloud (`checkwithscience.com`).
 
-Latest milestone: **M9a — offline write queue.** Writes (Create/Toggle/Edit/Delete) are local-first; `Sync` drains them before pulling server state.
+Latest milestone: **M9b — conflict-resolution UI.** When a write loses a race and double-412s, the user gets a Resolve First Conflict button that shows a local-vs-server diff and offers Keep Mine / Take Theirs / Cancel. Toggle + edit only in M9b; delete + create deferred.
 
 ## Tech stack
 
@@ -37,7 +37,7 @@ The build scripts handle the cross-compile env (linker, sysroot, `CC_*` per-targ
 - `app/backend/src/queue.rs` — `flush_pending`, `dispatch_op`, `apply_outcome`, `classify_error`, `FlushSummary`, `ExecOutcome`, in-file tests including `#[tokio::test]` + httpmock integration
 - `app/backend/src/nextcloud.rs` — HTTP helpers: discovery, sync-collection REPORT, `put_task_with_retry` (412 auto-retry), `delete_task_with_retry`, iCalendar mutations (`toggle_completion`, `replace_summary`, `escape_ical_text`)
 - `app/backend/src/config.rs` — TOML loader for `~/.config/retaskable/config.toml`
-- `app/ui/Main.qml` — single Flow of buttons + a TextField + the response area
+- `app/ui/Main.qml` — Flow of 12 buttons + a TextField + a conditional Keep/Take/Cancel row (visible while a conflict is primed) + the response area
 - `vendor/appload-client/` — modified AppLoad client crate (the `?Send` trait change is intentional)
 - `docs/design-plans/` — per-milestone design plans (read these before changing architecture)
 - `docs/implementation-plans/` — per-milestone implementation plans (read these to understand why specific code shape was chosen)
@@ -45,7 +45,7 @@ The build scripts handle the cross-compile env (linker, sysroot, `CC_*` per-targ
 
 ## Conventions
 
-**MSG protocol.** Requests are 1–11, responses are 101–111, dense numbering so QML can filter with simple `||` chains. Reserved system types: `0xFFFFFFFE` (new-coordinator), `0xFFFFFFFF` (terminate). Frames are `{type:u32 LE, len:u32 LE}` + UTF-8 payload.
+**MSG protocol.** Requests are 1–13, responses are 101–113, dense numbering so QML can filter with simple `||` chains. Reserved system types: `0xFFFFFFFE` (new-coordinator), `0xFFFFFFFF` (terminate). Frames are `{type:u32 LE, len:u32 LE}` + UTF-8 payload. M9b's MSG 112 response is the first multi-line payload with a parseable sentinel — its first line is `OPID:<n>\n`, which QML strips and uses to drive the visibility of the Keep/Take/Cancel row.
 
 **Async + rusqlite.** `rusqlite::Connection` is `Send` but `!Sync` (RefCell inside), so `&Connection` is `!Send`. The AppLoadBackend trait uses `#[async_trait(?Send)]` (the harness calls it sequentially under a mutex; Send is gratuitous). Async fns inside the backend hold `&mut Connection` not `&Connection`.
 
@@ -53,7 +53,7 @@ The build scripts handle the cross-compile env (linker, sysroot, `CC_*` per-targ
 
 **iCalendar on the wire is CRLF.** Always. `nextcloud::ensure_crlf` runs at every parse boundary (XML extraction strips CRs per XML 1.0 §2.11, so calendar-data comes back LF-only and must be restored). ETags include their surrounding quotes — pass through verbatim.
 
-**Tests are in-file.** No separate `tests/` directory. Each module has its own `#[cfg(test)] mod tests { ... }` block using `Connection::open_in_memory()`. Pre-M9a there were 6 tests; M9a brought the count to 54.
+**Tests are in-file.** No separate `tests/` directory. Each module has its own `#[cfg(test)] mod tests { ... }` block using `Connection::open_in_memory()`. Pre-M9a there were 6 tests; M9a brought it to 54; M9b to 86.
 
 **Diagnostics.** `eprintln!("retaskable: ...")` with lowercase fragments and no terminal punctuation. Captured by xochitl → journald.
 
@@ -61,7 +61,12 @@ The build scripts handle the cross-compile env (linker, sysroot, `CC_*` per-targ
 
 ## Workflow discipline (small pieces)
 
-Each milestone must verify on real rMPP hardware before the next one is planned. Code review + automated tests are necessary but not sufficient — bugs hide in cross-module contract assumptions that only surface against a real server. The recent M9a `put_task_with_retry` double-mutation bug (commit `f3dbd9c`) is a textbook example: it survived 54 passing tests and 8 phases of code review, and surfaced on the first real toggle round-trip. Plan accordingly; budget time for the hardware loop.
+Each milestone must verify on real rMPP hardware before the next one is planned. Code review + automated tests are necessary but not sufficient — bugs hide in cross-module contract assumptions that only surface against a real server. Two examples from the offline-queue era:
+
+- **M9a (commit `f3dbd9c`):** `put_task_with_retry` double-mutated the cached body. Survived 54 passing tests and 8 phases of code review; surfaced on the first real toggle round-trip.
+- **M9b (commit `5326ee3`):** `ensure_crlf` left a trailing bare CR untouched, so the icalendar crate couldn't parse Nextcloud's GET response. Survived 85 passing tests; surfaced on the first real conflict-preview attempt.
+
+Plan accordingly; budget time for the hardware loop. M9b also added a `manufacture-m9b-conflict.py` test helper at `docs/test-plans/` because natural double-412s require a millisecond-window race that's impractical to trigger by hand — verification needed direct DB-state injection.
 
 ## Where to find more context
 
