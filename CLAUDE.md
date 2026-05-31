@@ -1,10 +1,12 @@
 # reTaskable
 
-Last verified: 2026-05-19
+Last verified: 2026-05-31
 
 A CalDAV task client for the reMarkable Paper Pro (rMPP), running under the AppLoad on-device harness. Rust backend + QML frontend. Speaks to any RFC-compliant CalDAV server; primary test target is Nextcloud (`checkwithscience.com`).
 
-Latest milestone: **M9b — conflict-resolution UI.** When a write loses a race and double-412s, the user gets a Resolve First Conflict button that shows a local-vs-server diff and offers Keep Mine / Take Theirs / Cancel. Toggle + edit only in M9b; delete + create deferred.
+Latest milestone: **M9c — pending-op visualization.** Show Tasks now prefixes each row with a pending-op marker: `! ` errored/needs-resolution (wins), `* ` queued-will-flush, `  ` (two-space align) none. Prefixes appear only when something is pending, so a clean queue renders byte-identical to pre-M9c. Backend-string only — zero QML changes. Pending deletes are invisible by design (they set `pending_delete = 1` and drop out of `list_tasks`; revisit in M10's ListView).
+
+Prior milestone: **M9b — conflict-resolution UI.** When a write loses a race and double-412s, the user gets a Resolve First Conflict button that shows a local-vs-server diff and offers Keep Mine / Take Theirs / Cancel. Toggle + edit only in M9b; delete + create deferred.
 
 ## Tech stack
 
@@ -33,9 +35,9 @@ The build scripts handle the cross-compile env (linker, sysroot, `CC_*` per-targ
 ## Project structure
 
 - `app/backend/src/main.rs` — `AppLoadBackend` impl, MSG dispatch, `sync()`, `compose_sync_response`, the four write handlers (`toggle_first`, `create`, `edit_first`, `delete_first`)
-- `app/backend/src/db.rs` — SQLite schema + migration, cache CRUD, `enqueue_{create,edit,toggle,delete}`, `fetch_next_drainable`, `cascade_uid`, `clear_errored`, in-file tests
+- `app/backend/src/db.rs` — SQLite schema + migration, cache CRUD, `enqueue_{create,edit,toggle,delete}`, `fetch_next_drainable`, `cascade_uid`, `clear_errored`, `pending_marks` (per-UID queued/errored state for the M9c row markers), in-file tests
 - `app/backend/src/queue.rs` — `flush_pending`, `dispatch_op`, `apply_outcome`, `classify_error`, `FlushSummary`, `ExecOutcome`, in-file tests including `#[tokio::test]` + httpmock integration
-- `app/backend/src/nextcloud.rs` — HTTP helpers: discovery, sync-collection REPORT, `put_task_with_retry` (412 auto-retry), `delete_task_with_retry`, iCalendar mutations (`toggle_completion`, `replace_summary`, `escape_ical_text`)
+- `app/backend/src/nextcloud.rs` — HTTP helpers: discovery, sync-collection REPORT, `put_task_with_retry` (412 auto-retry), `delete_task_with_retry`, iCalendar mutations (`toggle_completion`, `replace_summary`, `escape_ical_text`), task rendering (`format_tasks_marked`)
 - `app/backend/src/config.rs` — TOML loader for `~/.config/retaskable/config.toml`
 - `app/ui/Main.qml` — Flow of 12 buttons + a TextField + a conditional Keep/Take/Cancel row (visible while a conflict is primed) + the response area
 - `vendor/appload-client/` — modified AppLoad client crate (the `?Send` trait change is intentional)
@@ -53,7 +55,7 @@ The build scripts handle the cross-compile env (linker, sysroot, `CC_*` per-targ
 
 **iCalendar on the wire is CRLF.** Always. `nextcloud::ensure_crlf` runs at every parse boundary (XML extraction strips CRs per XML 1.0 §2.11, so calendar-data comes back LF-only and must be restored). ETags include their surrounding quotes — pass through verbatim.
 
-**Tests are in-file.** No separate `tests/` directory. Each module has its own `#[cfg(test)] mod tests { ... }` block using `Connection::open_in_memory()`. Pre-M9a there were 6 tests; M9a brought it to 54; M9b to 86.
+**Tests are in-file.** No separate `tests/` directory. Each module has its own `#[cfg(test)] mod tests { ... }` block using `Connection::open_in_memory()`. Pre-M9a there were 6 tests; M9a brought it to 54; M9b to 86; M9c to 94.
 
 **Diagnostics.** `eprintln!("retaskable: ...")` with lowercase fragments and no terminal punctuation. Captured by xochitl → journald.
 

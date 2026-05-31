@@ -1,5 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
+use std::collections::HashMap;
 use reqwest::{header, Client, Method, StatusCode};
 use serde::Serialize;
 use url::Url;
@@ -886,7 +887,14 @@ fn parse_status(raw: &str) -> TaskStatus {
     }
 }
 
-pub fn format_tasks(tasks: &[Task]) -> String {
+/// Render the task list, prefixing each row with a pending-op marker (M9c):
+/// `! ` if the task's UID maps to `true` (errored, needs resolution), `* ` if
+/// it maps to `false` (queued, will flush), `  ` (two spaces, for alignment) if
+/// the UID isn't in `marks`.
+///
+/// The prefix is applied only when `marks` is non-empty, so a clean queue
+/// renders byte-identical to the pre-M9c output (no prefix, no indent).
+pub fn format_tasks_marked(tasks: &[Task], marks: &HashMap<String, bool>) -> String {
     let mut sorted: Vec<&Task> = tasks.iter().collect();
     sorted.sort_by_key(|t| {
         // (completed_group, undated_group, due_string)
@@ -900,6 +908,7 @@ pub fn format_tasks(tasks: &[Task]) -> String {
         return "(no tasks)".to_string();
     }
 
+    let any_marks = !marks.is_empty();
     sorted
         .into_iter()
         .map(|t| {
@@ -907,9 +916,19 @@ pub fn format_tasks(tasks: &[Task]) -> String {
                 TaskStatus::Completed => "✓",
                 _ => "☐",
             };
-            match &t.due {
+            let body = match &t.due {
                 Some(d) => format!("{glyph} {} (due {})", t.summary, d),
                 None => format!("{glyph} {}", t.summary),
+            };
+            if any_marks {
+                let prefix = match marks.get(&t.uid) {
+                    Some(true) => "! ",
+                    Some(false) => "* ",
+                    None => "  ",
+                };
+                format!("{prefix}{body}")
+            } else {
+                body
             }
         })
         .collect::<Vec<_>>()
@@ -1193,5 +1212,54 @@ mod tests {
             round_trip.contains("X-CUSTOM-PROP"),
             "X-property was dropped by icalendar round-trip:\n{round_trip}"
         );
+    }
+
+    // --- M9c: pending-op marker rendering ---
+
+    use super::{format_tasks_marked, Task, TaskStatus};
+    use std::collections::HashMap;
+
+    fn task(uid: &str, summary: &str) -> Task {
+        Task {
+            uid: uid.to_string(),
+            summary: summary.to_string(),
+            status: TaskStatus::NeedsAction,
+            due: None,
+        }
+    }
+
+    #[test]
+    fn format_tasks_marked_empty_marks_renders_no_prefix() {
+        let tasks = vec![task("uid-A", "Buy milk"), task("uid-B", "Water plants")];
+        // Regression guard: no marks -> byte-identical to the pre-M9c output
+        // (no prefix, no alignment indent).
+        assert_eq!(
+            format_tasks_marked(&tasks, &HashMap::new()),
+            "☐ Buy milk\n☐ Water plants"
+        );
+    }
+
+    #[test]
+    fn format_tasks_marked_applies_queued_errored_and_blank_prefixes() {
+        let tasks = vec![
+            task("uid-A", "Buy milk"),     // queued
+            task("uid-B", "Call plumber"), // errored
+            task("uid-C", "Water plants"), // none
+        ];
+        let mut marks = HashMap::new();
+        marks.insert("uid-A".to_string(), false); // queued -> "* "
+        marks.insert("uid-B".to_string(), true); // errored -> "! "
+        let out = format_tasks_marked(&tasks, &marks);
+        // All three are NeedsAction + undated, so the stable sort preserves
+        // input order.
+        assert_eq!(out, "* ☐ Buy milk\n! ☐ Call plumber\n  ☐ Water plants");
+    }
+
+    #[test]
+    fn format_tasks_marked_errored_value_renders_bang() {
+        let tasks = vec![task("uid-A", "Buy milk")];
+        let mut marks = HashMap::new();
+        marks.insert("uid-A".to_string(), true);
+        assert_eq!(format_tasks_marked(&tasks, &marks), "! ☐ Buy milk");
     }
 }

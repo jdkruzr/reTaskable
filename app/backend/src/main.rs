@@ -203,11 +203,12 @@ fn show_tasks(db: &mut Connection) -> anyhow::Result<String> {
     };
 
     let tasks = db::list_tasks(db, &cal_href)?;
+    let marks = db::pending_marks(db, &cal_href)?;
     let freshness = match db::last_synced(db, &cal_href)? {
         Some(t) => format!("Last synced {} ago.\n\n", humanize_since(t)),
         None => "Not yet synced -- tap Sync.\n\n".to_string(),
     };
-    Ok(format!("{freshness}{}", nextcloud::format_tasks(&tasks)))
+    Ok(format!("{freshness}{}", nextcloud::format_tasks_marked(&tasks, &marks)))
 }
 
 fn show_pending(db: &mut Connection) -> anyhow::Result<String> {

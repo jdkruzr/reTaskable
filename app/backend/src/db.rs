@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -555,7 +555,7 @@ pub fn get_first_task(
     conn: &Connection,
     calendar_href: &str,
 ) -> Result<Option<CachedTask>> {
-    // Match nextcloud::format_tasks's display sort: incomplete first, then
+    // Match nextcloud::format_tasks_marked's display sort: incomplete first, then
     // undated last, then by due ascending, then href as tiebreak. Keeps
     // "First" buttons (Toggle / Delete / Edit) in sync with what the user
     // sees at the top of Show Tasks.
@@ -587,7 +587,7 @@ pub fn get_first_task(
 }
 
 pub fn list_tasks(conn: &Connection, calendar_href: &str) -> Result<Vec<Task>> {
-    // SQL order matches get_first_task. format_tasks does a stable Rust-side
+    // SQL order matches get_first_task. format_tasks_marked does a stable Rust-side
     // sort by (completed, undated, due) -- which preserves the href tiebreak
     // SQLite gives us here -- so Show Tasks's first row and get_first_task's
     // first row come from the same total ordering.
@@ -745,6 +745,30 @@ pub fn list_pending_ops(conn: &Connection) -> Result<Vec<PendingOpView>> {
     rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.into())
 }
 
+/// Per-UID pending-op state for one calendar, used to mark rows in the Show
+/// Tasks output (M9c). Keys are target UIDs with at least one pending_op; the
+/// value is `true` if any of that UID's ops is errored (`errored` wins over a
+/// merely-queued op, since an errored op needs the user's attention). A UID
+/// with no pending op is absent from the map.
+///
+/// Deliberately no join against `task`: callers look this map up by the UIDs
+/// they're already rendering, so a pending op whose row isn't visible (e.g. an
+/// unflushed delete, which sets `pending_delete = 1` and drops out of
+/// `list_tasks`) is simply never looked up.
+pub fn pending_marks(conn: &Connection, calendar_href: &str) -> Result<HashMap<String, bool>> {
+    let mut stmt = conn.prepare(
+        "SELECT target_uid, MAX(errored) \
+           FROM pending_op \
+          WHERE target_calendar_href = ?1 \
+          GROUP BY target_uid",
+    )?;
+    let rows = stmt.query_map(params![calendar_href], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? != 0))
+    })?;
+    rows.collect::<rusqlite::Result<HashMap<_, _>>>()
+        .map_err(|e| e.into())
+}
+
 /// Clear all errored pending_op rows and reset their cache-side effects:
 /// - For errored Deletes, unset `pending_delete = 0` on the corresponding
 ///   task rows (so the row becomes live again and sync-collection can
@@ -822,6 +846,67 @@ mod tests {
 
     fn fresh() -> Connection {
         Connection::open_in_memory().expect("open in-memory sqlite")
+    }
+
+    /// Insert a pending_op row directly with a controlled `errored` flag.
+    /// `pending_marks` only reads pending_op, so no task row is needed.
+    fn seed_op(conn: &Connection, cal: &str, uid: &str, op_type: &str, errored: i64) {
+        conn.execute(
+            "INSERT INTO pending_op
+                (op_type, target_uid, target_calendar_href, payload, enqueued_at, errored)
+             VALUES (?1, ?2, ?3, NULL, 1700000000, ?4)",
+            params![op_type, uid, cal, errored],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn pending_marks_empty_when_no_ops() {
+        let conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        let marks = pending_marks(&conn, "cal1").unwrap();
+        assert!(marks.is_empty());
+    }
+
+    #[test]
+    fn pending_marks_queued_op_is_false() {
+        let conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        seed_op(&conn, "cal1", "uid-A", "toggle", 0);
+        let marks = pending_marks(&conn, "cal1").unwrap();
+        assert_eq!(marks.get("uid-A"), Some(&false));
+    }
+
+    #[test]
+    fn pending_marks_errored_op_is_true() {
+        let conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        seed_op(&conn, "cal1", "uid-A", "edit", 1);
+        let marks = pending_marks(&conn, "cal1").unwrap();
+        assert_eq!(marks.get("uid-A"), Some(&true));
+    }
+
+    #[test]
+    fn pending_marks_errored_wins_over_queued_for_same_uid() {
+        let conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        seed_op(&conn, "cal1", "uid-A", "toggle", 0);
+        seed_op(&conn, "cal1", "uid-A", "edit", 1);
+        let marks = pending_marks(&conn, "cal1").unwrap();
+        // MAX(errored) across the UID's ops -> errored wins.
+        assert_eq!(marks.get("uid-A"), Some(&true));
+        assert_eq!(marks.len(), 1, "ops for one UID collapse to one entry");
+    }
+
+    #[test]
+    fn pending_marks_scoped_to_calendar() {
+        let conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        seed_op(&conn, "cal1", "uid-A", "toggle", 0);
+        seed_op(&conn, "cal2", "uid-B", "toggle", 1);
+        let marks = pending_marks(&conn, "cal1").unwrap();
+        assert_eq!(marks.get("uid-A"), Some(&false));
+        assert!(marks.get("uid-B").is_none(), "other calendar's op must not leak in");
     }
 
     #[test]
