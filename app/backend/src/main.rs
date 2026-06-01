@@ -25,6 +25,10 @@ const MSG_SHOW_PENDING: u32 = 10;
 const MSG_CLEAR_ERRORED: u32 = 11;
 const MSG_RESOLVE_FIRST_CONFLICT: u32 = 12;
 const MSG_CONFLICT_DECISION: u32 = 13;
+const MSG_TOGGLE_BY_UID: u32 = 14;
+const MSG_GET_CONFIG: u32 = 15;
+const MSG_SAVE_CONFIG: u32 = 16;
+const MSG_DISCOVER_WITH: u32 = 17;
 const MSG_PONG: u32 = 101;
 const MSG_NEXTCLOUD_RESPONSE: u32 = 102;
 const MSG_CALENDARS_RESPONSE: u32 = 103;
@@ -38,6 +42,10 @@ const MSG_SHOW_PENDING_RESPONSE: u32 = 110;
 const MSG_CLEAR_ERRORED_RESPONSE: u32 = 111;
 const MSG_RESOLVE_FIRST_CONFLICT_RESPONSE: u32 = 112;
 const MSG_CONFLICT_DECISION_RESPONSE: u32 = 113;
+const MSG_TOGGLE_BY_UID_RESPONSE: u32 = 114;
+const MSG_GET_CONFIG_RESPONSE: u32 = 115;
+const MSG_SAVE_CONFIG_RESPONSE: u32 = 116;
+const MSG_DISCOVER_WITH_RESPONSE: u32 = 117;
 
 #[tokio::main]
 async fn main() {
@@ -79,8 +87,11 @@ impl AppLoadBackend for Backend {
                 send(replier, MSG_CALENDARS_RESPONSE, &response);
             }
             MSG_SHOW_TASKS => {
-                eprintln!("retaskable: show tasks requested");
-                let response = match show_tasks(&mut self.db) {
+                // Payload "all" includes finished tasks (Show Completed toggle);
+                // anything else (incl. "open"/"") is the default open-only view.
+                let include_completed = msg.contents.trim() == "all";
+                eprintln!("retaskable: show tasks requested (include_completed={include_completed})");
+                let response = match show_tasks(&mut self.db, include_completed) {
                     Ok(s) => s,
                     Err(e) => format!("error: {e:#}"),
                 };
@@ -171,6 +182,39 @@ impl AppLoadBackend for Backend {
                 eprintln!("retaskable: conflict decision result:\n{response}");
                 send(replier, MSG_CONFLICT_DECISION_RESPONSE, &response);
             }
+            MSG_TOGGLE_BY_UID => {
+                eprintln!(
+                    "retaskable: toggle-by-uid requested ({} chars)",
+                    msg.contents.len()
+                );
+                let response = match toggle_by_uid(&mut self.db, &msg.contents) {
+                    Ok(s) => s,
+                    Err(e) => format!("error: {e:#}"),
+                };
+                eprintln!("retaskable: toggle-by-uid result:\n{response}");
+                send(replier, MSG_TOGGLE_BY_UID_RESPONSE, &response);
+            }
+            MSG_GET_CONFIG => {
+                eprintln!("retaskable: get config requested");
+                let response = get_config();
+                send(replier, MSG_GET_CONFIG_RESPONSE, &response);
+            }
+            MSG_SAVE_CONFIG => {
+                // Payload carries the app password; log only its size, never the body.
+                eprintln!(
+                    "retaskable: save config requested ({} chars)",
+                    msg.contents.len()
+                );
+                let response = save_config(&mut self.db, &msg.contents);
+                eprintln!("retaskable: save config result:\n{response}");
+                send(replier, MSG_SAVE_CONFIG_RESPONSE, &response);
+            }
+            MSG_DISCOVER_WITH => {
+                // Payload carries credentials; don't log it.
+                eprintln!("retaskable: discover-with requested");
+                let response = discover_with(&msg.contents).await;
+                send(replier, MSG_DISCOVER_WITH_RESPONSE, &response);
+            }
             t => eprintln!("retaskable: ignoring unknown msg type {t}"),
         }
     }
@@ -187,7 +231,7 @@ async fn list_calendars() -> anyhow::Result<String> {
     Ok(serde_json::to_string_pretty(&calendars)?)
 }
 
-fn show_tasks(db: &mut Connection) -> anyhow::Result<String> {
+fn show_tasks(db: &mut Connection, include_completed: bool) -> anyhow::Result<String> {
     let cfg = config::load()?;
     let wanted = cfg.nextcloud.calendar.as_ref().ok_or_else(|| {
         anyhow::anyhow!(
@@ -203,12 +247,13 @@ fn show_tasks(db: &mut Connection) -> anyhow::Result<String> {
     };
 
     let tasks = db::list_tasks(db, &cal_href)?;
+    let tasks = nextcloud::filter_for_display(tasks, include_completed);
     let marks = db::pending_marks(db, &cal_href)?;
-    let freshness = match db::last_synced(db, &cal_href)? {
-        Some(t) => format!("Last synced {} ago.\n\n", humanize_since(t)),
-        None => "Not yet synced -- tap Sync.\n\n".to_string(),
+    let last_synced = match db::last_synced(db, &cal_href)? {
+        Some(t) => Some(format!("Last synced {} ago.", humanize_since(t))),
+        None => None,
     };
-    Ok(format!("{freshness}{}", nextcloud::format_tasks_marked(&tasks, &marks)))
+    Ok(nextcloud::format_tasks_json(&tasks, &marks, last_synced.as_deref()))
 }
 
 fn show_pending(db: &mut Connection) -> anyhow::Result<String> {
@@ -344,6 +389,70 @@ fn format_no_conflict_preview() -> String {
 mod tests {
     use super::*;
     use crate::queue::FlushSummary;
+
+    #[test]
+    fn toggle_by_uid_inner_flips_completed_and_marks_queued() {
+        use rusqlite::Connection;
+        let mut conn = Connection::open_in_memory().unwrap();
+        db::ensure_schema_v2(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO calendar (href, display_name) VALUES ('/cal/', 'Cal')",
+            [],
+        )
+        .unwrap();
+        // Seed a live needs-action task with a proper VTODO body.
+        db::enqueue_create(&mut conn, "/cal/", "uid-1", "Buy milk").unwrap();
+
+        let out = toggle_by_uid_inner(&mut conn, "/cal/", "uid-1").expect("toggle");
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["uid"], "uid-1");
+        assert_eq!(v["completed"], true); // needs-action -> completed
+        assert_eq!(v["mark"], "*");
+
+        // The cache flipped and a freshly-queued (non-errored) op exists for uid-1.
+        let marks = db::pending_marks(&conn, "/cal/").unwrap();
+        assert_eq!(marks.get("uid-1"), Some(&false));
+    }
+
+    #[test]
+    fn toggle_by_uid_inner_unknown_uid_errors() {
+        use rusqlite::Connection;
+        let mut conn = Connection::open_in_memory().unwrap();
+        db::ensure_schema_v2(&conn).unwrap();
+        assert!(toggle_by_uid_inner(&mut conn, "/cal/", "nope").is_err());
+    }
+
+    fn cfg(base_url: &str, calendar: Option<&str>) -> config::Config {
+        config::Config {
+            nextcloud: config::NextcloudConfig {
+                base_url: base_url.to_string(),
+                username: "u".to_string(),
+                app_password: "p".to_string(),
+                calendar: calendar.map(|s| s.to_string()),
+            },
+        }
+    }
+
+    #[test]
+    fn target_changed_true_on_first_run_url_or_calendar() {
+        let old = cfg("https://a", Some("Personal"));
+        // first run (no prior config)
+        assert!(target_changed(None, "https://a", &Some("Personal".to_string())));
+        // identical target -> unchanged
+        assert!(!target_changed(Some(&old), "https://a", &Some("Personal".to_string())));
+        // server url changed
+        assert!(target_changed(Some(&old), "https://b", &Some("Personal".to_string())));
+        // calendar changed
+        assert!(target_changed(Some(&old), "https://a", &Some("Work".to_string())));
+    }
+
+    #[test]
+    fn target_changed_false_when_only_credentials_differ() {
+        // Same base_url + calendar; only username/password would differ. The
+        // helper only inspects target, so it must report no change.
+        let old = cfg("https://a", Some("Personal"));
+        assert!(!target_changed(Some(&old), "https://a", &Some("Personal".to_string())));
+    }
 
     #[test]
     fn compose_empty_queue_matches_legacy_format() {
@@ -1092,9 +1201,12 @@ async fn sync(db: &mut Connection) -> anyhow::Result<String> {
     if let Some(token) = &delta.new_sync_token {
         db::set_sync_token(db, &cal.href, token, SystemTime::now())?;
     } else if was_full {
-        // Server didn't return a sync-token. Wipe whatever we had so the
-        // next attempt also goes full. (Shouldn't happen with Nextcloud.)
+        // No sync-token: either Nextcloud omitted it, or this is the
+        // calendar-query fallback for a server without WebDAV-Sync. Clear any
+        // stale token so the next pass stays full, but still record the sync
+        // time so the UI shows "Last synced …" instead of "Not yet synced".
         db::clear_sync_token(db, &cal.href)?;
+        db::set_last_synced(db, &cal.href, SystemTime::now())?;
     }
 
     let kind = if was_full { "full" } else { "incremental" };
@@ -1131,6 +1243,182 @@ fn toggle_first(db: &mut Connection) -> anyhow::Result<String> {
     Ok(format!(
         "Queued: toggle \"{summary}\" -> {new_state} (#{op_id})"
     ))
+}
+
+/// MSG_TOGGLE_BY_UID handler. The M10 ListView addresses a specific task by its
+/// UID (the checkbox the user tapped) rather than the positional "first" task.
+/// Thin config/calendar-resolution wrapper around `toggle_by_uid_inner`, which
+/// holds the testable DB logic.
+fn toggle_by_uid(db: &mut Connection, uid: &str) -> anyhow::Result<String> {
+    let uid = uid.trim();
+    if uid.is_empty() {
+        anyhow::bail!("uid cannot be empty");
+    }
+
+    let cfg = config::load()?;
+    let wanted = cfg.nextcloud.calendar.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "config is missing `calendar = \"...\"` under [nextcloud]. \
+             Run List Calendars to see options."
+        )
+    })?;
+
+    let Some(cal_href) = db::get_calendar_href_by_display_name(db, wanted)? else {
+        return Ok(format!(
+            "calendar {wanted:?} not yet synced -- tap Sync first."
+        ));
+    };
+
+    toggle_by_uid_inner(db, &cal_href, uid)
+}
+
+/// Enqueue a toggle for a specific UID and return the compact JSON the QML row
+/// applies optimistically: `{"uid":…,"completed":bool,"mark":"*"}`. The status
+/// flip happens in `db::enqueue_toggle` (cache is mutated at enqueue time), and
+/// the freshly-queued op renders as `*` until the next Sync reconciles it.
+fn toggle_by_uid_inner(
+    db: &mut Connection,
+    cal_href: &str,
+    uid: &str,
+) -> anyhow::Result<String> {
+    let Some(task) = db::get_cached_task_by_uid(db, cal_href, uid)? else {
+        anyhow::bail!("no task with uid {uid}");
+    };
+    let was_completed = task.status == "completed";
+
+    // enqueue_toggle flips the cached status in place and inserts the pending op.
+    // It enforces liveness (errors on a tombstoned/missing row), so a stale uid
+    // surfaces as an Err the dispatcher renders as "error: ...".
+    db::enqueue_toggle(db, cal_href, uid)?;
+
+    let now_completed = !was_completed;
+    Ok(serde_json::json!({
+        "uid": uid,
+        "completed": now_completed,
+        "mark": "*",
+    })
+    .to_string())
+}
+
+/// MSG_GET_CONFIG handler. Returns the current sync target for the Settings
+/// form. Never returns the app password — only whether one is stored, so the
+/// secret never round-trips to QML. Always returns JSON (no error wrapper).
+fn get_config() -> String {
+    match config::load_optional() {
+        Ok(Some(c)) => serde_json::json!({
+            "configured": true,
+            "base_url": c.nextcloud.base_url,
+            "username": c.nextcloud.username,
+            "calendar": c.nextcloud.calendar,
+            "has_password": !c.nextcloud.app_password.is_empty(),
+        })
+        .to_string(),
+        Ok(None) => serde_json::json!({
+            "configured": false,
+            "base_url": "",
+            "username": "",
+            "calendar": serde_json::Value::Null,
+            "has_password": false,
+        })
+        .to_string(),
+        Err(e) => serde_json::json!({
+            "configured": false,
+            "error": format!("{e:#}"),
+        })
+        .to_string(),
+    }
+}
+
+/// Did the sync *target* change? A changed server URL or calendar invalidates
+/// the local cache; a username/password-only change does not (same data, new
+/// auth), so we keep the cache + any queued offline ops in that case.
+fn target_changed(old: Option<&config::Config>, base_url: &str, calendar: &Option<String>) -> bool {
+    match old {
+        None => true,
+        Some(o) => o.nextcloud.base_url != base_url || &o.nextcloud.calendar != calendar,
+    }
+}
+
+/// MSG_SAVE_CONFIG handler. Writes the new config (blank password keeps the
+/// existing one) and resets the cache only when the target changed. Returns
+/// `{ok: true}` or `{ok: false, error}`.
+fn save_config(db: &mut Connection, payload: &str) -> String {
+    match save_config_inner(db, payload) {
+        Ok(()) => serde_json::json!({ "ok": true }).to_string(),
+        Err(e) => serde_json::json!({ "ok": false, "error": format!("{e:#}") }).to_string(),
+    }
+}
+
+fn save_config_inner(db: &mut Connection, payload: &str) -> anyhow::Result<()> {
+    let v: serde_json::Value = serde_json::from_str(payload)?;
+    let base_url = v.get("base_url").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+    let username = v.get("username").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+    let new_password = v.get("app_password").and_then(|x| x.as_str()).unwrap_or("");
+    let calendar = v
+        .get("calendar")
+        .and_then(|x| x.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if base_url.is_empty() || username.is_empty() {
+        anyhow::bail!("base_url and username are required");
+    }
+
+    let old = config::load_optional()?;
+    let app_password =
+        config::merge_password(new_password, old.as_ref().map(|c| c.nextcloud.app_password.as_str()));
+    let changed = target_changed(old.as_ref(), &base_url, &calendar);
+
+    let cfg = config::Config {
+        nextcloud: config::NextcloudConfig {
+            base_url,
+            username,
+            app_password,
+            calendar,
+        },
+    };
+    config::save(&cfg)?;
+    if changed {
+        db::reset_cache(db)?;
+    }
+    Ok(())
+}
+
+/// MSG_DISCOVER_WITH handler. Validates the provided credentials by listing the
+/// account's calendars *without* saving anything first (so the Settings form can
+/// Test + populate the picker for brand-new, unsaved creds). A blank password
+/// falls back to the stored one. Returns `{ok, calendars}` or `{ok:false,error}`.
+async fn discover_with(payload: &str) -> String {
+    match discover_with_inner(payload).await {
+        Ok(cals) => serde_json::json!({
+            "ok": true,
+            "calendars": cals
+                .iter()
+                .map(|c| serde_json::json!({ "display_name": c.display_name, "href": c.href }))
+                .collect::<Vec<_>>(),
+        })
+        .to_string(),
+        Err(e) => serde_json::json!({ "ok": false, "error": format!("{e:#}") }).to_string(),
+    }
+}
+
+async fn discover_with_inner(payload: &str) -> anyhow::Result<Vec<nextcloud::Calendar>> {
+    let v: serde_json::Value = serde_json::from_str(payload)?;
+    let base_url = v.get("base_url").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+    let username = v.get("username").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+    let new_password = v.get("app_password").and_then(|x| x.as_str()).unwrap_or("");
+    if base_url.is_empty() || username.is_empty() {
+        anyhow::bail!("base_url and username are required");
+    }
+    let old = config::load_optional()?;
+    let app_password =
+        config::merge_password(new_password, old.as_ref().map(|c| c.nextcloud.app_password.as_str()));
+    let cfg = config::NextcloudConfig {
+        base_url,
+        username,
+        app_password,
+        calendar: None,
+    };
+    nextcloud::discover_calendars(&cfg).await
 }
 
 fn create(db: &mut Connection, summary: &str) -> anyhow::Result<String> {

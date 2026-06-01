@@ -2,3 +2,4 @@ app/output-pc/
 app/output-rmpp/
 app/backend/target/
 sdk/
+.claude/

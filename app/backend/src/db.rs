@@ -206,6 +206,21 @@ pub fn set_sync_token(
     Ok(())
 }
 
+/// Record a successful sync's timestamp without touching the sync-token. Used by
+/// the calendar-query fallback (servers without WebDAV-Sync return no token, but
+/// the UI still needs a "Last synced …" time).
+pub fn set_last_synced(conn: &Connection, href: &str, when: SystemTime) -> Result<()> {
+    let secs = when
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_secs() as i64;
+    conn.execute(
+        "UPDATE calendar SET last_synced_at = ?1 WHERE href = ?2",
+        params![secs, href],
+    )?;
+    Ok(())
+}
+
 pub fn last_synced(conn: &Connection, href: &str) -> Result<Option<SystemTime>> {
     let secs: Option<i64> = conn
         .query_row(
@@ -718,6 +733,19 @@ pub fn get_cached_task_by_uid(
     Ok(row)
 }
 
+/// Wipe all synced state so the next Sync does a clean full pull. Used when the
+/// sync target (server URL or calendar) changes via Settings (M11). Clears the
+/// task cache, the offline-op queue, and the calendar table (which carries the
+/// `sync_token` + `last_synced_at`); leaves `meta` (schema version) intact.
+pub fn reset_cache(conn: &Connection) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("DELETE FROM task", [])?;
+    tx.execute("DELETE FROM pending_op", [])?;
+    tx.execute("DELETE FROM calendar", [])?;
+    tx.commit()?;
+    Ok(())
+}
+
 /// Fetch all pending_op rows (errored and not) for display in the Show
 /// Pending response. Joined against task by target_uid for the summary
 /// column.
@@ -1132,6 +1160,51 @@ mod tests {
         let rows = list_tasks(&conn, "/cal/").expect("list");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].summary, "live");
+    }
+
+    #[test]
+    fn set_last_synced_updates_time_without_a_token() {
+        let conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        conn.execute(
+            "INSERT INTO calendar (href, display_name, sync_token, last_synced_at) VALUES ('/c/','C',NULL,NULL)",
+            [],
+        ).unwrap();
+        assert!(last_synced(&conn, "/c/").unwrap().is_none());
+        set_last_synced(&conn, "/c/", SystemTime::now()).expect("set");
+        assert!(last_synced(&conn, "/c/").unwrap().is_some());
+        // sync_token stays NULL (calendar-query servers have none).
+        assert!(get_sync_token(&conn, "/c/").unwrap().is_none());
+    }
+
+    #[test]
+    fn reset_cache_clears_task_pending_calendar_but_keeps_meta() {
+        let conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        conn.execute(
+            "INSERT INTO calendar (href, display_name, sync_token, last_synced_at) VALUES ('/c/','C','tok',1)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO task (calendar_href, href, etag, ical_text, summary, status, due, uid, pending_delete) \
+             VALUES ('/c/','/c/t.ics','','','S','needs-action',NULL,'u',0)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO pending_op (op_type, target_uid, target_calendar_href, payload, enqueued_at) \
+             VALUES ('toggle','u','/c/',NULL,1)",
+            [],
+        ).unwrap();
+        let meta_before: i64 = conn.query_row("SELECT COUNT(*) FROM meta", [], |r| r.get(0)).unwrap();
+
+        reset_cache(&conn).expect("reset");
+
+        let tc: i64 = conn.query_row("SELECT COUNT(*) FROM task", [], |r| r.get(0)).unwrap();
+        let pc: i64 = conn.query_row("SELECT COUNT(*) FROM pending_op", [], |r| r.get(0)).unwrap();
+        let cc: i64 = conn.query_row("SELECT COUNT(*) FROM calendar", [], |r| r.get(0)).unwrap();
+        let meta_after: i64 = conn.query_row("SELECT COUNT(*) FROM meta", [], |r| r.get(0)).unwrap();
+        assert_eq!((tc, pc, cc), (0, 0, 0));
+        assert_eq!(meta_before, meta_after); // schema version untouched
     }
 
     #[test]

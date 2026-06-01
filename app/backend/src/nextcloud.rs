@@ -162,7 +162,7 @@ pub async fn sync_collection_with_fallback(
             Ok(d) => return Ok((d, false)),
             Err(e) => {
                 let msg = format!("{e:#}");
-                if msg.contains("412") || msg.contains("403") {
+                if msg.contains("412") || msg.contains("403") || sync_collection_unsupported(&msg) {
                     eprintln!(
                         "retaskable: sync-token rejected ({msg}); falling back to full sync"
                     );
@@ -173,8 +173,28 @@ pub async fn sync_collection_with_fallback(
         }
     }
     eprintln!("retaskable: sync-collection full (empty token)");
-    let d = sync_collection(client, calendar_url, None, auth).await?;
-    Ok((d, true))
+    match sync_collection(client, calendar_url, None, auth).await {
+        Ok(d) => Ok((d, true)),
+        Err(e) => {
+            let msg = format!("{e:#}");
+            if sync_collection_unsupported(&msg) {
+                // RFC 6578 WebDAV-Sync is optional; some CalDAV servers (e.g.
+                // go-webdav-based) reject the sync-collection REPORT outright.
+                // Fall back to an RFC 4791 calendar-query: enumerate every VTODO
+                // each time (no sync-token → always a full pull).
+                eprintln!(
+                    "retaskable: server lacks sync-collection ({msg}); \
+                     falling back to calendar-query"
+                );
+                let d = calendar_query_all(client, calendar_url, auth)
+                    .await
+                    .context("calendar-query fallback")?;
+                Ok((d, true))
+            } else {
+                Err(e)
+            }
+        }
+    }
 }
 
 async fn sync_collection(
@@ -187,6 +207,53 @@ async fn sync_collection(
     let resp = dav_request(client, b"REPORT", calendar_url, body, "1", auth)
         .await
         .context("REPORT sync-collection")?;
+    parse_sync_response(&resp.body, &resp.final_url)
+}
+
+/// Does this error indicate the server doesn't implement the `sync-collection`
+/// REPORT (RFC 6578)? Such servers answer with a 400/501 mentioning
+/// sync-collection (e.g. go-webdav: `unsupported REPORT root ... sync-collection`).
+fn sync_collection_unsupported(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("sync-collection")
+        && (m.contains("unsupported")
+            || m.contains("not implemented")
+            || m.contains("400")
+            || m.contains("501"))
+}
+
+/// RFC 4791 §9.5 calendar-query REPORT body: fetch every VTODO's etag +
+/// calendar-data in one shot. Used as the fallback for servers without
+/// WebDAV-Sync.
+fn calendar_query_body() -> String {
+    r#"<?xml version="1.0" encoding="utf-8"?>
+<c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:prop>
+    <d:getetag/>
+    <c:calendar-data/>
+  </d:prop>
+  <c:filter>
+    <c:comp-filter name="VCALENDAR">
+      <c:comp-filter name="VTODO"/>
+    </c:comp-filter>
+  </c:filter>
+</c:calendar-query>
+"#
+    .to_string()
+}
+
+/// Enumerate all VTODOs via calendar-query. The multistatus shape matches
+/// sync-collection's (href + getetag + calendar-data), so `parse_sync_response`
+/// handles it directly; it carries no sync-token, so the caller treats the
+/// result as a full sync.
+async fn calendar_query_all(
+    client: &Client,
+    calendar_url: &Url,
+    auth: (&str, &str),
+) -> Result<SyncDelta> {
+    let resp = dav_request(client, b"REPORT", calendar_url, calendar_query_body(), "1", auth)
+        .await
+        .context("REPORT calendar-query")?;
     parse_sync_response(&resp.body, &resp.final_url)
 }
 
@@ -894,6 +961,9 @@ fn parse_status(raw: &str) -> TaskStatus {
 ///
 /// The prefix is applied only when `marks` is non-empty, so a clean queue
 /// renders byte-identical to the pre-M9c output (no prefix, no indent).
+// Retained for the M9c test suite; the live Show Tasks path now emits JSON via
+// `format_tasks_json`, so this is dead code in non-test (device) builds.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn format_tasks_marked(tasks: &[Task], marks: &HashMap<String, bool>) -> String {
     let mut sorted: Vec<&Task> = tasks.iter().collect();
     sorted.sort_by_key(|t| {
@@ -933,6 +1003,74 @@ pub fn format_tasks_marked(tasks: &[Task], marks: &HashMap<String, bool>) -> Str
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Render the task list as a JSON envelope for the M10 ListView UI:
+///
+/// ```json
+/// {
+///   "last_synced": "Last synced 2 hours ago.",   // or null when never synced
+///   "tasks": [
+///     {"uid":"…","summary":"Buy milk","completed":false,"due":"2026-06-01","mark":""}
+///   ]
+/// }
+/// ```
+///
+/// `mark` is `"!"` (errored, needs resolution), `"*"` (queued, will flush), or
+/// `""` (clean) — the same per-UID state `format_tasks_marked` renders as a text
+/// prefix, but here the field is always present so the QML consumer can key off
+/// it directly. Tasks are sorted with the same total ordering as
+/// `format_tasks_marked` / `list_tasks` (incomplete first, then undated, then by
+/// due date).
+pub fn format_tasks_json(
+    tasks: &[Task],
+    marks: &HashMap<String, bool>,
+    last_synced: Option<&str>,
+) -> String {
+    let mut sorted: Vec<&Task> = tasks.iter().collect();
+    sorted.sort_by_key(|t| {
+        let completed = matches!(t.status, TaskStatus::Completed) as u8;
+        let undated = t.due.is_none() as u8;
+        let due = t.due.clone().unwrap_or_default();
+        (completed, undated, due)
+    });
+
+    let rows: Vec<serde_json::Value> = sorted
+        .into_iter()
+        .map(|t| {
+            let mark = match marks.get(&t.uid) {
+                Some(true) => "!",
+                Some(false) => "*",
+                None => "",
+            };
+            serde_json::json!({
+                "uid": t.uid,
+                "summary": t.summary,
+                "completed": matches!(t.status, TaskStatus::Completed),
+                "due": t.due,
+                "mark": mark,
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        "last_synced": last_synced,
+        "tasks": rows,
+    })
+    .to_string()
+}
+
+/// Filter the cached task list for display. The M10 ListView hides finished
+/// tasks (completed/cancelled) by default so the active list stays readable;
+/// the "Show Completed" toggle passes `include_completed = true` to keep them.
+pub fn filter_for_display(tasks: Vec<Task>, include_completed: bool) -> Vec<Task> {
+    if include_completed {
+        return tasks;
+    }
+    tasks
+        .into_iter()
+        .filter(|t| !matches!(t.status, TaskStatus::Completed | TaskStatus::Cancelled))
+        .collect()
 }
 
 fn parse_href_property(xml: &str, property_local_name: &str) -> Result<String> {
@@ -1030,7 +1168,10 @@ fn propstat_is_ok(propstat: &roxmltree::Node) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_crlf, escape_ical_text, get_task, replace_summary};
+    use super::{
+        ensure_crlf, escape_ical_text, filter_for_display, format_tasks_json, get_task,
+        parse_sync_response, replace_summary, sync_collection_unsupported,
+    };
 
     #[test]
     fn replace_summary_preserves_unrelated_properties() {
@@ -1261,5 +1402,121 @@ mod tests {
         let mut marks = HashMap::new();
         marks.insert("uid-A".to_string(), true);
         assert_eq!(format_tasks_marked(&tasks, &marks), "! ☐ Buy milk");
+    }
+
+    #[test]
+    fn format_tasks_json_empty_renders_empty_envelope() {
+        let out = format_tasks_json(&[], &HashMap::new(), None);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["last_synced"], serde_json::Value::Null);
+        assert_eq!(v["tasks"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn format_tasks_json_carries_fields_and_queued_mark() {
+        let tasks = vec![
+            Task {
+                uid: "uid-A".to_string(),
+                summary: "Buy milk".to_string(),
+                status: TaskStatus::NeedsAction,
+                due: None,
+            },
+            Task {
+                uid: "uid-B".to_string(),
+                summary: "Pay rent".to_string(),
+                status: TaskStatus::Completed,
+                due: Some("2026-06-01".to_string()),
+            },
+        ];
+        let mut marks = HashMap::new();
+        marks.insert("uid-A".to_string(), false); // queued -> "*"
+        let out = format_tasks_json(&tasks, &marks, Some("Last synced 5 minutes ago."));
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["last_synced"], "Last synced 5 minutes ago.");
+        let arr = v["tasks"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        // incomplete sorts before completed (same ordering as format_tasks_marked)
+        assert_eq!(arr[0]["uid"], "uid-A");
+        assert_eq!(arr[0]["summary"], "Buy milk");
+        assert_eq!(arr[0]["completed"], false);
+        assert_eq!(arr[0]["due"], serde_json::Value::Null);
+        assert_eq!(arr[0]["mark"], "*");
+        assert_eq!(arr[1]["uid"], "uid-B");
+        assert_eq!(arr[1]["completed"], true);
+        assert_eq!(arr[1]["due"], "2026-06-01");
+        assert_eq!(arr[1]["mark"], "");
+    }
+
+    #[test]
+    fn format_tasks_json_errored_mark_is_bang() {
+        let tasks = vec![task("uid-A", "Buy milk")];
+        let mut marks = HashMap::new();
+        marks.insert("uid-A".to_string(), true);
+        let out = format_tasks_json(&tasks, &marks, None);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["tasks"][0]["mark"], "!");
+    }
+
+    fn task_with_status(uid: &str, status: TaskStatus) -> Task {
+        Task {
+            uid: uid.to_string(),
+            summary: uid.to_string(),
+            status,
+            due: None,
+        }
+    }
+
+    #[test]
+    fn filter_for_display_hides_completed_and_cancelled_by_default() {
+        let tasks = vec![
+            task_with_status("open", TaskStatus::NeedsAction),
+            task_with_status("doing", TaskStatus::InProcess),
+            task_with_status("done", TaskStatus::Completed),
+            task_with_status("dropped", TaskStatus::Cancelled),
+        ];
+        let out = filter_for_display(tasks, false);
+        let uids: Vec<&str> = out.iter().map(|t| t.uid.as_str()).collect();
+        assert_eq!(uids, vec!["open", "doing"]);
+    }
+
+    #[test]
+    fn filter_for_display_include_completed_keeps_everything() {
+        let tasks = vec![
+            task_with_status("open", TaskStatus::NeedsAction),
+            task_with_status("done", TaskStatus::Completed),
+            task_with_status("dropped", TaskStatus::Cancelled),
+        ];
+        assert_eq!(filter_for_display(tasks, true).len(), 3);
+    }
+
+    #[test]
+    fn sync_collection_unsupported_detects_go_webdav_400() {
+        let msg = "REPORT sync-collection: https://x/caldav/user/calendars/tasks/ -> \
+                   400 Bad Request: caldav: unsupported REPORT root \"DAV:\" \"sync-collection\"";
+        assert!(sync_collection_unsupported(msg));
+        // Unrelated failures must NOT trigger the calendar-query fallback.
+        assert!(!sync_collection_unsupported("PUT failed -> 412 Precondition Failed"));
+        assert!(!sync_collection_unsupported("network error: connection refused"));
+    }
+
+    #[test]
+    fn parse_sync_response_handles_calendar_query_without_sync_token() {
+        // A calendar-query multistatus: same href+getetag+calendar-data shape as
+        // sync-collection, but no <sync-token> and no 404 deletes.
+        let xml = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+            <d:multistatus xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\">\n\
+            <d:response><d:href>/cal/abc.ics</d:href><d:propstat><d:prop>\
+            <d:getetag>\"e1\"</d:getetag>\
+            <c:calendar-data>BEGIN:VCALENDAR\nVERSION:2.0\nBEGIN:VTODO\nUID:abc\n\
+            SUMMARY:Buy milk\nSTATUS:NEEDS-ACTION\nEND:VTODO\nEND:VCALENDAR\n</c:calendar-data>\
+            </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>\n\
+            </d:multistatus>";
+        let base = url::Url::parse("https://x.example/cal/").unwrap();
+        let delta = parse_sync_response(xml, &base).expect("parse");
+        assert!(delta.new_sync_token.is_none());
+        assert!(delta.deleted_hrefs.is_empty());
+        assert_eq!(delta.added_or_updated.len(), 1);
+        assert_eq!(delta.added_or_updated[0].task.summary, "Buy milk");
+        assert_eq!(delta.added_or_updated[0].etag, "\"e1\"");
     }
 }
