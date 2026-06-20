@@ -1,0 +1,94 @@
+; reTaskable — "Send to reTaskable" capture hook for the handwriting lasso menu.
+; xochitl 3.27 (reMarkable Paper Pro, 5.6.75 chiappa). xovi + qmldiff extension.
+; SPDX-License-Identifier: GPL-3.0-only
+;
+; Adds a button to the handwriting selection menu (SceneSelectionHandler's ?#tools:
+; cut / copy / convert-to-text / delete) that captures the lassoed strokes as a
+; CalDAV to-do WITHOUT altering the note. On tap it clones the selected items and
+; runs cloud handwriting recognition (the same MyScript path "Convert to text"
+; uses), reads the recognized text, and writes an intake JSON the reTaskable
+; backend drains (M13 spool) into an anchored to-do that remembers its source page.
+;
+; Three coordinated patches, mirroring how the stock convert-to-text flow is wired:
+;   A  SceneSelectionHandler.qml — the menu button + a `sendToReTaskable` signal
+;   B  DeviceSceneView.qml       — wire the signal to a NON-DESTRUCTIVE convert-on-clone
+;   C  HwcSelection.qml          — recognize (no insert) and write the intake JSON
+;
+; Published HASHED for xochitl 3.27 (qmldiff hashtab tokens, not symbol names). To
+; read or edit: `qmldiff hash-diffs <device-hashtab> retaskableSend.qmd -r` unhashes
+; it in place; edit the readable form, then re-hash (same command without -r) before
+; committing. The device hashtab is at
+; /home/root/xovi/exthome/qt-resource-rebuilder/hashtab. See docs/m14-tooling/.
+
+; --- A: handwriting-menu button + signal -------------------------------------
+AFFECT [[3197972396468700595]]
+	TRAVERSE ?#[[10742505294233322867]]
+		LOCATE BEFORE [[197082485]]
+		INSERT { signal sendToReTaskable }
+	END TRAVERSE
+	TRAVERSE ?#[[214642769434]]
+		LOCATE BEFORE [[425121728314878811.16765000136167945189.7081261925573]]#[[3012293087768835154]]
+		INSERT {
+			~&425121728314878811&~.~&16765000136167945189&~.~&7081261925573&~ {
+				~&5972374&~: sendToReTaskableButton
+				~&481641799955318521&~: ~&5971598&~.~&233696851602406&~
+				~&6504337259&~: ~&214642769434&~.~&6504337259&~
+				~&8399601734642709923&~: ~&"15094524446771854124&~
+				~&254542236275632405&~: ~&10742505294233322867&~.sendToReTaskable()
+			}
+		}
+	END TRAVERSE
+END AFFECT
+
+; --- B: wire the signal to a non-destructive convert-on-clone ----------------
+AFFECT [[11806562588218124596]]
+	TRAVERSE ?#[[18399528329672988301]]
+		LOCATE AFTER ALL
+		INSERT {
+			onSendToReTaskable: {
+				~&6504254477&~.~&7282468819357443632&~(function () {
+					~&11077763042784530127&~.sendToReTaskableFrom(~&8399340108982949229&~.~&5308518110917893541&~(~&8399340108982949229&~.~&15752433948179392809&~, ~&6504254477&~.~&15777890623490054006&~));
+					~&6504254477&~.~&12148339614529610933&~();
+				});
+			}
+		}
+	END TRAVERSE
+END AFFECT
+
+; --- C: recognize (no insert) and write the M13 intake JSON ------------------
+AFFECT [[15977735761668523171]]
+	TRAVERSE ?#[[6504254477]]
+		LOCATE BEFORE [[233724020120234]]
+		INSERT {
+			property ~&6503679477&~ sendingToReTaskable: ~&214625660372&~
+			function sendToReTaskableFrom(~&214629893131&~) {
+				sendingToReTaskable = ~&6504329801&~;
+				~&8398536573969953217&~.~&15319355904852707254&~(~&214629893131&~, ~&7712198086779994&~.~&5671208228825160146&~);
+			}
+		}
+	END TRAVERSE
+	TRAVERSE ?#[[742117811095419965]]
+		REBUILD [[12940955005542131354]]
+			LOCATE AFTER STREAM / { /
+			INSERT {
+				~&5972376&~ (sendingToReTaskable) {
+					~&5972376&~ (!~&7713012755563699&~) { ~&7083121450889&~; }
+					~&197102514&~ rtText = ~&3875029581909304837&~.plainText.replace(/\n/g, ~&"180905&~).~&6504329413&~();
+					~&197102514&~ rtPage = ~&6504254477&~.~&477346483278306569&~;
+					~&197102514&~ rtPayload = ~&6502785411&~.~&254548178208422824&~({
+						~&233744916906391&~: rtText,
+						source_doc_uuid: ~&6504254477&~.~&7712934851008712&~.~&5972374&~,
+						source_page_key: "idx:" + rtPage,
+						source_label: "reMarkable note · p." + (rtPage + 1),
+						captured_at:  new  ~&6502586279&~().toISOString()
+					});
+					~&197102514&~ rtReq =  new  XMLHttpRequest();
+					rtReq.~&6504147419&~("PUT", "file:///home/root/.local/share/retaskable/intake/cap_" + ~&6502586279&~.now() + ".json");
+					rtReq.~&6504279475&~(rtPayload);
+					sendingToReTaskable = ~&214625660372&~;
+					~&7083121450889&~;
+				}
+			}
+		END REBUILD
+	END TRAVERSE
+END AFFECT

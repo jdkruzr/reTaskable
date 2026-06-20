@@ -109,6 +109,20 @@ pub fn open() -> Result<Connection> {
     let conn = Connection::open(&p)
         .with_context(|| format!("opening sqlite at {}", p.display()))?;
     ensure_schema_v2(&conn)?;
+
+    // Ensure the intake spool dir exists so the M14 xochitl capture hook's
+    // `file://` PUT always has a target (XMLHttpRequest PUT does not mkdir).
+    // Non-fatal: drain_intake tolerates a missing dir, and a spool hiccup must
+    // not block app startup.
+    if let Ok(intake) = intake_dir() {
+        if let Err(e) = std::fs::create_dir_all(&intake) {
+            eprintln!(
+                "retaskable: could not create intake dir {}: {e}",
+                intake.display()
+            );
+        }
+    }
+
     Ok(conn)
 }
 
@@ -1014,6 +1028,19 @@ mod tests {
         let marks = pending_marks(&conn, "cal1").unwrap();
         assert_eq!(marks.get("uid-A"), Some(&false));
         assert!(marks.get("uid-B").is_none(), "other calendar's op must not leak in");
+    }
+
+    #[test]
+    fn intake_dir_is_the_db_dir_sibling_named_intake() {
+        // The M14 xochitl hook hardcodes `…/retaskable/intake/`; this pins that
+        // intake_dir() resolves to the same place (db dir's sibling).
+        let intake = intake_dir().unwrap();
+        assert!(intake.ends_with("retaskable/intake"), "got {intake:?}");
+        assert_eq!(
+            intake.parent(),
+            path().unwrap().parent(),
+            "intake dir must sit next to db.sqlite under …/retaskable/"
+        );
     }
 
     #[test]
