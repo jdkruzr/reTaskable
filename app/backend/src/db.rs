@@ -92,6 +92,14 @@ pub fn path() -> Result<PathBuf> {
     Ok(base.join("retaskable").join("db.sqlite"))
 }
 
+/// Directory the backend drains note-anchor hand-off files from (M13). A future
+/// xochitl-side hook drops one JSON file per captured selection here; the backend
+/// ingests and unlinks them. Lives in the data dir next to the SQLite cache.
+pub fn intake_dir() -> Result<PathBuf> {
+    let base = dirs::data_dir().context("could not resolve user data dir")?;
+    Ok(base.join("retaskable").join("intake"))
+}
+
 pub fn open() -> Result<Connection> {
     let p = path()?;
     if let Some(parent) = p.parent() {
@@ -313,16 +321,58 @@ fn unix_secs_now() -> i64 {
         .as_secs() as i64
 }
 
+/// A note-anchor back to the reMarkable notebook a to-do was captured from (M13).
+/// `doc_uuid` + `page_key` are machine addressing (persisted for a future
+/// jump-back); `label` is the human string the ListView shows. Any field may be
+/// empty; an empty field simply omits its X-property.
+#[derive(Debug, Clone)]
+pub struct Anchor {
+    pub doc_uuid: String,
+    pub page_key: String,
+    pub label: String,
+}
+
 pub fn enqueue_create(
     conn: &mut Connection,
     calendar_href: &str,
     uid: &str,
     summary: &str,
 ) -> Result<i64> {
+    enqueue_create_with_anchor(conn, calendar_href, uid, summary, None)
+}
+
+/// Like [`enqueue_create`], but stamps the M13 note-anchor X-properties into the
+/// VTODO when `anchor` is `Some`. With `anchor = None` the produced `ical_text`
+/// is byte-identical to the pre-M13 create (SUMMARY immediately followed by
+/// STATUS), so existing callers and their tests are unaffected.
+pub fn enqueue_create_with_anchor(
+    conn: &mut Connection,
+    calendar_href: &str,
+    uid: &str,
+    summary: &str,
+    anchor: Option<&Anchor>,
+) -> Result<i64> {
     let now_iso = Utc::now()
         .format("%Y%m%dT%H%M%SZ")
         .to_string();
     let escaped = crate::nextcloud::escape_ical_text(summary);
+    // Machine anchors (doc/page) are controlled tokens written verbatim; only the
+    // human label is escaped (a notebook name may contain commas/semicolons).
+    let mut anchor_lines = String::new();
+    if let Some(a) = anchor {
+        if !a.doc_uuid.is_empty() {
+            anchor_lines.push_str(&format!("X-RETASKABLE-SOURCE-DOC:{}\r\n", a.doc_uuid));
+        }
+        if !a.page_key.is_empty() {
+            anchor_lines.push_str(&format!("X-RETASKABLE-SOURCE-PAGE:{}\r\n", a.page_key));
+        }
+        if !a.label.is_empty() {
+            anchor_lines.push_str(&format!(
+                "X-RETASKABLE-SOURCE-LABEL:{}\r\n",
+                crate::nextcloud::escape_ical_text(&a.label)
+            ));
+        }
+    }
     let ical_text = format!(
         "BEGIN:VCALENDAR\r\n\
          VERSION:2.0\r\n\
@@ -333,12 +383,19 @@ pub fn enqueue_create(
          CREATED:{now_iso}\r\n\
          LAST-MODIFIED:{now_iso}\r\n\
          SUMMARY:{escaped}\r\n\
+         {anchor_lines}\
          STATUS:NEEDS-ACTION\r\n\
          END:VTODO\r\n\
          END:VCALENDAR\r\n"
     );
     let sentinel_href = format!("pending:{uid}");
-    let payload = serde_json::to_string(&serde_json::json!({ "summary": summary }))?;
+    // Carry the full body in the payload so the queue's create flush PUTs exactly
+    // what we cached (anchor X-properties included), not a summary-only rebuild.
+    // `summary` is kept for display/back-compat; `ical` is the source of truth.
+    let payload = serde_json::to_string(&serde_json::json!({
+        "summary": summary,
+        "ical": ical_text,
+    }))?;
     let enqueued_at = unix_secs_now();
 
     let tx = conn.unchecked_transaction()?;
@@ -795,6 +852,28 @@ pub fn pending_marks(conn: &Connection, calendar_href: &str) -> Result<HashMap<S
     })?;
     rows.collect::<rusqlite::Result<HashMap<_, _>>>()
         .map_err(|e| e.into())
+}
+
+/// Map of `uid -> source label` for live tasks in a calendar that carry the M13
+/// note anchor (`X-RETASKABLE-SOURCE-LABEL`). Parallels [`pending_marks`]: callers
+/// look it up by the UIDs they already render, so unanchored tasks are simply
+/// absent. The label is parsed (and unescaped) from each row's `ical_text`.
+pub fn source_labels(conn: &Connection, calendar_href: &str) -> Result<HashMap<String, String>> {
+    let mut stmt = conn.prepare(
+        "SELECT uid, ical_text FROM task \
+         WHERE calendar_href = ?1 AND pending_delete = 0",
+    )?;
+    let rows = stmt.query_map(params![calendar_href], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
+    let mut map = HashMap::new();
+    for row in rows {
+        let (uid, ical) = row?;
+        if let Some(label) = crate::nextcloud::extract_source_label(&ical) {
+            map.insert(uid, label);
+        }
+    }
+    Ok(map)
 }
 
 /// Clear all errored pending_op rows and reset their cache-side effects:
@@ -1261,9 +1340,87 @@ mod tests {
         assert_eq!(op_type, "create");
         assert_eq!(target_uid, "uid-new-1");
         assert_eq!(target_cal, "/cal/");
-        assert_eq!(payload, r#"{"summary":"Buy milk"}"#);
+        // Payload carries the summary plus the exact cached body (so the queue
+        // create-flush PUTs anchor properties verbatim — see dispatch_create).
+        let pv: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(pv["summary"], "Buy milk");
+        assert_eq!(pv["ical"], ical, "payload ical must equal the cached body");
         assert_eq!(error_count, 0);
         assert_eq!(errored, 0);
+    }
+
+    #[test]
+    fn enqueue_create_no_anchor_omits_x_properties() {
+        // Regression guard: a plain create (no anchor) keeps SUMMARY immediately
+        // followed by STATUS, with no X-RETASKABLE-* lines.
+        let mut conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        conn.execute(
+            "INSERT INTO calendar (href, display_name) VALUES ('/cal/', 'Cal')",
+            [],
+        )
+        .unwrap();
+        enqueue_create(&mut conn, "/cal/", "uid-plain", "Buy milk").unwrap();
+        let ical: String = conn
+            .query_row("SELECT ical_text FROM task WHERE uid = 'uid-plain'", [], |r| r.get(0))
+            .unwrap();
+        assert!(!ical.contains("X-RETASKABLE"), "plain create must carry no anchor:\n{ical}");
+        assert!(ical.contains("SUMMARY:Buy milk\r\nSTATUS:NEEDS-ACTION\r\n"));
+    }
+
+    #[test]
+    fn enqueue_create_with_anchor_stamps_all_three_x_properties() {
+        let mut conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        conn.execute(
+            "INSERT INTO calendar (href, display_name) VALUES ('/cal/', 'Cal')",
+            [],
+        )
+        .unwrap();
+        let anchor = Anchor {
+            doc_uuid: "e0cef3e0-1234".to_string(),
+            page_key: "p:0.500000".to_string(),
+            label: "Q3 Planning, vol 2 · p.3".to_string(),
+        };
+        enqueue_create_with_anchor(&mut conn, "/cal/", "uid-anch", "Email Bob", Some(&anchor))
+            .unwrap();
+        let ical: String = conn
+            .query_row("SELECT ical_text FROM task WHERE uid = 'uid-anch'", [], |r| r.get(0))
+            .unwrap();
+        assert!(ical.contains("X-RETASKABLE-SOURCE-DOC:e0cef3e0-1234\r\n"), "{ical}");
+        assert!(ical.contains("X-RETASKABLE-SOURCE-PAGE:p:0.500000\r\n"), "{ical}");
+        // Label is escaped on the wire (comma) ...
+        assert!(ical.contains("X-RETASKABLE-SOURCE-LABEL:Q3 Planning\\, vol 2 · p.3\r\n"), "{ical}");
+        // ... and reads back unescaped via the extractor + source_labels map.
+        assert_eq!(
+            crate::nextcloud::extract_source_label(&ical).as_deref(),
+            Some("Q3 Planning, vol 2 · p.3")
+        );
+        let sources = source_labels(&conn, "/cal/").unwrap();
+        assert_eq!(sources.get("uid-anch").map(String::as_str), Some("Q3 Planning, vol 2 · p.3"));
+    }
+
+    #[test]
+    fn source_labels_omits_unanchored_tasks() {
+        let mut conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        conn.execute(
+            "INSERT INTO calendar (href, display_name) VALUES ('/cal/', 'Cal')",
+            [],
+        )
+        .unwrap();
+        enqueue_create(&mut conn, "/cal/", "uid-plain", "no anchor").unwrap();
+        let anchor = Anchor {
+            doc_uuid: String::new(),
+            page_key: String::new(),
+            label: "Notebook · p.1".to_string(),
+        };
+        enqueue_create_with_anchor(&mut conn, "/cal/", "uid-anch", "has label", Some(&anchor))
+            .unwrap();
+        let sources = source_labels(&conn, "/cal/").unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources.get("uid-anch").map(String::as_str), Some("Notebook · p.1"));
+        assert!(sources.get("uid-plain").is_none());
     }
 
     #[test]

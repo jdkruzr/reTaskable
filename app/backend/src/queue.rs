@@ -186,13 +186,19 @@ async fn dispatch_create(
     calendar_url: &Url,
     op: &PendingOp,
 ) -> ExecOutcome {
-    // Recover summary from the JSON payload. Fallback to "(no summary)" if
-    // the payload is malformed (defensive — should never happen, since
-    // enqueue_create writes valid JSON).
-    let summary = op
+    // Recover the create payload. Prefer `ical` — the exact body enqueue cached,
+    // carrying any M13 note-anchor X-properties — and PUT it verbatim. Fall back
+    // to a summary-only rebuild for any pre-M13 queued op whose payload predates
+    // the `ical` field. Both are defended against a malformed payload.
+    let payload = op
         .payload
         .as_deref()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+    let cached_ical = payload
+        .as_ref()
+        .and_then(|v| v.get("ical").and_then(|s| s.as_str()).map(String::from));
+    let summary = payload
+        .as_ref()
         .and_then(|v| v.get("summary").and_then(|s| s.as_str()).map(String::from))
         .unwrap_or_else(|| "(no summary)".to_string());
 
@@ -201,18 +207,27 @@ async fn dispatch_create(
     // same UID minted at enqueue time so the server-side resource matches
     // the cached row's uid column.
     match build_create_url(calendar_url, &op.target_uid) {
-        Ok(task_url) => match crate::nextcloud::put_task_create_with_uid(
-            http, &task_url, auth, &op.target_uid, &summary,
-        )
-        .await
-        {
-            Ok((etag, ical_text)) => ExecOutcome::SuccessCreate {
-                task_url: task_url.to_string(),
-                etag,
-                ical_text,
-            },
-            Err(err) => classify_error(&err),
-        },
+        Ok(task_url) => {
+            let result = match &cached_ical {
+                Some(body) => {
+                    crate::nextcloud::put_task_create_body(http, &task_url, auth, body).await
+                }
+                None => {
+                    crate::nextcloud::put_task_create_with_uid(
+                        http, &task_url, auth, &op.target_uid, &summary,
+                    )
+                    .await
+                }
+            };
+            match result {
+                Ok((etag, ical_text)) => ExecOutcome::SuccessCreate {
+                    task_url: task_url.to_string(),
+                    etag,
+                    ical_text,
+                },
+                Err(err) => classify_error(&err),
+            }
+        }
         Err(err) => ExecOutcome::Terminal(format!("invalid calendar URL: {err}")),
     }
 }

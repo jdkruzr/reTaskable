@@ -703,8 +703,24 @@ pub async fn put_task_create_with_uid(
          END:VTODO\r\n\
          END:VCALENDAR\r\n"
     );
-    match put_task_create_once(client, task_url, &ical_text, auth).await? {
-        WriteOutcome::Updated(etag) => Ok((etag, ical_text)),
+    put_task_create_body(client, task_url, auth, &ical_text).await
+}
+
+/// Create a task by PUTting an exact, caller-supplied VTODO body with
+/// `If-None-Match: *`. Used by the offline queue's create flush (M13) so the
+/// body that lands on the server is byte-for-byte the one we cached and showed
+/// the user — carrying any `X-RETASKABLE-SOURCE-*` anchor properties verbatim.
+///
+/// Returns `(etag, body)` on success; `body` echoes the input so the caller can
+/// store exactly what the server now holds.
+pub async fn put_task_create_body(
+    client: &Client,
+    task_url: &Url,
+    auth: (&str, &str),
+    body: &str,
+) -> Result<(String, String)> {
+    match put_task_create_once(client, task_url, body, auth).await? {
+        WriteOutcome::Updated(etag) => Ok((etag, body.to_string())),
         WriteOutcome::PreconditionFailed => bail!(
             "412 on create -- UID collision (should never happen with v4 UUIDs). Tap Create again."
         ),
@@ -892,6 +908,53 @@ pub fn escape_ical_text(s: &str) -> String {
         .replace(';', "\\;")
 }
 
+/// Inverse of [`escape_ical_text`] for an RFC 5545 §3.3.11 TEXT value. Used when
+/// reading a value we wrote escaped (e.g. the M13 source-label X-property) back
+/// for display. Unknown escapes are passed through literally.
+pub fn unescape_ical_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') | Some('N') => out.push('\n'),
+                Some('\\') => out.push('\\'),
+                Some(',') => out.push(','),
+                Some(';') => out.push(';'),
+                Some(other) => out.push(other),
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Undo RFC 5545 §3.1 line folding: a CRLF (or bare LF) followed by a single
+/// space or HTAB is a continuation of the previous line. A server may fold long
+/// property values, so we unfold before scanning for a property by name.
+fn unfold_ical(s: &str) -> String {
+    s.replace("\r\n ", "")
+        .replace("\r\n\t", "")
+        .replace("\n ", "")
+        .replace("\n\t", "")
+}
+
+/// Extract and unescape the `X-RETASKABLE-SOURCE-LABEL` value from a VTODO body,
+/// if present (M13 note anchor). Returns the human-readable source label that the
+/// ListView shows beneath the summary. Unfolds first so a server-folded value is
+/// read whole.
+pub fn extract_source_label(ical_text: &str) -> Option<String> {
+    let unfolded = unfold_ical(ical_text);
+    for line in unfolded.lines() {
+        if let Some(rest) = line.strip_prefix("X-RETASKABLE-SOURCE-LABEL:") {
+            return Some(unescape_ical_text(rest));
+        }
+    }
+    None
+}
+
 fn matching_mutation<'a>(
     line: &str,
     mutations: &'a [(&'a str, Option<String>)],
@@ -1025,6 +1088,7 @@ pub fn format_tasks_marked(tasks: &[Task], marks: &HashMap<String, bool>) -> Str
 pub fn format_tasks_json(
     tasks: &[Task],
     marks: &HashMap<String, bool>,
+    sources: &HashMap<String, String>,
     last_synced: Option<&str>,
 ) -> String {
     let mut sorted: Vec<&Task> = tasks.iter().collect();
@@ -1049,6 +1113,7 @@ pub fn format_tasks_json(
                 "completed": matches!(t.status, TaskStatus::Completed),
                 "due": t.due,
                 "mark": mark,
+                "source": sources.get(&t.uid).cloned().unwrap_or_default(),
             })
         })
         .collect();
@@ -1169,8 +1234,9 @@ fn propstat_is_ok(propstat: &roxmltree::Node) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_crlf, escape_ical_text, filter_for_display, format_tasks_json, get_task,
-        parse_sync_response, replace_summary, sync_collection_unsupported,
+        ensure_crlf, escape_ical_text, extract_source_label, filter_for_display,
+        format_tasks_json, get_task, parse_sync_response, replace_summary,
+        sync_collection_unsupported, unescape_ical_text,
     };
 
     #[test]
@@ -1406,7 +1472,7 @@ mod tests {
 
     #[test]
     fn format_tasks_json_empty_renders_empty_envelope() {
-        let out = format_tasks_json(&[], &HashMap::new(), None);
+        let out = format_tasks_json(&[], &HashMap::new(), &HashMap::new(), None);
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["last_synced"], serde_json::Value::Null);
         assert_eq!(v["tasks"].as_array().unwrap().len(), 0);
@@ -1430,7 +1496,7 @@ mod tests {
         ];
         let mut marks = HashMap::new();
         marks.insert("uid-A".to_string(), false); // queued -> "*"
-        let out = format_tasks_json(&tasks, &marks, Some("Last synced 5 minutes ago."));
+        let out = format_tasks_json(&tasks, &marks, &HashMap::new(), Some("Last synced 5 minutes ago."));
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["last_synced"], "Last synced 5 minutes ago.");
         let arr = v["tasks"].as_array().unwrap();
@@ -1452,9 +1518,64 @@ mod tests {
         let tasks = vec![task("uid-A", "Buy milk")];
         let mut marks = HashMap::new();
         marks.insert("uid-A".to_string(), true);
-        let out = format_tasks_json(&tasks, &marks, None);
+        let out = format_tasks_json(&tasks, &marks, &HashMap::new(), None);
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["tasks"][0]["mark"], "!");
+    }
+
+    #[test]
+    fn format_tasks_json_carries_source_label_when_present() {
+        let tasks = vec![task("uid-A", "Email Bob"), task("uid-B", "Buy milk")];
+        let mut sources = HashMap::new();
+        sources.insert("uid-A".to_string(), "Q3 Planning · p.3".to_string());
+        let out = format_tasks_json(&tasks, &HashMap::new(), &sources, None);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let arr = v["tasks"].as_array().unwrap();
+        // uid-A and uid-B both open + undated, so href tiebreak keeps input order.
+        assert_eq!(arr[0]["uid"], "uid-A");
+        assert_eq!(arr[0]["source"], "Q3 Planning · p.3");
+        assert_eq!(arr[1]["uid"], "uid-B");
+        assert_eq!(arr[1]["source"], ""); // absent -> empty string, never null
+    }
+
+    #[test]
+    fn unescape_is_inverse_of_escape_for_label_specials() {
+        let raw = "Notes, vol. 2; draft \\ p.3";
+        let round = unescape_ical_text(&escape_ical_text(raw));
+        assert_eq!(round, raw);
+    }
+
+    #[test]
+    fn extract_source_label_reads_and_unescapes() {
+        let ical = "BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:x\r\n\
+            SUMMARY:Email Bob\r\n\
+            X-RETASKABLE-SOURCE-DOC:e0cef3e0-1234\r\n\
+            X-RETASKABLE-SOURCE-PAGE:p:0.500000\r\n\
+            X-RETASKABLE-SOURCE-LABEL:Q3 Planning\\, vol 2 · p.3\r\n\
+            STATUS:NEEDS-ACTION\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        assert_eq!(
+            extract_source_label(ical).as_deref(),
+            Some("Q3 Planning, vol 2 · p.3")
+        );
+    }
+
+    #[test]
+    fn extract_source_label_unfolds_a_folded_value() {
+        // Server folded the long value: CRLF + exactly one space (RFC 5545 §3.1),
+        // the fold space being consumed on unfold.
+        let ical = "BEGIN:VTODO\r\n\
+            X-RETASKABLE-SOURCE-LABEL:Quarterly Plan\r\n ning · p.3\r\n\
+            STATUS:NEEDS-ACTION\r\nEND:VTODO\r\n";
+        assert_eq!(
+            extract_source_label(ical).as_deref(),
+            Some("Quarterly Planning · p.3")
+        );
+    }
+
+    #[test]
+    fn extract_source_label_absent_is_none() {
+        let ical = "BEGIN:VTODO\r\nSUMMARY:Buy milk\r\nSTATUS:NEEDS-ACTION\r\nEND:VTODO\r\n";
+        assert_eq!(extract_source_label(ical), None);
     }
 
     fn task_with_status(uid: &str, status: TaskStatus) -> Task {

@@ -92,6 +92,10 @@ Rectangle {
                 root.applyDiscover(contents)
                 return
             }
+            if (type === 118) {
+                root.applyDrainResult(contents)
+                return
+            }
             statusText.text = contents
         }
     }
@@ -100,6 +104,23 @@ Rectangle {
     // default; "all" includes finished tasks.
     function refreshList() {
         endpoint.sendMessage(4, root.showCompleted ? "all" : "open")
+    }
+
+    // Reply to the MSG 18 intake drain (M13). The backend has already ingested any
+    // note-anchor hand-off files into the queue; load the list so freshly-captured
+    // to-dos show up. Runs on app launch (the startup Timer fires the drain first).
+    function applyDrainResult(jsonText) {
+        var n = 0
+        try {
+            var d = JSON.parse(jsonText)
+            n = d.ingested ? d.ingested : 0
+        } catch (e) {
+            // Non-JSON (e.g. "error: ..."); still load the list below.
+        }
+        if (n > 0) {
+            console.log("retaskable: ingested " + n + " note to-do(s)")
+        }
+        root.refreshList()
     }
 
     // ---- M11: settings flow ----
@@ -210,12 +231,14 @@ Rectangle {
         taskList.contentY = Math.max(0, taskList.contentY - taskList.height)
     }
 
-    // Give the backend connection a moment to establish, then load the list.
+    // Give the backend connection a moment to establish, then drain any note-anchor
+    // intake files (MSG 18). The 118 reply (applyDrainResult) loads the task list,
+    // so freshly-captured to-dos appear in a single redraw.
     Timer {
         interval: 300
         repeat: false
         running: true
-        onTriggered: root.refreshList()
+        onTriggered: endpoint.sendMessage(18, "")
     }
 
     // Parse the MSG 104 JSON envelope and repopulate the list. Non-JSON replies
@@ -242,7 +265,8 @@ Rectangle {
                 summary: t.summary,
                 completed: t.completed === true,
                 due: t.due ? t.due : "",
-                mark: t.mark ? t.mark : ""
+                mark: t.mark ? t.mark : "",
+                source: t.source ? t.source : ""
             })
         }
         taskList.contentY = 0
@@ -604,14 +628,30 @@ Rectangle {
                     onToggled: endpoint.sendMessage(14, model.uid)
                 }
 
-                Text {
+                Column {
                     anchors.verticalCenter: parent.verticalCenter
                     width: parent.width - 20 - rowCheck.width - 42
-                    text: model.summary + (model.due ? "  (due " + model.due + ")" : "")
-                    font.pixelSize: 26
-                    elide: Text.ElideRight
-                    color: model.completed ? "#909090" : "black"
-                    font.strikeout: model.completed
+                    spacing: 2
+
+                    Text {
+                        width: parent.width
+                        text: model.summary + (model.due ? "  (due " + model.due + ")" : "")
+                        font.pixelSize: 26
+                        elide: Text.ElideRight
+                        color: model.completed ? "#909090" : "black"
+                        font.strikeout: model.completed
+                    }
+
+                    // M13 note anchor: where this to-do was captured from. A Column
+                    // skips invisible children, so unanchored rows stay single-line.
+                    Text {
+                        width: parent.width
+                        visible: model.source && model.source.length > 0
+                        text: "📓 " + model.source
+                        font.pixelSize: 18
+                        elide: Text.ElideRight
+                        color: "#707070"
+                    }
                 }
             }
 

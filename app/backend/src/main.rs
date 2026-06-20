@@ -3,6 +3,7 @@ use std::time::{Duration, SystemTime};
 use appload_client::{
     AppLoad, AppLoadBackend, BackendReplier, Message, MSG_SYSTEM_NEW_COORDINATOR,
 };
+use anyhow::Context;
 use async_trait::async_trait;
 use rusqlite::Connection;
 use uuid::Uuid;
@@ -29,6 +30,7 @@ const MSG_TOGGLE_BY_UID: u32 = 14;
 const MSG_GET_CONFIG: u32 = 15;
 const MSG_SAVE_CONFIG: u32 = 16;
 const MSG_DISCOVER_WITH: u32 = 17;
+const MSG_DRAIN_INTAKE: u32 = 18;
 const MSG_PONG: u32 = 101;
 const MSG_NEXTCLOUD_RESPONSE: u32 = 102;
 const MSG_CALENDARS_RESPONSE: u32 = 103;
@@ -46,6 +48,7 @@ const MSG_TOGGLE_BY_UID_RESPONSE: u32 = 114;
 const MSG_GET_CONFIG_RESPONSE: u32 = 115;
 const MSG_SAVE_CONFIG_RESPONSE: u32 = 116;
 const MSG_DISCOVER_WITH_RESPONSE: u32 = 117;
+const MSG_DRAIN_INTAKE_RESPONSE: u32 = 118;
 
 #[tokio::main]
 async fn main() {
@@ -215,6 +218,15 @@ impl AppLoadBackend for Backend {
                 let response = discover_with(&msg.contents).await;
                 send(replier, MSG_DISCOVER_WITH_RESPONSE, &response);
             }
+            MSG_DRAIN_INTAKE => {
+                eprintln!("retaskable: drain intake requested");
+                let response = match drain_intake(&mut self.db) {
+                    Ok(n) => serde_json::json!({ "ingested": n }).to_string(),
+                    Err(e) => format!("error: {e:#}"),
+                };
+                eprintln!("retaskable: drain intake result: {response}");
+                send(replier, MSG_DRAIN_INTAKE_RESPONSE, &response);
+            }
             t => eprintln!("retaskable: ignoring unknown msg type {t}"),
         }
     }
@@ -249,11 +261,12 @@ fn show_tasks(db: &mut Connection, include_completed: bool) -> anyhow::Result<St
     let tasks = db::list_tasks(db, &cal_href)?;
     let tasks = nextcloud::filter_for_display(tasks, include_completed);
     let marks = db::pending_marks(db, &cal_href)?;
+    let sources = db::source_labels(db, &cal_href)?;
     let last_synced = match db::last_synced(db, &cal_href)? {
         Some(t) => Some(format!("Last synced {} ago.", humanize_since(t))),
         None => None,
     };
-    Ok(nextcloud::format_tasks_json(&tasks, &marks, last_synced.as_deref()))
+    Ok(nextcloud::format_tasks_json(&tasks, &marks, &sources, last_synced.as_deref()))
 }
 
 fn show_pending(db: &mut Connection) -> anyhow::Result<String> {
@@ -420,6 +433,61 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         db::ensure_schema_v2(&conn).unwrap();
         assert!(toggle_by_uid_inner(&mut conn, "/cal/", "nope").is_err());
+    }
+
+    #[test]
+    fn drain_intake_from_ingests_valid_and_skips_the_rest() {
+        use rusqlite::Connection;
+        use std::fs;
+        let mut conn = Connection::open_in_memory().unwrap();
+        db::ensure_schema_v2(&conn).unwrap();
+
+        let dir = std::env::temp_dir().join("retaskable_intake_test_drain1");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // (a) anchored item, (b) plain item, (c) malformed, (d) empty-summary,
+        // plus a non-.json file the drain must ignore entirely.
+        fs::write(
+            dir.join("a.json"),
+            r#"{"summary":"Email Bob","source_doc_uuid":"doc-1","source_page_key":"p:0.5","source_label":"Plan · p.3","captured_at":"2026-06-19T20:00:00Z"}"#,
+        )
+        .unwrap();
+        fs::write(dir.join("b.json"), r#"{"summary":"Buy milk"}"#).unwrap();
+        fs::write(dir.join("c.json"), "{ not valid json").unwrap();
+        fs::write(dir.join("d.json"), r#"{"summary":"   "}"#).unwrap();
+        fs::write(dir.join("note.txt"), "ignore me").unwrap();
+
+        let n = drain_intake_from(&mut conn, &dir, "/cal/").expect("drain");
+        assert_eq!(n, 2, "two valid items ingested");
+
+        // Valid files unlinked; malformed / empty-summary / non-json left in place.
+        assert!(!dir.join("a.json").exists());
+        assert!(!dir.join("b.json").exists());
+        assert!(dir.join("c.json").exists(), "malformed left for inspection");
+        assert!(dir.join("d.json").exists(), "empty-summary left in place");
+        assert!(dir.join("note.txt").exists());
+
+        // Two tasks created; exactly one carries a source label (the anchored one).
+        let tasks = db::list_tasks(&conn, "/cal/").unwrap();
+        assert_eq!(tasks.len(), 2);
+        let sources = db::source_labels(&conn, "/cal/").unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources.values().next().map(String::as_str), Some("Plan · p.3"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn drain_intake_from_empty_dir_is_zero() {
+        use rusqlite::Connection;
+        let mut conn = Connection::open_in_memory().unwrap();
+        db::ensure_schema_v2(&conn).unwrap();
+        let dir = std::env::temp_dir().join("retaskable_intake_test_empty");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(drain_intake_from(&mut conn, &dir, "/cal/").unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn cfg(base_url: &str, calendar: Option<&str>) -> config::Config {
@@ -1110,6 +1178,15 @@ mod tests {
 }
 
 async fn sync(db: &mut Connection) -> anyhow::Result<String> {
+    // Ingest any note-anchor hand-off files first, so freshly-captured to-dos are
+    // queued and flush in this same sync pass. Non-fatal: a drain problem must not
+    // block the sync itself.
+    match drain_intake(db) {
+        Ok(n) if n > 0 => eprintln!("retaskable: sync ingested {n} intake item(s)"),
+        Ok(_) => {}
+        Err(e) => eprintln!("retaskable: sync intake drain error: {e:#}"),
+    }
+
     let cfg = config::load()?;
     let wanted = cfg.nextcloud.calendar.as_ref().ok_or_else(|| {
         anyhow::anyhow!(
@@ -1444,6 +1521,121 @@ fn create(db: &mut Connection, summary: &str) -> anyhow::Result<String> {
     let uid = Uuid::new_v4().to_string();
     let op_id = db::enqueue_create(db, &cal_href, &uid, summary)?;
     Ok(format!("Queued: create \"{summary}\" (#{op_id})"))
+}
+
+/// One hand-off file dropped in the intake spool by a future xochitl-side capture
+/// hook (M13). `summary` is required; the anchor fields are optional so the format
+/// degrades gracefully. Unknown fields (e.g. `captured_at`) are ignored by serde.
+#[derive(serde::Deserialize)]
+struct IntakeItem {
+    summary: String,
+    #[serde(default)]
+    source_doc_uuid: String,
+    #[serde(default)]
+    source_page_key: String,
+    #[serde(default)]
+    source_label: String,
+}
+
+/// Build a [`db::Anchor`] from an intake item, or `None` if it carries no anchor
+/// fields at all (a plain typed to-do with no source note).
+fn make_anchor(item: &IntakeItem) -> Option<db::Anchor> {
+    if item.source_doc_uuid.is_empty()
+        && item.source_page_key.is_empty()
+        && item.source_label.is_empty()
+    {
+        None
+    } else {
+        Some(db::Anchor {
+            doc_uuid: item.source_doc_uuid.clone(),
+            page_key: item.source_page_key.clone(),
+            label: item.source_label.clone(),
+        })
+    }
+}
+
+/// Ingest every well-formed `*.json` hand-off file in the intake spool, enqueuing
+/// an anchored create for each, then unlink it. Returns the count ingested.
+/// Resolves config + target calendar, then delegates the file work to
+/// [`drain_intake_from`]. A missing spool dir or unconfigured/unsynced calendar
+/// is a no-op (returns 0), not an error.
+fn drain_intake(db: &mut Connection) -> anyhow::Result<usize> {
+    let dir = db::intake_dir()?;
+    if !dir.exists() {
+        return Ok(0);
+    }
+    // Need a synced target calendar to attach creates to. If we can't resolve one,
+    // leave the files in place for a later drain rather than dropping them.
+    let cfg = config::load()?;
+    let Some(wanted) = cfg.nextcloud.calendar.as_ref() else {
+        eprintln!("retaskable: intake drain skipped -- no calendar configured");
+        return Ok(0);
+    };
+    let Some(cal_href) = db::get_calendar_href_by_display_name(db, wanted)? else {
+        eprintln!("retaskable: intake drain skipped -- calendar {wanted:?} not yet synced");
+        return Ok(0);
+    };
+    drain_intake_from(db, &dir, &cal_href)
+}
+
+/// Pure-ish core of [`drain_intake`]: process the `*.json` files in `dir` against
+/// an already-resolved `cal_href`. Split out so it's unit-testable without a real
+/// config file. Each file: parse → enqueue anchored create → unlink on success.
+/// Malformed / empty-summary files are logged and left in place; an enqueue error
+/// also leaves the file for a later retry.
+fn drain_intake_from(
+    db: &mut Connection,
+    dir: &std::path::Path,
+    cal_href: &str,
+) -> anyhow::Result<usize> {
+    let mut ingested = 0usize;
+    for entry in std::fs::read_dir(dir)
+        .with_context(|| format!("reading intake dir {}", dir.display()))?
+    {
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("retaskable: intake skip unreadable {}: {e}", path.display());
+                continue;
+            }
+        };
+        let item: IntakeItem = match serde_json::from_str(&raw) {
+            Ok(i) => i,
+            Err(e) => {
+                eprintln!("retaskable: intake skip malformed {}: {e}", path.display());
+                continue;
+            }
+        };
+        let summary = item.summary.trim();
+        if summary.is_empty() {
+            eprintln!("retaskable: intake skip empty-summary {}", path.display());
+            continue;
+        }
+        let anchor = make_anchor(&item);
+        let uid = Uuid::new_v4().to_string();
+        if let Err(e) =
+            db::enqueue_create_with_anchor(db, cal_href, &uid, summary, anchor.as_ref())
+        {
+            eprintln!("retaskable: intake enqueue failed {}: {e:#}", path.display());
+            continue; // leave the file for a later retry
+        }
+        if let Err(e) = std::fs::remove_file(&path) {
+            // Already enqueued; a failed unlink risks a duplicate next drain, so
+            // surface it loudly. In practice this never fails (same process, just
+            // read the file).
+            eprintln!(
+                "retaskable: intake created but could not unlink {} ({e}) -- may double-create",
+                path.display()
+            );
+        }
+        ingested += 1;
+    }
+    Ok(ingested)
 }
 
 fn edit_first(db: &mut Connection, summary: &str) -> anyhow::Result<String> {
