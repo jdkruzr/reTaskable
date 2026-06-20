@@ -1622,6 +1622,7 @@ dependencies = [
  "dirs",
  "httpmock",
  "icalendar",
+ "libc",
  "reqwest",
  "roxmltree",
  "rusqlite",

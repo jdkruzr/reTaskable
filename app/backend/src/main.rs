@@ -52,8 +52,90 @@ const MSG_DRAIN_INTAKE_RESPONSE: u32 = 118;
 
 #[tokio::main]
 async fn main() {
+    // Headless one-shot mode: `entry --sync-once`. The M14 xochitl capture hook
+    // fires this (via command-executor) right after writing an intake file, so a
+    // freshly captured to-do reaches the server without the app being open. We
+    // branch *before* AppLoad::new() — which interprets argv[1] as its coordinator
+    // socket path — so a normal AppLoad launch (argv[1] = socket) never matches.
+    if std::env::args().nth(1).as_deref() == Some("--sync-once") {
+        std::process::exit(sync_once().await);
+    }
+
     let db = db::open().expect("open db");
     AppLoad::new(Backend { db }).unwrap().run().await.unwrap();
+}
+
+/// Drain intake → flush the offline queue → sync-collection, then exit. Reuses
+/// the same `sync()` core the in-app Sync uses (it needs no `BackendReplier`).
+/// Returns a process exit code. Diagnostics go to journald via `eprintln!`,
+/// consistent with offline-first: on failure the intake file persists for the
+/// next capture's sync — or opening the app — to drain.
+async fn sync_once() -> i32 {
+    // Single-flight across processes: two rapid captures (or a concurrent app
+    // backend) must not double-drain the spool into duplicate to-dos. The flock
+    // auto-releases when this process exits.
+    let _lock = match acquire_sync_lock() {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            eprintln!("retaskable: sync-once skipped, another sync holds the lock");
+            return 0;
+        }
+        Err(e) => {
+            eprintln!("retaskable: sync-once lock error: {e:#}");
+            return 1;
+        }
+    };
+
+    let mut db = match db::open() {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("retaskable: sync-once db open error: {e:#}");
+            return 1;
+        }
+    };
+    match sync(&mut db).await {
+        Ok(summary) => {
+            eprintln!("retaskable: sync-once {summary}");
+            0
+        }
+        Err(e) => {
+            eprintln!("retaskable: sync-once error: {e:#}");
+            1
+        }
+    }
+}
+
+/// Acquire the cross-process advisory sync lock (non-blocking). `Ok(Some(file))`
+/// holds the lock until the returned handle drops; `Ok(None)` means another sync
+/// already holds it (caller should skip quietly).
+fn acquire_sync_lock() -> anyhow::Result<Option<std::fs::File>> {
+    flock_exclusive(&db::sync_lock_path()?)
+}
+
+/// Non-blocking exclusive `flock` on `path`. `Ok(Some(file))` holds the lock
+/// until the handle drops; `Ok(None)` if another open file description holds it.
+fn flock_exclusive(path: &std::path::Path) -> anyhow::Result<Option<std::fs::File>> {
+    use std::os::unix::io::AsRawFd;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating lock dir {}", parent.display()))?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("opening lock file {}", path.display()))?;
+
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            return Ok(None);
+        }
+        return Err(anyhow::anyhow!("flock {}: {err}", path.display()));
+    }
+    Ok(Some(file))
 }
 
 struct Backend {
@@ -476,6 +558,29 @@ mod tests {
         assert_eq!(sources.values().next().map(String::as_str), Some("Plan · p.3"));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn flock_exclusive_is_single_flight() {
+        // The `--sync-once` lock must let exactly one holder in: a second
+        // acquire while the first is held returns None, and once the first
+        // drops the lock is acquirable again. Guards against two rapid captures
+        // double-draining the intake spool into duplicate to-dos.
+        let path = std::env::temp_dir().join("retaskable_synclock_test.lock");
+        let _ = std::fs::remove_file(&path);
+
+        let first = flock_exclusive(&path).expect("first acquire");
+        assert!(first.is_some(), "first acquire should hold the lock");
+
+        let second = flock_exclusive(&path).expect("second acquire");
+        assert!(second.is_none(), "second acquire should be blocked");
+
+        drop(first);
+        let third = flock_exclusive(&path).expect("third acquire");
+        assert!(third.is_some(), "lock should be free after the holder drops");
+
+        drop(third);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

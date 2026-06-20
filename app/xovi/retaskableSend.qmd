@@ -83,6 +83,26 @@ AFFECT [[15977735761668523171]]
 						captured_at:  new  ~&6502586279&~().toISOString()
 					});
 					~&197102514&~ rtReq =  new  XMLHttpRequest();
+					/* When the capture file has finished writing, kick reTaskable's*/
+					/* headless sync so the to-do reaches the server without opening the*/
+					/* app. Gated on DONE (readyState 4) — NOT inline — because the*/
+					/* file:// PUT is async; spawning earlier races the write and the*/
+					/* backend's drain ingests nothing. command-executor*/
+					/* (net.asivery.CommandExecutor) runs the backend binary; HOME must*/
+					/* be set since xochitl runs without one. Soft dependency, fully*/
+					/* guarded: if anything here fails the capture file is already on*/
+					/* disk and will sync on next app open — never break the note.*/
+					rtReq.onreadystatechange = function () {
+						~&5972376&~ (rtReq.readyState !== 4) { ~&7083121450889&~; }
+						try {
+							~&197102514&~ rtSync = ~&5971598&~.createQmlObject("import net.asivery.CommandExecutor 1.0; AsyncCommandExecutor {}", ~&6504254477&~, "rtSyncSpawn");
+							rtSync.command = "/home/root/xovi/exthome/appload/retaskable/backend/entry";
+							rtSync.arguments = ["--sync-once"];
+							rtSync.environment = { "HOME": "/home/root" };
+							rtSync.startCommand();
+						} catch (rtSyncErr) {
+						}
+					};
 					rtReq.~&6504147419&~("PUT", "file:///home/root/.local/share/retaskable/intake/cap_" + ~&6502586279&~.now() + ".json");
 					rtReq.~&6504279475&~(rtPayload);
 					sendingToReTaskable = ~&214625660372&~;

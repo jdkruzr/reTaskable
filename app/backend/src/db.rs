@@ -100,6 +100,14 @@ pub fn intake_dir() -> Result<PathBuf> {
     Ok(base.join("retaskable").join("intake"))
 }
 
+/// Path of the advisory lock file the M14 `--sync-once` one-shot flocks so two
+/// rapid captures (or a concurrent app backend) can't double-drain the intake
+/// spool into duplicate to-dos. Sits in the data dir next to the SQLite cache.
+pub fn sync_lock_path() -> Result<PathBuf> {
+    let base = dirs::data_dir().context("could not resolve user data dir")?;
+    Ok(base.join("retaskable").join("sync-once.lock"))
+}
+
 pub fn open() -> Result<Connection> {
     let p = path()?;
     if let Some(parent) = p.parent() {
@@ -108,6 +116,7 @@ pub fn open() -> Result<Connection> {
     }
     let conn = Connection::open(&p)
         .with_context(|| format!("opening sqlite at {}", p.display()))?;
+    configure_connection(&conn)?;
     ensure_schema_v2(&conn)?;
 
     // Ensure the intake spool dir exists so the M14 xochitl capture hook's
@@ -124,6 +133,17 @@ pub fn open() -> Result<Connection> {
     }
 
     Ok(conn)
+}
+
+/// Connection-level pragmas applied to every real `open()`.
+///
+/// `busy_timeout` lets brief write contention retry-then-succeed instead of
+/// failing `SQLITE_BUSY`: the M14 `--sync-once` one-shot can run concurrently
+/// with an open AppLoad backend (or a second rapid capture).
+fn configure_connection(conn: &Connection) -> Result<()> {
+    conn.busy_timeout(Duration::from_secs(5))
+        .context("setting sqlite busy_timeout")?;
+    Ok(())
 }
 
 /// Apply the v2 migration to an already-opened connection. Used by both
@@ -1028,6 +1048,18 @@ mod tests {
         let marks = pending_marks(&conn, "cal1").unwrap();
         assert_eq!(marks.get("uid-A"), Some(&false));
         assert!(marks.get("uid-B").is_none(), "other calendar's op must not leak in");
+    }
+
+    #[test]
+    fn configure_connection_sets_busy_timeout() {
+        // The M14 `--sync-once` one-shot may contend with an open backend, so
+        // every real open() must arm a non-zero busy_timeout (default is 0).
+        let conn = fresh();
+        configure_connection(&conn).expect("configure");
+        let ms: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ms, 5000);
     }
 
     #[test]
