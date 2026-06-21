@@ -764,6 +764,22 @@ pub fn first_resolvable_conflict(conn: &Connection) -> Result<Option<PendingOp>>
     Ok(row)
 }
 
+/// Count `pending_op` rows that are currently conflict-resolvable — the same
+/// predicate as [`first_resolvable_conflict`]. Drives the M14 UX gate: the QML
+/// hides the "Resolve Conflict" button when this is zero, so it only appears
+/// when there's actually something to resolve.
+pub fn count_resolvable_conflicts(conn: &Connection) -> Result<i64> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pending_op \
+         WHERE errored = 1 \
+           AND op_type IN ('toggle','edit') \
+           AND last_error LIKE '%double-412%'",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(n)
+}
+
 /// Look up a single pending_op row by id. Used by the M9b conflict
 /// resolution path to verify an op is still resolvable between the user's
 /// "Resolve" tap and their "Keep Mine" / "Take Theirs" tap (the op could
@@ -2023,6 +2039,25 @@ mod tests {
             [],
         ).unwrap();
         assert!(first_resolvable_conflict(&conn).unwrap().is_none());
+    }
+
+    #[test]
+    fn count_resolvable_conflicts_matches_first_resolvable_predicate() {
+        let conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        assert_eq!(count_resolvable_conflicts(&conn).unwrap(), 0);
+        // Only the two double-412 toggle/edit rows count; the 401, the
+        // blocked-by, and the delete/create double-412s do not.
+        conn.execute(
+            "INSERT INTO pending_op (op_type, target_uid, target_calendar_href, payload, enqueued_at, errored, last_error)
+             VALUES ('toggle', 'a', '/cal/', NULL, 100, 1, 'HTTP 401 Unauthorized'),
+                    ('edit',   'b', '/cal/', NULL, 101, 1, 'blocked by failed toggle'),
+                    ('toggle', 'c', '/cal/', NULL, 102, 1, 'double-412 (server-side conflict)'),
+                    ('edit',   'd', '/cal/', NULL, 103, 1, 'double-412 (server-side conflict)'),
+                    ('delete', 'e', '/cal/', NULL, 104, 1, 'double-412 (server-side conflict)')",
+            [],
+        ).unwrap();
+        assert_eq!(count_resolvable_conflicts(&conn).unwrap(), 2);
     }
 
     #[test]

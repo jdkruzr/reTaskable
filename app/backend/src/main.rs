@@ -348,7 +348,14 @@ fn show_tasks(db: &mut Connection, include_completed: bool) -> anyhow::Result<St
         Some(t) => Some(format!("Last synced {} ago.", humanize_since(t))),
         None => None,
     };
-    Ok(nextcloud::format_tasks_json(&tasks, &marks, &sources, last_synced.as_deref()))
+    let conflicts = db::count_resolvable_conflicts(db)?;
+    Ok(nextcloud::format_tasks_json(
+        &tasks,
+        &marks,
+        &sources,
+        last_synced.as_deref(),
+        conflicts,
+    ))
 }
 
 fn show_pending(db: &mut Connection) -> anyhow::Result<String> {

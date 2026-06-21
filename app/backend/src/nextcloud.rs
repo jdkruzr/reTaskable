@@ -1090,6 +1090,7 @@ pub fn format_tasks_json(
     marks: &HashMap<String, bool>,
     sources: &HashMap<String, String>,
     last_synced: Option<&str>,
+    conflicts: i64,
 ) -> String {
     let mut sorted: Vec<&Task> = tasks.iter().collect();
     sorted.sort_by_key(|t| {
@@ -1121,6 +1122,9 @@ pub fn format_tasks_json(
     serde_json::json!({
         "last_synced": last_synced,
         "tasks": rows,
+        // M14 UX: count of conflict-resolvable errored ops, so the QML can hide
+        // the "Resolve Conflict" button when there's nothing to resolve.
+        "conflicts": conflicts,
     })
     .to_string()
 }
@@ -1472,10 +1476,11 @@ mod tests {
 
     #[test]
     fn format_tasks_json_empty_renders_empty_envelope() {
-        let out = format_tasks_json(&[], &HashMap::new(), &HashMap::new(), None);
+        let out = format_tasks_json(&[], &HashMap::new(), &HashMap::new(), None, 0);
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["last_synced"], serde_json::Value::Null);
         assert_eq!(v["tasks"].as_array().unwrap().len(), 0);
+        assert_eq!(v["conflicts"], 0);
     }
 
     #[test]
@@ -1496,7 +1501,7 @@ mod tests {
         ];
         let mut marks = HashMap::new();
         marks.insert("uid-A".to_string(), false); // queued -> "*"
-        let out = format_tasks_json(&tasks, &marks, &HashMap::new(), Some("Last synced 5 minutes ago."));
+        let out = format_tasks_json(&tasks, &marks, &HashMap::new(), Some("Last synced 5 minutes ago."), 0);
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["last_synced"], "Last synced 5 minutes ago.");
         let arr = v["tasks"].as_array().unwrap();
@@ -1518,9 +1523,10 @@ mod tests {
         let tasks = vec![task("uid-A", "Buy milk")];
         let mut marks = HashMap::new();
         marks.insert("uid-A".to_string(), true);
-        let out = format_tasks_json(&tasks, &marks, &HashMap::new(), None);
+        let out = format_tasks_json(&tasks, &marks, &HashMap::new(), None, 3);
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["tasks"][0]["mark"], "!");
+        assert_eq!(v["conflicts"], 3);
     }
 
     #[test]
@@ -1528,7 +1534,7 @@ mod tests {
         let tasks = vec![task("uid-A", "Email Bob"), task("uid-B", "Buy milk")];
         let mut sources = HashMap::new();
         sources.insert("uid-A".to_string(), "Q3 Planning · p.3".to_string());
-        let out = format_tasks_json(&tasks, &HashMap::new(), &sources, None);
+        let out = format_tasks_json(&tasks, &HashMap::new(), &sources, None, 0);
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         let arr = v["tasks"].as_array().unwrap();
         // uid-A and uid-B both open + undated, so href tiebreak keeps input order.

@@ -22,6 +22,11 @@ Rectangle {
     // (completed/cancelled) tasks are included. Drives the MSG 4 payload.
     property bool showCompleted: false
 
+    // M14 UX: number of conflict-resolvable errored ops, from the MSG 104
+    // envelope. The "Resolve Conflict" button is hidden unless this is > 0, so
+    // it only appears when there's actually a conflict to resolve.
+    property int conflictCount: 0
+
     // M11: settings screen state.
     property bool settingsOpen: false
     property bool settingsHasPassword: false
@@ -269,6 +274,7 @@ Rectangle {
                 source: t.source ? t.source : ""
             })
         }
+        root.conflictCount = data.conflicts ? data.conflicts : 0
         taskList.contentY = 0
         var synced = data.last_synced ? data.last_synced : "Not yet synced — tap Sync."
         statusText.text = synced + "   (" + tasks.length + (root.showCompleted ? " shown, incl. completed)" : " open)")
@@ -317,9 +323,9 @@ Rectangle {
             width: parent.width
             wrapMode: Text.WrapAnywhere
             text: ""
-            font.pixelSize: 18
+            font.pixelSize: 20
             font.family: "monospace"
-            color: "#404040"
+            color: "#1a1a1a"
             visible: text.length > 0
         }
 
@@ -333,6 +339,8 @@ Rectangle {
                 width: parent.width - createBtn.width - 16
                 height: 72
                 font.pixelSize: 22
+                color: "black"
+                placeholderTextColor: "#606060"
                 placeholderText: "New task summary"
             }
 
@@ -349,7 +357,7 @@ Rectangle {
                     anchors.centerIn: parent
                     text: "Create"
                     font.pixelSize: 24
-                    color: createBtn.active ? "black" : "#888888"
+                    color: createBtn.active ? "black" : "#555555"
                 }
 
                 MouseArea {
@@ -388,16 +396,22 @@ Rectangle {
                 }
             }
 
+            // M14 UX: only present when the backend reports a resolvable
+            // conflict (Row positioners skip invisible items, so Sync/Settings
+            // reflow together when it's hidden).
             Rectangle {
-                width: 300
+                width: 320
                 height: 72
                 color: "white"
                 border.color: "black"
                 border.width: 3
+                visible: root.conflictCount > 0
 
                 Text {
                     anchors.centerIn: parent
-                    text: "Resolve First Conflict"
+                    text: root.conflictCount > 1
+                          ? "Resolve Conflicts (" + root.conflictCount + ")"
+                          : "Resolve Conflict"
                     font.pixelSize: 20
                     color: "black"
                 }
@@ -626,6 +640,32 @@ Rectangle {
                     // toggled() fires only on user interaction, not when the
                     // binding above re-evaluates after applyToggleResult().
                     onToggled: endpoint.sendMessage(14, model.uid)
+
+                    // M14 UX: bigger tap target + a dark, clearly-bordered box
+                    // with a bold check. The stock indicator is a thin light
+                    // line that's hard to see and to hit on e-ink.
+                    implicitWidth: 64
+                    implicitHeight: 64
+                    padding: 0
+
+                    indicator: Rectangle {
+                        anchors.centerIn: parent
+                        width: 48
+                        height: 48
+                        radius: 4
+                        color: "white"
+                        border.color: "black"
+                        border.width: 4
+
+                        Text {
+                            anchors.centerIn: parent
+                            visible: rowCheck.checked
+                            text: "✓"
+                            font.pixelSize: 38
+                            font.bold: true
+                            color: "black"
+                        }
+                    }
                 }
 
                 Column {
@@ -648,9 +688,9 @@ Rectangle {
                         width: parent.width
                         visible: model.source && model.source.length > 0
                         text: "📓 " + model.source
-                        font.pixelSize: 18
+                        font.pixelSize: 20
                         elide: Text.ElideRight
-                        color: "#707070"
+                        color: "#333333"
                     }
                 }
             }
