@@ -27,6 +27,19 @@ Rectangle {
     // it only appears when there's actually a conflict to resolve.
     property int conflictCount: 0
 
+    // Task-detail dialog state. Opened by single-tapping a row's text area;
+    // populated from that row's model entry (no backend fetch — the list
+    // envelope already carries every field shown). detailDeleteArmed gates the
+    // two-step delete confirm so an accidental tap can't destroy a task.
+    property bool detailOpen: false
+    property bool detailDeleteArmed: false
+    property string detailUid: ""
+    property string detailSummary: ""
+    property bool detailCompleted: false
+    property string detailDue: ""
+    property string detailSource: ""
+    property string detailMark: ""
+
     // M11: settings screen state.
     property bool settingsOpen: false
     property bool settingsHasPassword: false
@@ -80,7 +93,7 @@ Rectangle {
                 root.applyToggleResult(contents)
                 return
             }
-            if (type === 105 || type === 108) {
+            if (type === 105 || type === 108 || type === 119 || type === 120) {
                 statusText.text = contents
                 root.refreshList()
                 return
@@ -301,6 +314,37 @@ Rectangle {
         }
     }
 
+    // Open the task-detail dialog for the row at `idx`, copying its fields out
+    // of the model (the dialog reads root.detail* so it survives a list refresh).
+    function openDetail(idx) {
+        var t = taskModel.get(idx)
+        root.detailUid = t.uid
+        root.detailSummary = t.summary
+        root.detailCompleted = t.completed === true
+        root.detailDue = t.due ? t.due : ""
+        root.detailSource = t.source ? t.source : ""
+        root.detailMark = t.mark ? t.mark : ""
+        root.detailDeleteArmed = false
+        detailSummaryInput.text = t.summary
+        root.detailOpen = true
+    }
+
+    // Close the detail dialog, releasing focus from the summary editor and
+    // dismissing the virtual keyboard (the TextArea raised it on focus; nothing
+    // else takes it down on the way back to the list).
+    function closeDetail() {
+        detailSummaryInput.focus = false
+        Qt.inputMethod.hide()
+        root.detailOpen = false
+    }
+
+    // Human-readable pending-sync state from the row's mark.
+    function markLabel(m) {
+        if (m === "!") return "Sync error — will retry"
+        if (m === "*") return "Queued — not yet synced"
+        return "Synced"
+    }
+
     // ---- Header: title, status, and the essential controls ----
     Column {
         id: header
@@ -318,15 +362,57 @@ Rectangle {
             color: "black"
         }
 
-        Text {
-            id: statusText
+        // Fixed-height status slot: always reserves three lines (even when empty)
+        // so a change in message length never reflows the buttons or list below.
+        // Longer messages (errors, the conflict preview) wrap to three lines then
+        // elide. The Resolve-Conflict button lives here, to the right of the
+        // status, so its conditional appearance never disturbs the action-button
+        // line below.
+        Row {
             width: parent.width
-            wrapMode: Text.WrapAnywhere
-            text: ""
-            font.pixelSize: 20
-            font.family: "monospace"
-            color: "#1a1a1a"
-            visible: text.length > 0
+            spacing: 16
+
+            Text {
+                id: statusText
+                width: resolveConflictBtn.visible
+                       ? parent.width - resolveConflictBtn.width - parent.spacing
+                       : parent.width
+                height: 84
+                wrapMode: Text.WrapAnywhere
+                maximumLineCount: 3
+                elide: Text.ElideRight
+                verticalAlignment: Text.AlignTop
+                clip: true
+                text: ""
+                font.pixelSize: 20
+                font.family: "monospace"
+                color: "#1a1a1a"
+            }
+
+            // M14 UX: present only when the backend reports a resolvable conflict.
+            Rectangle {
+                id: resolveConflictBtn
+                width: 300
+                height: 84
+                color: "white"
+                border.color: "black"
+                border.width: 3
+                visible: root.conflictCount > 0
+
+                Text {
+                    anchors.centerIn: parent
+                    text: root.conflictCount > 1
+                          ? "Resolve Conflicts (" + root.conflictCount + ")"
+                          : "Resolve Conflict"
+                    font.pixelSize: 20
+                    color: "black"
+                }
+
+                MouseArea {
+                    anchors.fill: parent
+                    onClicked: endpoint.sendMessage(12, "")
+                }
+            }
         }
 
         // Create a task.
@@ -371,7 +457,11 @@ Rectangle {
             }
         }
 
-        // Sync + conflict entry point.
+        // Action controls — all on one line: Sync, Settings, Show/Hide
+        // Completed, and discrete page ▲/▼. Widths sum to fit the ~874 px
+        // content width (150+160+300+90+90 + 4×16 spacing = 854). The
+        // Resolve-Conflict button is not here — it lives beside the status slot
+        // above so its conditional width never reflows this row.
         Row {
             width: parent.width
             spacing: 16
@@ -396,32 +486,6 @@ Rectangle {
                 }
             }
 
-            // M14 UX: only present when the backend reports a resolvable
-            // conflict (Row positioners skip invisible items, so Sync/Settings
-            // reflow together when it's hidden).
-            Rectangle {
-                width: 320
-                height: 72
-                color: "white"
-                border.color: "black"
-                border.width: 3
-                visible: root.conflictCount > 0
-
-                Text {
-                    anchors.centerIn: parent
-                    text: root.conflictCount > 1
-                          ? "Resolve Conflicts (" + root.conflictCount + ")"
-                          : "Resolve Conflict"
-                    font.pixelSize: 20
-                    color: "black"
-                }
-
-                MouseArea {
-                    anchors.fill: parent
-                    onClicked: endpoint.sendMessage(12, "")
-                }
-            }
-
             Rectangle {
                 width: 160
                 height: 72
@@ -441,12 +505,6 @@ Rectangle {
                     onClicked: root.openSettings()
                 }
             }
-        }
-
-        // View controls: Show/Hide completed + discrete paging.
-        Row {
-            width: parent.width
-            spacing: 16
 
             Rectangle {
                 width: 300
@@ -472,7 +530,7 @@ Rectangle {
             }
 
             Rectangle {
-                width: 110
+                width: 90
                 height: 72
                 color: "white"
                 border.color: "black"
@@ -492,7 +550,7 @@ Rectangle {
             }
 
             Rectangle {
-                width: 110
+                width: 90
                 height: 72
                 color: "white"
                 border.color: "black"
@@ -615,6 +673,15 @@ Rectangle {
             width: taskList.width
             height: 84
             color: "white"
+
+            // Single-tap the row to open the detail dialog. Placed BELOW the Row
+            // in the stack: plain Text doesn't accept taps so they fall through
+            // here, while the CheckBox (above) keeps its own region. So tapping
+            // the text opens detail; tapping the box still toggles.
+            MouseArea {
+                anchors.fill: parent
+                onClicked: root.openDetail(index)
+            }
 
             Row {
                 anchors.fill: parent
@@ -879,6 +946,222 @@ Rectangle {
                     MouseArea {
                         anchors.fill: parent
                         onClicked: root.settingsOpen = false
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- Task-detail dialog (opened by single-tapping a row) ----
+    Rectangle {
+        id: detailOverlay
+        anchors.fill: parent
+        color: "white"
+        visible: root.detailOpen
+        z: 150
+
+        Column {
+            anchors.top: parent.top
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.margins: 40
+            spacing: 16
+
+            Text {
+                text: "Task"
+                font.pixelSize: 32
+                font.bold: true
+                color: "black"
+            }
+
+            // Info block — every field comes from the tapped row (no fetch).
+            Text {
+                text: "Status: " + (root.detailCompleted ? "Completed" : "Open")
+                font.pixelSize: 22
+                color: "#1a1a1a"
+            }
+
+            Text {
+                visible: root.detailDue.length > 0
+                text: "Due: " + root.detailDue
+                font.pixelSize: 22
+                color: "#1a1a1a"
+            }
+
+            Text {
+                width: parent.width
+                visible: root.detailSource.length > 0
+                text: "📓 " + root.detailSource
+                font.pixelSize: 22
+                wrapMode: Text.WrapAnywhere
+                color: "#333333"
+            }
+
+            Text {
+                text: root.markLabel(root.detailMark)
+                font.pixelSize: 20
+                color: root.detailMark === "!" ? "#c00000"
+                       : (root.detailMark === "*" ? "#b06000" : "#606060")
+            }
+
+            Text {
+                width: parent.width
+                text: "UID: " + root.detailUid
+                font.pixelSize: 15
+                font.family: "monospace"
+                elide: Text.ElideRight
+                color: "#909090"
+            }
+
+            // Edit: a wrapping editable field shows the full summary AND edits it.
+            Text {
+                text: "Summary"
+                font.pixelSize: 18
+                color: "#404040"
+            }
+
+            TextArea {
+                id: detailSummaryInput
+                width: parent.width
+                height: 160
+                wrapMode: TextArea.Wrap
+                font.pixelSize: 24
+                color: "black"
+                background: Rectangle {
+                    border.color: "black"
+                    border.width: 3
+                    color: "white"
+                }
+            }
+
+            Row {
+                spacing: 16
+
+                Rectangle {
+                    id: detailSaveBtn
+                    property bool active: detailSummaryInput.text.trim().length > 0
+                                          && detailSummaryInput.text.trim() !== root.detailSummary
+                    width: 240
+                    height: 72
+                    color: detailSaveBtn.active ? "white" : "#dddddd"
+                    border.color: "black"
+                    border.width: 3
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: "Save changes"
+                        font.pixelSize: 22
+                        color: detailSaveBtn.active ? "black" : "#555555"
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+                        enabled: detailSaveBtn.active
+                        onClicked: {
+                            endpoint.sendMessage(19, JSON.stringify({
+                                uid: root.detailUid,
+                                summary: detailSummaryInput.text.trim()
+                            }))
+                            root.closeDetail()
+                        }
+                    }
+                }
+
+                Rectangle {
+                    width: 160
+                    height: 72
+                    color: "white"
+                    border.color: "black"
+                    border.width: 3
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: "Close"
+                        font.pixelSize: 22
+                        color: "black"
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+                        onClicked: root.closeDetail()
+                    }
+                }
+            }
+
+            // Delete: two-step confirm. A single tap arms it; a second,
+            // deliberate tap on Confirm performs the delete.
+            Rectangle {
+                visible: !root.detailDeleteArmed
+                width: 240
+                height: 72
+                color: "white"
+                border.color: "#c00000"
+                border.width: 3
+
+                Text {
+                    anchors.centerIn: parent
+                    text: "Delete task"
+                    font.pixelSize: 22
+                    color: "#c00000"
+                }
+
+                MouseArea {
+                    anchors.fill: parent
+                    onClicked: root.detailDeleteArmed = true
+                }
+            }
+
+            Row {
+                visible: root.detailDeleteArmed
+                spacing: 16
+
+                Text {
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "Really delete?"
+                    font.pixelSize: 22
+                    color: "#c00000"
+                }
+
+                Rectangle {
+                    width: 200
+                    height: 72
+                    color: "#c00000"
+                    border.color: "#c00000"
+                    border.width: 3
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: "Confirm"
+                        font.pixelSize: 22
+                        color: "white"
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+                        onClicked: {
+                            endpoint.sendMessage(20, root.detailUid)
+                            root.closeDetail()
+                        }
+                    }
+                }
+
+                Rectangle {
+                    width: 160
+                    height: 72
+                    color: "white"
+                    border.color: "black"
+                    border.width: 3
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: "Keep"
+                        font.pixelSize: 22
+                        color: "black"
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+                        onClicked: root.detailDeleteArmed = false
                     }
                 }
             }

@@ -31,6 +31,8 @@ const MSG_GET_CONFIG: u32 = 15;
 const MSG_SAVE_CONFIG: u32 = 16;
 const MSG_DISCOVER_WITH: u32 = 17;
 const MSG_DRAIN_INTAKE: u32 = 18;
+const MSG_EDIT_BY_UID: u32 = 19;
+const MSG_DELETE_BY_UID: u32 = 20;
 const MSG_PONG: u32 = 101;
 const MSG_NEXTCLOUD_RESPONSE: u32 = 102;
 const MSG_CALENDARS_RESPONSE: u32 = 103;
@@ -49,6 +51,8 @@ const MSG_GET_CONFIG_RESPONSE: u32 = 115;
 const MSG_SAVE_CONFIG_RESPONSE: u32 = 116;
 const MSG_DISCOVER_WITH_RESPONSE: u32 = 117;
 const MSG_DRAIN_INTAKE_RESPONSE: u32 = 118;
+const MSG_EDIT_BY_UID_RESPONSE: u32 = 119;
+const MSG_DELETE_BY_UID_RESPONSE: u32 = 120;
 
 #[tokio::main]
 async fn main() {
@@ -309,6 +313,30 @@ impl AppLoadBackend for Backend {
                 eprintln!("retaskable: drain intake result: {response}");
                 send(replier, MSG_DRAIN_INTAKE_RESPONSE, &response);
             }
+            MSG_EDIT_BY_UID => {
+                eprintln!(
+                    "retaskable: edit-by-uid requested ({} chars)",
+                    msg.contents.len()
+                );
+                let response = match edit_by_uid(&mut self.db, &msg.contents) {
+                    Ok(s) => s,
+                    Err(e) => format!("error: {e:#}"),
+                };
+                eprintln!("retaskable: edit-by-uid result:\n{response}");
+                send(replier, MSG_EDIT_BY_UID_RESPONSE, &response);
+            }
+            MSG_DELETE_BY_UID => {
+                eprintln!(
+                    "retaskable: delete-by-uid requested ({} chars)",
+                    msg.contents.len()
+                );
+                let response = match delete_by_uid(&mut self.db, &msg.contents) {
+                    Ok(s) => s,
+                    Err(e) => format!("error: {e:#}"),
+                };
+                eprintln!("retaskable: delete-by-uid result:\n{response}");
+                send(replier, MSG_DELETE_BY_UID_RESPONSE, &response);
+            }
             t => eprintln!("retaskable: ignoring unknown msg type {t}"),
         }
     }
@@ -522,6 +550,72 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         db::ensure_schema_v2(&conn).unwrap();
         assert!(toggle_by_uid_inner(&mut conn, "/cal/", "nope").is_err());
+    }
+
+    #[test]
+    fn edit_by_uid_inner_replaces_summary_and_marks_queued() {
+        use rusqlite::Connection;
+        let mut conn = Connection::open_in_memory().unwrap();
+        db::ensure_schema_v2(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO calendar (href, display_name) VALUES ('/cal/', 'Cal')",
+            [],
+        )
+        .unwrap();
+        db::enqueue_create(&mut conn, "/cal/", "uid-1", "Buy milk").unwrap();
+
+        let out = edit_by_uid_inner(&mut conn, "/cal/", "uid-1", "Buy oat milk")
+            .expect("edit");
+        assert!(out.contains("Buy milk"), "old summary in status: {out}");
+        assert!(out.contains("Buy oat milk"), "new summary in status: {out}");
+
+        // Cache row now carries the new summary, and a freshly-queued
+        // (non-errored) op exists for uid-1.
+        let task = db::get_cached_task_by_uid(&conn, "/cal/", "uid-1")
+            .unwrap()
+            .expect("cache row");
+        assert_eq!(task.summary, "Buy oat milk");
+        let marks = db::pending_marks(&conn, "/cal/").unwrap();
+        assert_eq!(marks.get("uid-1"), Some(&false));
+    }
+
+    #[test]
+    fn edit_by_uid_inner_unknown_uid_errors() {
+        use rusqlite::Connection;
+        let mut conn = Connection::open_in_memory().unwrap();
+        db::ensure_schema_v2(&conn).unwrap();
+        assert!(edit_by_uid_inner(&mut conn, "/cal/", "nope", "x").is_err());
+    }
+
+    #[test]
+    fn delete_by_uid_inner_tombstones_and_drops_from_list() {
+        use rusqlite::Connection;
+        let mut conn = Connection::open_in_memory().unwrap();
+        db::ensure_schema_v2(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO calendar (href, display_name) VALUES ('/cal/', 'Cal')",
+            [],
+        )
+        .unwrap();
+        db::enqueue_create(&mut conn, "/cal/", "uid-1", "Buy milk").unwrap();
+
+        let out = delete_by_uid_inner(&mut conn, "/cal/", "uid-1").expect("delete");
+        assert!(out.contains("Buy milk"), "summary in status: {out}");
+
+        // pending_delete = 1 → the row drops out of the open list.
+        let tasks = db::list_tasks(&conn, "/cal/").unwrap();
+        assert!(
+            tasks.iter().all(|t| t.uid != "uid-1"),
+            "deleted task should not appear in the list"
+        );
+    }
+
+    #[test]
+    fn delete_by_uid_inner_unknown_uid_errors() {
+        use rusqlite::Connection;
+        let mut conn = Connection::open_in_memory().unwrap();
+        db::ensure_schema_v2(&conn).unwrap();
+        assert!(delete_by_uid_inner(&mut conn, "/cal/", "nope").is_err());
     }
 
     #[test]
@@ -1487,6 +1581,106 @@ fn toggle_by_uid_inner(
         "mark": "*",
     })
     .to_string())
+}
+
+/// MSG_EDIT_BY_UID handler. The task-detail dialog edits a specific task's
+/// summary by UID (the detail it opened), mirroring `toggle_by_uid`. Payload is
+/// `{ "uid": "...", "summary": "..." }`. Thin config/calendar wrapper around
+/// `edit_by_uid_inner`, which holds the testable DB logic.
+fn edit_by_uid(db: &mut Connection, payload: &str) -> anyhow::Result<String> {
+    let v: serde_json::Value = serde_json::from_str(payload)?;
+    let uid = v.get("uid").and_then(|x| x.as_str()).unwrap_or("").trim();
+    let new_summary = v
+        .get("summary")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim();
+    if uid.is_empty() {
+        anyhow::bail!("uid cannot be empty");
+    }
+    if new_summary.is_empty() {
+        anyhow::bail!("summary cannot be empty");
+    }
+
+    let cfg = config::load()?;
+    let wanted = cfg.nextcloud.calendar.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "config is missing `calendar = \"...\"` under [nextcloud]. \
+             Run List Calendars to see options."
+        )
+    })?;
+
+    let Some(cal_href) = db::get_calendar_href_by_display_name(db, wanted)? else {
+        return Ok(format!(
+            "calendar {wanted:?} not yet synced -- tap Sync first."
+        ));
+    };
+
+    edit_by_uid_inner(db, &cal_href, uid, new_summary)
+}
+
+/// Enqueue an edit for a specific UID and return a `Queued: ...` status string.
+/// `enqueue_edit` rewrites the cached SUMMARY in place and inserts the pending
+/// op; the freshly-queued op renders as `*` until the next Sync reconciles it.
+/// A stale/tombstoned uid surfaces as an Err the dispatcher renders as
+/// "error: ...".
+fn edit_by_uid_inner(
+    db: &mut Connection,
+    cal_href: &str,
+    uid: &str,
+    new_summary: &str,
+) -> anyhow::Result<String> {
+    let Some(task) = db::get_cached_task_by_uid(db, cal_href, uid)? else {
+        anyhow::bail!("no task with uid {uid}");
+    };
+    let old_summary = task.summary.clone();
+    let op_id = db::enqueue_edit(db, cal_href, uid, new_summary)?;
+    Ok(format!(
+        "Queued: edit \"{old_summary}\" -> \"{new_summary}\" (#{op_id})"
+    ))
+}
+
+/// MSG_DELETE_BY_UID handler. Deletes a specific task by UID (the one the
+/// detail dialog opened), mirroring `toggle_by_uid`. Payload is the bare uid
+/// string. Thin config/calendar wrapper around `delete_by_uid_inner`.
+fn delete_by_uid(db: &mut Connection, uid: &str) -> anyhow::Result<String> {
+    let uid = uid.trim();
+    if uid.is_empty() {
+        anyhow::bail!("uid cannot be empty");
+    }
+
+    let cfg = config::load()?;
+    let wanted = cfg.nextcloud.calendar.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "config is missing `calendar = \"...\"` under [nextcloud]. \
+             Run List Calendars to see options."
+        )
+    })?;
+
+    let Some(cal_href) = db::get_calendar_href_by_display_name(db, wanted)? else {
+        return Ok(format!(
+            "calendar {wanted:?} not yet synced -- tap Sync first."
+        ));
+    };
+
+    delete_by_uid_inner(db, &cal_href, uid)
+}
+
+/// Enqueue a delete for a specific UID and return a `Queued: ...` status string.
+/// `enqueue_delete` sets `pending_delete = 1` (so the row drops out of the open
+/// list on the next MSG 4 refresh) and inserts the pending op. A
+/// missing/already-deleted uid surfaces as an Err.
+fn delete_by_uid_inner(
+    db: &mut Connection,
+    cal_href: &str,
+    uid: &str,
+) -> anyhow::Result<String> {
+    let Some(task) = db::get_cached_task_by_uid(db, cal_href, uid)? else {
+        anyhow::bail!("no task with uid {uid}");
+    };
+    let summary = task.summary.clone();
+    let op_id = db::enqueue_delete(db, cal_href, uid)?;
+    Ok(format!("Queued: delete \"{summary}\" (#{op_id})"))
 }
 
 /// MSG_GET_CONFIG handler. Returns the current sync target for the Settings
