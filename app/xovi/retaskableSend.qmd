@@ -4,15 +4,28 @@
 ;
 ; Adds a button to the handwriting selection menu (SceneSelectionHandler's ?#tools:
 ; cut / copy / convert-to-text / delete) that captures the lassoed strokes as a
-; CalDAV to-do WITHOUT altering the note. On tap it clones the selected items and
-; runs cloud handwriting recognition (the same MyScript path "Convert to text"
-; uses), reads the recognized text, and writes an intake JSON the reTaskable
-; backend drains (M13 spool) into an anchored to-do that remembers its source page.
+; CalDAV to-do WITHOUT altering the note. On tap it clones the selected items, runs
+; cloud handwriting recognition (the same MyScript path "Convert to text" uses), and
+; shows a confirm/edit dialog. On the dialog's Create it writes an intake JSON the
+; reTaskable backend drains (M13 spool) into an anchored to-do, then kicks a headless
+; sync (M14 Phase 1.2). The note is never altered; an accidental pen-touch can't lose
+; or mangle the capture (deliberate-modal dialog).
 ;
-; Three coordinated patches, mirroring how the stock convert-to-text flow is wired:
+; Four coordinated patches, mirroring how the stock convert-to-text flow is wired:
 ;   A  SceneSelectionHandler.qml — the menu button + a `sendToReTaskable` signal
-;   B  DeviceSceneView.qml       — wire the signal to a NON-DESTRUCTIVE convert-on-clone
-;   C  HwcSelection.qml          — recognize (no insert) and write the intake JSON
+;   B  DeviceSceneView.qml       — bubble a capture request up; run convert-on-clone
+;                                  when DocumentView says we're online
+;   C  HwcSelection.qml          — recognize (no insert); emit text + ok/fail up
+;   D  DocumentView.qml          — connectivity gate; the confirm/edit dialog; write
+;                                  intake + sync on Create
+;
+; The dialog AND the connectivity gate live in DocumentView: it is the only scope with
+; the live PopupOverlay (id _popupOverlay) + the pen-input manager, and the only one
+; where LinkProvider/Authentication are in scope (DeviceSceneView's stock convert path
+; gates via the convertSelection signal handled up here). So Block B bubbles a bare
+; reTaskableCapture() up; DocumentView decides offline (→ empty type-fallback dialog)
+; vs online (→ clone+recognize, result back via reTaskableRecognized(text, ok)). The
+; page anchor is read locally in DocumentView (root.document.id / root.currentPage).
 ;
 ; Published HASHED for xochitl 3.27 (qmldiff hashtab tokens, not symbol names). To
 ; read or edit: `qmldiff hash-diffs <device-hashtab> retaskableSend.qmd -r` unhashes
@@ -40,12 +53,17 @@ AFFECT [[3197972396468700595]]
 	END TRAVERSE
 END AFFECT
 
-; --- B: wire the signal to a non-destructive convert-on-clone ----------------
+; --- B: non-destructive convert-on-clone; relay the recognition result up -----
 AFFECT [[11806562588218124596]]
-	TRAVERSE ?#[[18399528329672988301]]
+	TRAVERSE ?#[[6504254477]]
 		LOCATE AFTER ALL
 		INSERT {
-			onSendToReTaskable: {
+			signal reTaskableRecognized(~&7083178290016&~ ~&6504315758&~, ~&6503679477&~ ~&5972579&~)
+			signal reTaskableCapture()
+			/* The online clone+recognize path, invoked by DocumentView only once its*/
+			/* connectivity/login gate passes. Wrapping in convertSelection (the stock*/
+			/* gate + language setup) is safe here because we only reach it online.*/
+			function reTaskableConvertOnline() {
 				~&6504254477&~.~&7282468819357443632&~(function () {
 					~&11077763042784530127&~.sendToReTaskableFrom(~&8399340108982949229&~.~&5308518110917893541&~(~&8399340108982949229&~.~&15752433948179392809&~, ~&6504254477&~.~&15777890623490054006&~));
 					~&6504254477&~.~&12148339614529610933&~();
@@ -53,17 +71,48 @@ AFFECT [[11806562588218124596]]
 			}
 		}
 	END TRAVERSE
+	TRAVERSE ?#[[18399528329672988301]]
+		LOCATE AFTER ALL
+		INSERT {
+			onSendToReTaskable: ~&6504254477&~.reTaskableCapture()
+		}
+	END TRAVERSE
+	TRAVERSE ?#[[11077763042784530127]]
+		LOCATE AFTER ALL
+		INSERT {
+			onReTaskableRecognized: ~&6504254477&~.reTaskableRecognized(~&6504315758&~, ~&5972579&~)
+		}
+	END TRAVERSE
 END AFFECT
 
-; --- C: recognize (no insert) and write the M13 intake JSON ------------------
+; --- C: recognize (no insert); emit text + ok/fail up ------------------------
 AFFECT [[15977735761668523171]]
 	TRAVERSE ?#[[6504254477]]
 		LOCATE BEFORE [[233724020120234]]
 		INSERT {
+			signal reTaskableRecognized(~&7083178290016&~ ~&6504315758&~, ~&6503679477&~ ~&5972579&~)
 			property ~&6503679477&~ sendingToReTaskable: ~&214625660372&~
+
+			~&214604601930&~ {
+				~&5972374&~: reTaskableTimeout
+				~&7713147298280334&~: 25000
+				~&7083121289162&~: ~&214625660372&~
+				~&495358363329399331&~: {
+					~&5972376&~ (sendingToReTaskable) {
+						sendingToReTaskable = ~&214625660372&~;
+						~&8398536573969953217&~.~&15568081865960980320&~();
+						~&6504254477&~.reTaskableRecognized("", ~&214625660372&~);
+					}
+				}
+			}
+
 			function sendToReTaskableFrom(~&214629893131&~) {
+				/* Reached only after DocumentView's gate confirmed online + logged in,*/
+				/* so just recognize. The timeout guards a hung/slow server; a*/
+				/* recognition Error routes to the type-fallback in onFinishedChanged.*/
 				sendingToReTaskable = ~&6504329801&~;
 				~&8398536573969953217&~.~&15319355904852707254&~(~&214629893131&~, ~&7712198086779994&~.~&5671208228825160146&~);
+				reTaskableTimeout.~&233743006639214&~();
 			}
 		}
 	END TRAVERSE
@@ -73,29 +122,92 @@ AFFECT [[15977735761668523171]]
 			INSERT {
 				~&5972376&~ (sendingToReTaskable) {
 					~&5972376&~ (!~&7713012755563699&~) { ~&7083121450889&~; }
-					~&197102514&~ rtText = ~&3875029581909304837&~.plainText.replace(/\n/g, ~&"180905&~).~&6504329413&~();
+					reTaskableTimeout.~&6504295855&~();
+					sendingToReTaskable = ~&214625660372&~;
+					/* `failed` is HwcNotificationBar's error flag; guard in case it*/
+					/* isn't in scope. Empty recognized text also counts as a miss, so*/
+					/* a silent failure still routes to the type-fallback.*/
+					~&197102514&~ rtFailed = ~&214625660372&~;
+					try { rtFailed = ~&7082646676942&~; } catch (rtFErr) { rtFailed = ~&214625660372&~; }
+					~&197102514&~ rtText = rtFailed ? "" : ~&3875029581909304837&~.plainText.replace(/\n/g, ~&"180905&~).~&6504329413&~();
+					~&197102514&~ rtOk = !rtFailed && rtText.~&7082886407723&~ > 0;
+					~&6504254477&~.reTaskableRecognized(rtText, rtOk);
+					~&7083121450889&~;
+				}
+			}
+		END REBUILD
+	END TRAVERSE
+END AFFECT
+
+; --- D: confirm/edit dialog; write intake + headless sync on Create ----------
+AFFECT [[1224665461898798997]]
+	TRAVERSE ?#[[254547437090201330]]
+		LOCATE AFTER ALL
+		INSERT {
+			/* The capture gate. LinkProvider/Authentication are in scope here (stock*/
+			/* onConvertSelection uses them) but NOT down in DeviceSceneView — which is*/
+			/* why the decision lives in DocumentView. Offline / not-signed-in skips*/
+			/* recognition entirely and opens the empty type-fallback; otherwise the*/
+			/* online clone+recognize runs and its result returns via*/
+			/* onReTaskableRecognized. Mirrors the stock convert gate exactly so the*/
+			/* connectivity semantics match (no surprise "requires Wi-Fi" toast).*/
+			onReTaskableCapture: {
+				~&5972376&~ (!~&9210209219278626665&~.~&7713275938201394&~ || ~&14571390169775532834&~.~&15652079942095156516&~ === ~&14571390169775532834&~.~&233697828699788&~) {
+					~&254547437090201330&~.~&12148339614529610933&~();
+					reTaskableDialog.openWith("", ~&214625660372&~);
+				} ~&6503784146&~ {
+					~&254547437090201330&~.reTaskableConvertOnline();
+				}
+			}
+			onReTaskableRecognized: reTaskableDialog.openWith(~&6504315758&~, ~&5972579&~)
+		}
+	END TRAVERSE
+	TRAVERSE ?#[[15549782143769420265]]
+		LOCATE AFTER ALL
+		INSERT {
+			~&214600077661&~ {
+				~&5972374&~: reTaskableDialog
+
+				~&233739780873643&~: ~&14839296689095546654&~
+				~&214646099849&~: ~&15549782143769420265&~.~&214646099849&~
+				~&2122835675838176157&~: reTaskableColumn.~&2122835675838176157&~
+
+				/* Deliberate modal: pen-on-canvas / tap-outside is a no-op (Ignore),*/
+				/* and pen input can't reach the note behind it. Exit only via the*/
+				/* explicit Create / Cancel in the HeaderInput. So an accidental*/
+				/* pen-touch never loses or mangles the capture.*/
+				~&17012884421348371483&~: ~&214600077661&~.~&8398624284572419691&~.~&7081519049453&~
+				~&11412860438186802733&~: ~&6504329801&~
+
+				property ~&6503679477&~ ~&5972579&~: ~&6504329801&~
+
+				function openWith(~&6504315758&~, recognized) {
+					~&5972579&~ = recognized;
+					reTaskableInput.~&6504315758&~ = recognized ? ~&6504315758&~ : "";
+					~&254547663425316670&~();
+					reTaskableInput.~&214626153769&~ = ~&6504329801&~;
+				}
+
+				function writeIntake(~&233744916906391&~) {
 					~&197102514&~ rtPage = ~&6504254477&~.~&477346483278306569&~;
 					~&197102514&~ rtPayload = ~&6502785411&~.~&254548178208422824&~({
-						~&233744916906391&~: rtText,
+						~&233744916906391&~: ~&233744916906391&~,
 						source_doc_uuid: ~&6504254477&~.~&7712934851008712&~.~&5972374&~,
 						source_page_key: "idx:" + rtPage,
 						source_label: "reMarkable note · p." + (rtPage + 1),
-						captured_at:  new  ~&6502586279&~().toISOString()
+						captured_at: new ~&6502586279&~().toISOString()
 					});
-					~&197102514&~ rtReq =  new  XMLHttpRequest();
-					/* When the capture file has finished writing, kick reTaskable's*/
-					/* headless sync so the to-do reaches the server without opening the*/
-					/* app. Gated on DONE (readyState 4) — NOT inline — because the*/
-					/* file:// PUT is async; spawning earlier races the write and the*/
-					/* backend's drain ingests nothing. command-executor*/
-					/* (net.asivery.CommandExecutor) runs the backend binary; HOME must*/
-					/* be set since xochitl runs without one. Soft dependency, fully*/
-					/* guarded: if anything here fails the capture file is already on*/
-					/* disk and will sync on next app open — never break the note.*/
+					~&197102514&~ rtReq = new XMLHttpRequest();
+					/* Kick the headless sync only once the capture file is fully*/
+					/* written (readyState 4) — the file:// PUT is async; spawning*/
+					/* earlier races the write and the backend drains nothing.*/
+					/* command-executor (net.asivery.CommandExecutor) runs the backend;*/
+					/* HOME must be set since xochitl runs without one. Guarded: on any*/
+					/* failure the file is already on disk and syncs on next app open.*/
 					rtReq.onreadystatechange = function () {
 						~&5972376&~ (rtReq.readyState !== 4) { ~&7083121450889&~; }
 						try {
-							~&197102514&~ rtSync = ~&5971598&~.createQmlObject("import net.asivery.CommandExecutor 1.0; AsyncCommandExecutor {}", ~&6504254477&~, "rtSyncSpawn");
+							~&197102514&~ rtSync = ~&5971598&~.createQmlObject("import net.asivery.CommandExecutor 1.0; AsyncCommandExecutor {}", reTaskableDialog, "rtSyncSpawn");
 							rtSync.command = "/home/root/xovi/exthome/appload/retaskable/backend/entry";
 							rtSync.arguments = ["--sync-once"];
 							rtSync.environment = { "HOME": "/home/root" };
@@ -105,10 +217,38 @@ AFFECT [[15977735761668523171]]
 					};
 					rtReq.~&6504147419&~("PUT", "file:///home/root/.local/share/retaskable/intake/cap_" + ~&6502586279&~.now() + ".json");
 					rtReq.~&6504279475&~(rtPayload);
-					sendingToReTaskable = ~&214625660372&~;
-					~&7083121450889&~;
+				}
+
+				~&7081293658967&~ {
+					~&5972374&~: reTaskableColumn
+					~&214646099849&~: ~&7083038346995&~.~&214646099849&~
+
+					~&6503165774&~ {
+						~&214646099849&~: ~&7083038346995&~.~&214646099849&~
+						~&233748328658231&~: !reTaskableDialog.~&5972579&~
+						~&7713748390489352&~: ~&6503165774&~.~&7712381377343359&~
+						~&6504315758&~: ~&6504222003&~("Handwriting recognition unavailable — type your task")
+					}
+
+					~&435226761427665314&~ {
+						~&5972374&~: reTaskableInput
+						~&214646099849&~: ~&7083038346995&~.~&214646099849&~
+						~&496814758264239564&~: ~&6504222003&~("Task text")
+						~&15687297754887797348&~: ~&214625660372&~
+						~&214626153769&~: ~&6504329801&~
+						~&233748328658231&~: ~&6504329801&~
+						~&477061882630366844&~: ~&6504222003&~(~&"7081296943613&~)
+						~&8399893700003527327&~: (~&180989&~) => {
+							~&5972376&~ (~&180989&~.~&6504329413&~().~&7082886407723&~ === 0) { ~&7083121450889&~; }
+							reTaskableDialog.writeIntake(~&180989&~.~&6504329413&~());
+							reTaskableDialog.~&254532220638374263&~();
+						}
+						~&8399894427373474444&~: {
+							reTaskableDialog.~&254532220638374263&~();
+						}
+					}
 				}
 			}
-		END REBUILD
+		}
 	END TRAVERSE
 END AFFECT
