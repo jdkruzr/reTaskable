@@ -288,14 +288,21 @@ async fn dispatch_edit(
     calendar_url: &Url,
     op: &PendingOp,
 ) -> ExecOutcome {
-    let new_summary = op
+    let payload = op
         .payload
         .as_deref()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+    let new_summary = payload
+        .as_ref()
         .and_then(|v| v.get("summary").and_then(|s| s.as_str()).map(String::from));
     let Some(new_summary) = new_summary else {
         return ExecOutcome::Terminal("edit op missing summary payload".to_string());
     };
+    // M16: a present "due" key (even "") means set/clear DUE; absent means leave it.
+    let due: Option<String> = payload
+        .as_ref()
+        .and_then(|v| v.get("due"))
+        .map(|d| d.as_str().unwrap_or("").to_string());
 
     let cached = match fetch_cached_for_dispatch(conn, &op.target_calendar_href, &op.target_uid) {
         Ok(opt) => opt,
@@ -311,13 +318,21 @@ async fn dispatch_edit(
     };
 
     let new_summary_for_closure = new_summary.clone();
+    let due_for_closure = due.clone();
     match crate::nextcloud::put_task_with_retry(
         http,
         &task_url,
         auth,
         &cached_etag,
         &cached_ical,
-        move |ical| Ok(crate::nextcloud::replace_summary(ical, &new_summary_for_closure)),
+        move |ical| {
+            let s = crate::nextcloud::replace_summary(ical, &new_summary_for_closure);
+            // Re-apply DUE on a 412 re-derive so a conflict can't drop the date.
+            Ok(match &due_for_closure {
+                Some(token) => crate::nextcloud::set_due(&s, token),
+                None => s,
+            })
+        },
     )
     .await
     {

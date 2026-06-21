@@ -372,7 +372,7 @@ pub fn enqueue_create(
     uid: &str,
     summary: &str,
 ) -> Result<i64> {
-    enqueue_create_with_anchor(conn, calendar_href, uid, summary, None)
+    enqueue_create_with_anchor(conn, calendar_href, uid, summary, None, None)
 }
 
 /// Like [`enqueue_create`], but stamps the M13 note-anchor X-properties into the
@@ -385,11 +385,19 @@ pub fn enqueue_create_with_anchor(
     uid: &str,
     summary: &str,
     anchor: Option<&Anchor>,
+    due: Option<&str>,
 ) -> Result<i64> {
     let now_iso = Utc::now()
         .format("%Y%m%dT%H%M%SZ")
         .to_string();
     let escaped = crate::nextcloud::escape_ical_text(summary);
+    // M16: an optional DUE line, rendered from the normalized due token. None /
+    // empty / malformed → no DUE line (and the cache `due` column stays NULL).
+    // The cache column gets the token only when it validated, so cache == wire.
+    let due_token = due.map(str::trim).filter(|s| !s.is_empty());
+    let due_line = due_token.and_then(crate::nextcloud::due_property_line);
+    let cache_due: Option<&str> = if due_line.is_some() { due_token } else { None };
+    let due_lines = due_line.map(|l| format!("{l}\r\n")).unwrap_or_default();
     // Machine anchors (doc/page) are controlled tokens written verbatim; only the
     // human label is escaped (a notebook name may contain commas/semicolons).
     let mut anchor_lines = String::new();
@@ -417,6 +425,7 @@ pub fn enqueue_create_with_anchor(
          CREATED:{now_iso}\r\n\
          LAST-MODIFIED:{now_iso}\r\n\
          SUMMARY:{escaped}\r\n\
+         {due_lines}\
          {anchor_lines}\
          STATUS:NEEDS-ACTION\r\n\
          END:VTODO\r\n\
@@ -435,8 +444,8 @@ pub fn enqueue_create_with_anchor(
     let tx = conn.unchecked_transaction()?;
     tx.execute(
         "INSERT INTO task (calendar_href, href, etag, ical_text, summary, status, due, uid, pending_delete)
-         VALUES (?1, ?2, '', ?3, ?4, 'needs-action', NULL, ?5, 0)",
-        params![calendar_href, sentinel_href, ical_text, summary, uid],
+         VALUES (?1, ?2, '', ?3, ?4, 'needs-action', ?5, ?6, 0)",
+        params![calendar_href, sentinel_href, ical_text, summary, cache_due, uid],
     )?;
     tx.execute(
         "INSERT INTO pending_op (op_type, target_uid, target_calendar_href, payload, enqueued_at)
@@ -500,26 +509,39 @@ pub fn enqueue_edit(
     calendar_href: &str,
     uid: &str,
     new_summary: &str,
+    due: Option<&str>,
 ) -> Result<i64> {
     let tx = conn.unchecked_transaction()?;
 
-    let row: Option<(String, String)> = tx
+    let row: Option<(String, String, Option<String>)> = tx
         .query_row(
-            "SELECT href, ical_text FROM task \
+            "SELECT href, ical_text, due FROM task \
              WHERE calendar_href = ?1 AND uid = ?2 AND pending_delete = 0",
             params![calendar_href, uid],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?;
-    let (href, ical_text) = row
+    let (href, ical_text, existing_due) = row
         .ok_or_else(|| anyhow::anyhow!("no live task with uid {uid}"))?;
 
-    let new_ical = crate::nextcloud::replace_summary(&ical_text, new_summary);
+    let summarised = crate::nextcloud::replace_summary(&ical_text, new_summary);
+    // M16: `due = Some(token)` sets/clears DUE (empty or malformed token clears);
+    // `None` leaves the existing DUE untouched. The cache `due` column tracks the
+    // body so the UI reflects the change before sync.
+    let (new_ical, final_due): (String, Option<String>) = match due {
+        Some(token) => {
+            // Cache the token only when it validates, so cache == what set_due wrote.
+            let cache_due = crate::nextcloud::due_property_line(token.trim())
+                .map(|_| token.trim().to_string());
+            (crate::nextcloud::set_due(&summarised, token), cache_due)
+        }
+        None => (summarised, existing_due),
+    };
 
     let affected = tx.execute(
-        "UPDATE task SET ical_text = ?1, summary = ?2 \
-         WHERE calendar_href = ?3 AND href = ?4",
-        params![new_ical, new_summary, calendar_href, href],
+        "UPDATE task SET ical_text = ?1, summary = ?2, due = ?3 \
+         WHERE calendar_href = ?4 AND href = ?5",
+        params![new_ical, new_summary, final_due, calendar_href, href],
     )?;
     if affected != 1 {
         return Err(anyhow::anyhow!(
@@ -527,7 +549,14 @@ pub fn enqueue_edit(
         ));
     }
 
-    let payload = serde_json::to_string(&serde_json::json!({ "summary": new_summary }))?;
+    let mut payload_obj = serde_json::Map::new();
+    payload_obj.insert("summary".into(), serde_json::json!(new_summary));
+    if let Some(token) = due {
+        // Present key (even when "") tells the queue to set/clear DUE on flush;
+        // absent means "don't touch it" (pre-M16 ops, or summary-only edits).
+        payload_obj.insert("due".into(), serde_json::json!(token));
+    }
+    let payload = serde_json::to_string(&serde_json::Value::Object(payload_obj))?;
     let enqueued_at = unix_secs_now();
     tx.execute(
         "INSERT INTO pending_op (op_type, target_uid, target_calendar_href, payload, enqueued_at)
@@ -1484,7 +1513,7 @@ mod tests {
             page_key: "p:0.500000".to_string(),
             label: "Q3 Planning, vol 2 · p.3".to_string(),
         };
-        enqueue_create_with_anchor(&mut conn, "/cal/", "uid-anch", "Email Bob", Some(&anchor))
+        enqueue_create_with_anchor(&mut conn, "/cal/", "uid-anch", "Email Bob", Some(&anchor), None)
             .unwrap();
         let ical: String = conn
             .query_row("SELECT ical_text FROM task WHERE uid = 'uid-anch'", [], |r| r.get(0))
@@ -1517,7 +1546,7 @@ mod tests {
             page_key: String::new(),
             label: "Notebook · p.1".to_string(),
         };
-        enqueue_create_with_anchor(&mut conn, "/cal/", "uid-anch", "has label", Some(&anchor))
+        enqueue_create_with_anchor(&mut conn, "/cal/", "uid-anch", "has label", Some(&anchor), None)
             .unwrap();
         let sources = source_labels(&conn, "/cal/").unwrap();
         assert_eq!(sources.len(), 1);
@@ -1629,7 +1658,7 @@ mod tests {
             params![ical],
         ).unwrap();
 
-        let op_id = enqueue_edit(&mut conn, "/cal/", "uid-e", "New summary").expect("enqueue");
+        let op_id = enqueue_edit(&mut conn, "/cal/", "uid-e", "New summary", None).expect("enqueue");
         assert!(op_id > 0);
 
         let (summary, new_ical): (String, String) = conn.query_row(
@@ -1669,7 +1698,7 @@ mod tests {
 
         // Summary contains a double-quote and a newline.
         let weird = "He said \"hi\"\nand left";
-        enqueue_edit(&mut conn, "/cal/", "uid-q", weird).unwrap();
+        enqueue_edit(&mut conn, "/cal/", "uid-q", weird, None).unwrap();
         let payload: String = conn.query_row(
             "SELECT payload FROM pending_op WHERE target_uid = 'uid-q'",
             [],
@@ -1681,6 +1710,126 @@ mod tests {
     }
 
     #[test]
+    fn enqueue_create_with_due_writes_property_and_cache() {
+        let mut conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        // All-day.
+        enqueue_create_with_anchor(&mut conn, "/cal/", "uid-d1", "Pay rent", None, Some("20260622"))
+            .unwrap();
+        let (ical, due): (String, Option<String>) = conn
+            .query_row(
+                "SELECT ical_text, due FROM task WHERE uid = 'uid-d1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(ical.contains("DUE;VALUE=DATE:20260622\r\n"), "body: {ical}");
+        assert_eq!(due.as_deref(), Some("20260622"));
+
+        // Timed (floating, no Z).
+        enqueue_create_with_anchor(
+            &mut conn,
+            "/cal/",
+            "uid-d2",
+            "Standup",
+            None,
+            Some("20260622T090000"),
+        )
+        .unwrap();
+        let (ical2, due2): (String, Option<String>) = conn
+            .query_row(
+                "SELECT ical_text, due FROM task WHERE uid = 'uid-d2'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(ical2.contains("DUE:20260622T090000\r\n"), "body: {ical2}");
+        assert!(!ical2.contains("VALUE=DATE"));
+        assert_eq!(due2.as_deref(), Some("20260622T090000"));
+
+        // Malformed token → no DUE, NULL cache.
+        enqueue_create_with_anchor(&mut conn, "/cal/", "uid-d3", "Nope", None, Some("garbage"))
+            .unwrap();
+        let (ical3, due3): (String, Option<String>) = conn
+            .query_row(
+                "SELECT ical_text, due FROM task WHERE uid = 'uid-d3'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(!ical3.contains("DUE"));
+        assert_eq!(due3, None);
+    }
+
+    #[test]
+    fn enqueue_edit_sets_and_clears_due() {
+        let mut conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        conn.execute(
+            "INSERT INTO calendar (href, display_name) VALUES ('/cal/', 'Cal')",
+            [],
+        )
+        .unwrap();
+        let ical = "BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:uid-ed\r\n\
+                    SUMMARY:Task\r\nSTATUS:NEEDS-ACTION\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        conn.execute(
+            "INSERT INTO task
+             (calendar_href, href, etag, ical_text, summary, status, due, uid, pending_delete)
+             VALUES ('/cal/', '/cal/ed.ics', 'e', ?1, 'Task', 'needs-action', NULL, 'uid-ed', 0)",
+            params![ical],
+        )
+        .unwrap();
+
+        // Set a due.
+        enqueue_edit(&mut conn, "/cal/", "uid-ed", "Task", Some("20260101")).unwrap();
+        let (ical1, due1): (String, Option<String>) = conn
+            .query_row(
+                "SELECT ical_text, due FROM task WHERE uid = 'uid-ed'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(ical1.contains("DUE;VALUE=DATE:20260101\r\n"));
+        assert_eq!(due1.as_deref(), Some("20260101"));
+        // The op payload carries the due token so the flush re-applies it.
+        let payload: String = conn
+            .query_row(
+                "SELECT payload FROM pending_op WHERE target_uid = 'uid-ed' ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(parsed["due"], "20260101");
+
+        // Clear it (empty token).
+        enqueue_edit(&mut conn, "/cal/", "uid-ed", "Task", Some("")).unwrap();
+        let (ical2, due2): (String, Option<String>) = conn
+            .query_row(
+                "SELECT ical_text, due FROM task WHERE uid = 'uid-ed'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(!ical2.contains("DUE"));
+        assert_eq!(due2, None);
+
+        // Summary-only edit (due = None) preserves whatever DUE exists.
+        enqueue_edit(&mut conn, "/cal/", "uid-ed", "Task", Some("20260202")).unwrap();
+        enqueue_edit(&mut conn, "/cal/", "uid-ed", "Renamed", None).unwrap();
+        let (ical3, due3): (String, Option<String>) = conn
+            .query_row(
+                "SELECT ical_text, due FROM task WHERE uid = 'uid-ed'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(ical3.contains("DUE;VALUE=DATE:20260202\r\n"));
+        assert!(ical3.contains("SUMMARY:Renamed\r\n"));
+        assert_eq!(due3.as_deref(), Some("20260202"));
+    }
+
+    #[test]
     fn enqueue_edit_unknown_uid_rolls_back() {
         let mut conn = fresh();
         ensure_schema_v2(&conn).expect("migrate");
@@ -1688,7 +1837,7 @@ mod tests {
             "INSERT INTO calendar (href, display_name) VALUES ('/cal/', 'Cal')",
             [],
         ).unwrap();
-        let err = enqueue_edit(&mut conn, "/cal/", "uid-missing", "anything");
+        let err = enqueue_edit(&mut conn, "/cal/", "uid-missing", "anything", None);
         assert!(err.is_err());
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM pending_op", [], |r| r.get(0),

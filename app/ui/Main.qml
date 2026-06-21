@@ -37,6 +37,9 @@ Rectangle {
     property string detailSummary: ""
     property bool detailCompleted: false
     property string detailDue: ""
+    // M16: the normalized due token the detail dialog opened with, so Save can
+    // tell whether the user actually changed the due (vs the summary alone).
+    property string detailDueOriginal: ""
     property string detailSource: ""
     property string detailMark: ""
     // M15 jump-back: the source note's machine anchor for the open task.
@@ -346,6 +349,10 @@ Rectangle {
         root.detailPage = t.page ? t.page : ""
         root.detailDeleteArmed = false
         detailSummaryInput.text = t.summary
+        // M16: prefill the due editor from the row, and record the normalized
+        // token so Save can detect a real due change.
+        detailDueField.setFromToken(root.detailDue)
+        root.detailDueOriginal = detailDueField.token
         root.detailOpen = true
     }
 
@@ -372,6 +379,34 @@ Rectangle {
         if (m === "!") return "Sync error — will retry"
         if (m === "*") return "Queued — not yet synced"
         return "Synced"
+    }
+
+    // M16: render a raw iCalendar DUE value (the cache/envelope `due` field, e.g.
+    // "20260622" or "20260622T140000", tolerating a trailing Z) as a friendly
+    // string like "Jun 22", "Jun 22 2026", or "Jun 22 · 2:00 PM". Returns "" for
+    // anything it can't parse, so callers can guard on length.
+    function formatDue(raw) {
+        if (!raw || raw.length < 8) return ""
+        var s = "" + raw
+        if (s.charAt(s.length - 1) === "Z") s = s.substring(0, s.length - 1)
+        var y = parseInt(s.substring(0, 4), 10)
+        var mo = parseInt(s.substring(4, 6), 10)
+        var d = parseInt(s.substring(6, 8), 10)
+        if (isNaN(y) || isNaN(mo) || isNaN(d)) return ""
+        var months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                      "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+        var out = months[(mo - 1 + 12) % 12] + " " + d
+        if (y !== new Date().getFullYear()) out += " " + y
+        if (s.indexOf("T") === 8 && s.length >= 13) {
+            var hh = parseInt(s.substring(9, 11), 10)
+            var mm = parseInt(s.substring(11, 13), 10)
+            if (!isNaN(hh) && !isNaN(mm)) {
+                var ap = hh < 12 ? "AM" : "PM"
+                var h12 = hh % 12; if (h12 === 0) h12 = 12
+                out += " · " + h12 + ":" + (mm < 10 ? "0" + mm : mm) + " " + ap
+            }
+        }
+        return out
     }
 
     // ---- Header: title, status, and the essential controls ----
@@ -445,45 +480,62 @@ Rectangle {
         }
 
         // Create a task.
-        Row {
+        Column {
             width: parent.width
-            spacing: 16
+            spacing: 12
 
-            TextField {
-                id: summaryInput
-                width: parent.width - createBtn.width - 16
-                height: 72
-                font.pixelSize: 22
-                color: "black"
-                placeholderTextColor: "#606060"
-                placeholderText: "New task summary"
-            }
+            Row {
+                width: parent.width
+                spacing: 16
 
-            Rectangle {
-                id: createBtn
-                property bool active: summaryInput.text.trim().length > 0
-                width: 180
-                height: 72
-                color: createBtn.active ? "white" : "#dddddd"
-                border.color: "black"
-                border.width: 3
-
-                Text {
-                    anchors.centerIn: parent
-                    text: "Create"
-                    font.pixelSize: 24
-                    color: createBtn.active ? "black" : "#555555"
+                TextField {
+                    id: summaryInput
+                    width: parent.width - createBtn.width - 16
+                    height: 72
+                    font.pixelSize: 22
+                    color: "black"
+                    placeholderTextColor: "#606060"
+                    placeholderText: "New task summary"
                 }
 
-                MouseArea {
-                    anchors.fill: parent
-                    enabled: createBtn.active
-                    onClicked: {
-                        endpoint.sendMessage(8, summaryInput.text.trim())
-                        summaryInput.text = ""
+                Rectangle {
+                    id: createBtn
+                    property bool active: summaryInput.text.trim().length > 0
+                    width: 180
+                    height: 72
+                    color: createBtn.active ? "white" : "#dddddd"
+                    border.color: "black"
+                    border.width: 3
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: "Create"
+                        font.pixelSize: 24
+                        color: createBtn.active ? "black" : "#555555"
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+                        enabled: createBtn.active
+                        onClicked: {
+                            // M16: create payload is JSON {summary, due}; due is
+                            // the normalized token ("" when no date was set).
+                            endpoint.sendMessage(8, JSON.stringify({
+                                summary: summaryInput.text.trim(),
+                                due: createDue.token
+                            }))
+                            summaryInput.text = ""
+                            createDue.clearDue()
+                            // Drop focus + lower the keyboard (clearing text alone
+                            // leaves it raised), mirroring closeDetail().
+                            summaryInput.focus = false
+                            Qt.inputMethod.hide()
+                        }
                     }
                 }
             }
+
+            DueField { id: createDue; width: parent.width }
         }
 
         // Action controls — all on one line: Sync, Settings, Show/Hide
@@ -753,12 +805,15 @@ Rectangle {
                         border.color: "black"
                         border.width: 4
 
-                        Text {
+                        // A filled inner square marks "checked" — font-independent
+                        // (the device font lacks ✓ / Dingbats, which rendered as
+                        // tofu) and crisp on e-ink.
+                        Rectangle {
                             anchors.centerIn: parent
                             visible: rowCheck.checked
-                            text: "✓"
-                            font.pixelSize: 38
-                            font.bold: true
+                            width: 28
+                            height: 28
+                            radius: 2
                             color: "black"
                         }
                     }
@@ -771,7 +826,7 @@ Rectangle {
 
                     Text {
                         width: parent.width
-                        text: model.summary + (model.due ? "  (due " + model.due + ")" : "")
+                        text: model.summary + (root.formatDue(model.due) ? "  (due " + root.formatDue(model.due) + ")" : "")
                         font.pixelSize: 26
                         elide: Text.ElideRight
                         color: model.completed ? "#909090" : "black"
@@ -1011,8 +1066,8 @@ Rectangle {
             }
 
             Text {
-                visible: root.detailDue.length > 0
-                text: "Due: " + root.detailDue
+                visible: root.formatDue(root.detailDue).length > 0
+                text: "Due: " + root.formatDue(root.detailDue)
                 font.pixelSize: 26
                 color: "#1a1a1a"
             }
@@ -1086,13 +1141,25 @@ Rectangle {
                 }
             }
 
+            // M16: edit the due date/time. Prefilled from the row in openDetail.
+            Text {
+                text: "Due date"
+                font.pixelSize: 22
+                color: "#1a1a1a"
+            }
+
+            DueField { id: detailDueField; width: parent.width }
+
             Row {
                 spacing: 16
 
                 Rectangle {
                     id: detailSaveBtn
+                    // Active when the summary is non-empty AND something changed —
+                    // either the summary text or the due token (vs what we opened with).
                     property bool active: detailSummaryInput.text.trim().length > 0
-                                          && detailSummaryInput.text.trim() !== root.detailSummary
+                                          && (detailSummaryInput.text.trim() !== root.detailSummary
+                                              || detailDueField.token !== root.detailDueOriginal)
                     width: 240
                     height: 72
                     color: detailSaveBtn.active ? "white" : "#dddddd"
@@ -1110,9 +1177,11 @@ Rectangle {
                         anchors.fill: parent
                         enabled: detailSaveBtn.active
                         onClicked: {
+                            // M16: carry the due token; "" clears it server-side.
                             endpoint.sendMessage(19, JSON.stringify({
                                 uid: root.detailUid,
-                                summary: detailSummaryInput.text.trim()
+                                summary: detailSummaryInput.text.trim(),
+                                due: detailDueField.token
                             }))
                             root.closeDetail()
                         }

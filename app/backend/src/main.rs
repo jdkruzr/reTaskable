@@ -580,7 +580,7 @@ mod tests {
         .unwrap();
         db::enqueue_create(&mut conn, "/cal/", "uid-1", "Buy milk").unwrap();
 
-        let out = edit_by_uid_inner(&mut conn, "/cal/", "uid-1", "Buy oat milk")
+        let out = edit_by_uid_inner(&mut conn, "/cal/", "uid-1", "Buy oat milk", None)
             .expect("edit");
         assert!(out.contains("Buy milk"), "old summary in status: {out}");
         assert!(out.contains("Buy oat milk"), "new summary in status: {out}");
@@ -600,7 +600,7 @@ mod tests {
         use rusqlite::Connection;
         let mut conn = Connection::open_in_memory().unwrap();
         db::ensure_schema_v2(&conn).unwrap();
-        assert!(edit_by_uid_inner(&mut conn, "/cal/", "nope", "x").is_err());
+        assert!(edit_by_uid_inner(&mut conn, "/cal/", "nope", "x", None).is_err());
     }
 
     #[test]
@@ -1608,12 +1608,16 @@ fn toggle_by_uid_inner(
 }
 
 /// MSG_EDIT_BY_UID handler. The task-detail dialog edits a specific task's
-/// summary by UID (the detail it opened), mirroring `toggle_by_uid`. Payload is
-/// `{ "uid": "...", "summary": "..." }`. Thin config/calendar wrapper around
-/// `edit_by_uid_inner`, which holds the testable DB logic.
+/// summary (and M16 due date) by UID (the detail it opened), mirroring
+/// `toggle_by_uid`. Payload is `{ "uid", "summary", "due" }` where `due` is the
+/// normalized token ("" clears, absent leaves it untouched). Thin config/calendar
+/// wrapper around `edit_by_uid_inner`, which holds the testable DB logic.
 fn edit_by_uid(db: &mut Connection, payload: &str) -> anyhow::Result<String> {
     let v: serde_json::Value = serde_json::from_str(payload)?;
     let uid = v.get("uid").and_then(|x| x.as_str()).unwrap_or("").trim();
+    // The detail dialog always sends `due` (the prefilled-or-edited token), so a
+    // present key drives set/clear; an absent key means a summary-only edit.
+    let due: Option<&str> = v.get("due").map(|x| x.as_str().unwrap_or("").trim());
     let new_summary = v
         .get("summary")
         .and_then(|x| x.as_str())
@@ -1640,7 +1644,7 @@ fn edit_by_uid(db: &mut Connection, payload: &str) -> anyhow::Result<String> {
         ));
     };
 
-    edit_by_uid_inner(db, &cal_href, uid, new_summary)
+    edit_by_uid_inner(db, &cal_href, uid, new_summary, due)
 }
 
 /// Enqueue an edit for a specific UID and return a `Queued: ...` status string.
@@ -1653,12 +1657,13 @@ fn edit_by_uid_inner(
     cal_href: &str,
     uid: &str,
     new_summary: &str,
+    due: Option<&str>,
 ) -> anyhow::Result<String> {
     let Some(task) = db::get_cached_task_by_uid(db, cal_href, uid)? else {
         anyhow::bail!("no task with uid {uid}");
     };
     let old_summary = task.summary.clone();
-    let op_id = db::enqueue_edit(db, cal_href, uid, new_summary)?;
+    let op_id = db::enqueue_edit(db, cal_href, uid, new_summary, due)?;
     Ok(format!(
         "Queued: edit \"{old_summary}\" -> \"{new_summary}\" (#{op_id})"
     ))
@@ -1858,11 +1863,25 @@ async fn discover_with_inner(payload: &str) -> anyhow::Result<Vec<nextcloud::Cal
     nextcloud::discover_calendars(&cfg).await
 }
 
-fn create(db: &mut Connection, summary: &str) -> anyhow::Result<String> {
-    let summary = summary.trim();
+fn create(db: &mut Connection, payload: &str) -> anyhow::Result<String> {
+    // M16: payload is JSON `{summary, due}`. Fall back to treating the whole
+    // payload as a bare summary (no due) so a pre-M16 plain-string sender still
+    // works. `due` is the normalized token ("" / YYYYMMDD / YYYYMMDDTHHMMSS).
+    let (summary_owned, due_owned) =
+        match serde_json::from_str::<serde_json::Value>(payload) {
+            Ok(v) if v.is_object() => {
+                let s = v.get("summary").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                let d = v.get("due").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                (s, d)
+            }
+            _ => (payload.to_string(), String::new()),
+        };
+    let summary = summary_owned.trim();
     if summary.is_empty() {
         anyhow::bail!("summary cannot be empty");
     }
+    let due = due_owned.trim();
+    let due_opt = if due.is_empty() { None } else { Some(due) };
 
     let cfg = config::load()?;
     let wanted = cfg.nextcloud.calendar.as_ref().ok_or_else(|| {
@@ -1879,7 +1898,7 @@ fn create(db: &mut Connection, summary: &str) -> anyhow::Result<String> {
     };
 
     let uid = Uuid::new_v4().to_string();
-    let op_id = db::enqueue_create(db, &cal_href, &uid, summary)?;
+    let op_id = db::enqueue_create_with_anchor(db, &cal_href, &uid, summary, None, due_opt)?;
     Ok(format!("Queued: create \"{summary}\" (#{op_id})"))
 }
 
@@ -1979,7 +1998,7 @@ fn drain_intake_from(
         let anchor = make_anchor(&item);
         let uid = Uuid::new_v4().to_string();
         if let Err(e) =
-            db::enqueue_create_with_anchor(db, cal_href, &uid, summary, anchor.as_ref())
+            db::enqueue_create_with_anchor(db, cal_href, &uid, summary, anchor.as_ref(), None)
         {
             eprintln!("retaskable: intake enqueue failed {}: {e:#}", path.display());
             continue; // leave the file for a later retry
@@ -2023,7 +2042,7 @@ fn edit_first(db: &mut Connection, summary: &str) -> anyhow::Result<String> {
     };
 
     let old_summary = task.summary.clone();
-    let op_id = db::enqueue_edit(db, &cal_href, &task.uid, new_summary)?;
+    let op_id = db::enqueue_edit(db, &cal_href, &task.uid, new_summary, None)?;
     Ok(format!(
         "Queued: edit \"{old_summary}\" -> \"{new_summary}\" (#{op_id})"
     ))

@@ -884,6 +884,75 @@ pub fn replace_summary(ical_text: &str, new_summary: &str) -> String {
     )
 }
 
+/// Render the full `DUE` property line for a normalized due token (the M16
+/// QML⇄backend wire form), or `None` for an empty / malformed token.
+///
+/// Tokens:
+/// - `""`                → `None` (no due)
+/// - `"YYYYMMDD"`        → `Some("DUE;VALUE=DATE:YYYYMMDD")`   (all-day)
+/// - `"YYYYMMDDTHHMMSS"` → `Some("DUE:YYYYMMDDTHHMMSS")`        (timed, floating-local)
+///
+/// Floating-local by design: no `Z`, no `TZID` (a personal single-device client).
+/// The all-day form carries the `;VALUE=DATE` parameter, which is exactly why due
+/// can't go through `apply_vtodo_mutations` (it only emits `KEY:value`). Anything
+/// else is treated as no due (logged), so a malformed QML payload can't corrupt the
+/// VTODO.
+pub fn due_property_line(token: &str) -> Option<String> {
+    let t = token.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let all_digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+    if t.len() == 8 && all_digits(t) {
+        return Some(format!("DUE;VALUE=DATE:{t}"));
+    }
+    // YYYYMMDDTHHMMSS — 8 digits, 'T', 6 digits.
+    if t.len() == 15 && t.as_bytes()[8] == b'T' && all_digits(&t[..8]) && all_digits(&t[9..]) {
+        return Some(format!("DUE:{t}"));
+    }
+    eprintln!("retaskable: ignoring malformed due token ({} chars)", t.len());
+    None
+}
+
+/// Set, replace, or clear the VTODO's `DUE` property from a normalized due token
+/// (see [`due_property_line`]). A dedicated scanner rather than
+/// `apply_vtodo_mutations` because the all-day form needs the `;VALUE=DATE`
+/// parameter the generic engine can't emit. Removes any existing `DUE` line
+/// (matching both `DUE:` and `DUE;…`) and, when the token yields a property,
+/// inserts the fresh line before `END:VTODO`. An empty/malformed token clears DUE.
+/// Same defensive `ensure_crlf` at entry as the other mutators.
+pub fn set_due(ical_text: &str, token: &str) -> String {
+    let ical_text = ensure_crlf(ical_text);
+    let new_line = due_property_line(token);
+    let mut out = String::with_capacity(ical_text.len() + 32);
+    let mut in_vtodo = false;
+
+    for line in ical_text.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
+
+        if trimmed == "BEGIN:VTODO" {
+            in_vtodo = true;
+            out.push_str(line);
+            continue;
+        }
+        if in_vtodo && trimmed == "END:VTODO" {
+            if let Some(ref l) = new_line {
+                out.push_str(l);
+                out.push_str("\r\n");
+            }
+            out.push_str(line);
+            in_vtodo = false;
+            continue;
+        }
+        // Drop any pre-existing DUE line (DUE: or DUE;param:) inside the VTODO.
+        if in_vtodo && (trimmed.starts_with("DUE:") || trimmed.starts_with("DUE;")) {
+            continue;
+        }
+        out.push_str(line);
+    }
+    out
+}
+
 /// iCalendar (RFC 5545) requires CRLF line terminators. roxmltree normalises
 /// to LF per the XML 1.0 spec, so calendar-data extracted from XML loses its
 /// CRs and some parsers + folding code paths trip on the result. This restores
@@ -1269,11 +1338,106 @@ fn propstat_is_ok(propstat: &roxmltree::Node) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_crlf, escape_ical_text, extract_source_doc, extract_source_label,
-        extract_source_page, filter_for_display, format_tasks_json, get_task,
-        parse_sync_response, replace_summary, sync_collection_unsupported,
-        unescape_ical_text,
+        due_property_line, ensure_crlf, escape_ical_text, extract_source_doc,
+        extract_source_label, extract_source_page, filter_for_display, format_tasks_json,
+        get_task, parse_sync_response, replace_summary, set_due,
+        sync_collection_unsupported, unescape_ical_text,
     };
+
+    const DUE_FIXTURE: &str = "BEGIN:VCALENDAR\r\n\
+        VERSION:2.0\r\n\
+        PRODID:-//reTaskable test//EN\r\n\
+        BEGIN:VTODO\r\n\
+        UID:due-test@retaskable\r\n\
+        DTSTAMP:20260101T000000Z\r\n\
+        SUMMARY:Schedule me\r\n\
+        X-RETASKABLE-SOURCE-DOC:abc-123\r\n\
+        STATUS:NEEDS-ACTION\r\n\
+        END:VTODO\r\n\
+        END:VCALENDAR\r\n";
+
+    #[test]
+    fn due_property_line_renders_each_form() {
+        assert_eq!(due_property_line(""), None);
+        assert_eq!(due_property_line("   "), None);
+        assert_eq!(
+            due_property_line("20260622").as_deref(),
+            Some("DUE;VALUE=DATE:20260622")
+        );
+        assert_eq!(
+            due_property_line("20260622T140000").as_deref(),
+            Some("DUE:20260622T140000")
+        );
+        // Trimmed before validation.
+        assert_eq!(
+            due_property_line(" 20260622 ").as_deref(),
+            Some("DUE;VALUE=DATE:20260622")
+        );
+    }
+
+    #[test]
+    fn due_property_line_rejects_malformed() {
+        for bad in ["2026062", "202606222", "2026-06-22", "20260622T1400", "20260622Z140000", "notadate"] {
+            assert_eq!(due_property_line(bad), None, "expected None for {bad:?}");
+        }
+    }
+
+    #[test]
+    fn set_due_adds_all_day_with_value_date_param() {
+        let out = set_due(DUE_FIXTURE, "20260622");
+        assert!(out.contains("DUE;VALUE=DATE:20260622\r\n"));
+        // Inserted inside the VTODO, before END:VTODO.
+        let due_at = out.find("DUE;VALUE=DATE").unwrap();
+        let end_at = out.find("END:VTODO").unwrap();
+        assert!(due_at < end_at);
+        // Unrelated props untouched.
+        assert!(out.contains("X-RETASKABLE-SOURCE-DOC:abc-123\r\n"));
+        assert!(out.contains("SUMMARY:Schedule me\r\n"));
+    }
+
+    #[test]
+    fn set_due_adds_timed_without_param_or_z() {
+        let out = set_due(DUE_FIXTURE, "20260622T140000");
+        assert!(out.contains("DUE:20260622T140000\r\n"));
+        assert!(!out.contains("VALUE=DATE"));
+        assert!(!out.contains("140000Z"));
+    }
+
+    #[test]
+    fn set_due_replaces_existing_due() {
+        let timed = set_due(DUE_FIXTURE, "20260622T140000");
+        assert_eq!(timed.matches("DUE").count(), 1);
+        // timed -> all-day
+        let allday = set_due(&timed, "20260625");
+        assert!(allday.contains("DUE;VALUE=DATE:20260625\r\n"));
+        assert!(!allday.contains("20260622"));
+        // Exactly one DUE property survives the replace.
+        assert_eq!(allday.matches("DUE").count(), 1);
+        // all-day -> timed again
+        let back = set_due(&allday, "20260626T090000");
+        assert!(back.contains("DUE:20260626T090000\r\n"));
+        assert_eq!(back.matches("DUE").count(), 1);
+    }
+
+    #[test]
+    fn set_due_clears_on_empty_or_malformed() {
+        let timed = set_due(DUE_FIXTURE, "20260622T140000");
+        let cleared = set_due(&timed, "");
+        assert!(!cleared.contains("DUE:"));
+        assert!(!cleared.contains("DUE;"));
+        // A malformed token also clears (treated as no due).
+        let cleared2 = set_due(&timed, "garbage");
+        assert!(!cleared2.contains("DUE:20260622"));
+    }
+
+    #[test]
+    fn set_due_preserves_crlf_and_structure() {
+        let out = set_due(DUE_FIXTURE, "20260622");
+        assert!(out.ends_with("END:VCALENDAR\r\n"));
+        assert!(!out.contains("\n\n"));
+        // No bare LF anywhere (all CRLF).
+        assert!(!out.replace("\r\n", "").contains('\n'));
+    }
 
     #[test]
     fn replace_summary_preserves_unrelated_properties() {

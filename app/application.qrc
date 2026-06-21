@@ -1,5 +1,6 @@
 <RCC>
     <qresource>
         <file>ui/Main.qml</file>
+        <file>ui/DueField.qml</file>
     </qresource>
 </RCC>
