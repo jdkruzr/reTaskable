@@ -1,0 +1,56 @@
+; reTaskable M15 — jump-back navigation hook (to-do → source note page).
+; xochitl 3.27 (reMarkable Paper Pro). xovi + qmldiff extension.
+; SPDX-License-Identifier: GPL-3.0-only
+;
+; Listens for the `reTaskableJump` broker signal — payload "<docUuid>,<pageKey>"
+; where pageKey is "idx:<0-based>" (the M13/M14 note anchor). On receipt it opens
+; that notebook page via MainView's stock `onOpened({documentId, page})`
+; (Library.entryForId -> documentView.item.openDocumentOnPage). The reTaskable app
+; sends by having its backend write `ureTaskableJump:<doc>,<page>` to /run/xovi-mb
+; (the `u` prefix routes to QML — `e` is native-only; proven by the M15 spike), then
+; terminating itself; this listener (always-loaded in MainView) does the navigation.
+;
+; Uses createQmlObject (not a declarative IMPORT) so a broker-module load failure is
+; caught and CANNOT break MainView's load. A missing note (entry not on this device)
+; degrades to a logged no-op inside onOpened's try/catch.
+;
+; Published HASHED for xochitl 3.27 (qmldiff hashtab tokens). To read/edit:
+;   qmldiff hash-diffs <device-hashtab> retaskableJump.qmd -r   (unhash in place)
+; edit, then re-hash (same command without -r) before committing. The
+; net.asivery.XoviMessageBroker identifiers stay readable (as command-executor does
+; in retaskableSend.qmd). Device hashtab: /home/root/xovi/exthome/qt-resource-rebuilder/hashtab.
+
+AFFECT [[2328484894988065446]]
+	TRAVERSE ?#[[6504254477]]
+		LOCATE AFTER ALL
+		INSERT {
+			~&6502786168&~ {
+				~&5972374&~: reTaskableJumpProbe
+				~&254480451320573660&~.~&495334332051582499&~: {
+					try {
+						~&197102514&~ ~&197097459&~ = "import net.asivery.XoviMessageBroker 2.0; "
+							+ "XoviMessageBroker { "
+							+ "  listeningFor: ['reTaskableJump']; "
+							+ "  function onSignalReceived(sgn, message) { "
+							+ "    if (sgn !== 'reTaskableJump') return; "
+							+ "    var s = '' + message; "
+							+ "    var c = s.indexOf(','); "
+							+ "    var docId = c < 0 ? s : s.substring(0, c); "
+							+ "    var pageKey = c < 0 ? '' : s.substring(c + 1); "
+							+ "    var page = 0; "
+							+ "    if (pageKey.indexOf('idx:') === 0) page = parseInt(pageKey.substring(4), 10); "
+							+ "    if (isNaN(page) || page < 0) page = 0; "
+							+ "    if (!docId) return; "
+							+ "    try { root.onOpened({ documentId: docId, page: page }); } "
+							+ "    catch (navErr) { console.log('retaskable-jump: nav failed: ' + navErr); } "
+							+ "  } "
+							+ "}";
+						~&5971598&~.createQmlObject(~&197097459&~, reTaskableJumpProbe, "reTaskableJumpBroker");
+					} catch (~&180974&~) {
+						~&233724020023100&~.~&197092075&~("retaskable-jump: failed to arm: " + ~&180974&~);
+					}
+				}
+			}
+		}
+	END TRAVERSE
+END AFFECT

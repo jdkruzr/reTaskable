@@ -39,6 +39,9 @@ Rectangle {
     property string detailDue: ""
     property string detailSource: ""
     property string detailMark: ""
+    // M15 jump-back: the source note's machine anchor for the open task.
+    property string detailDoc: ""
+    property string detailPage: ""
 
     // M11: settings screen state.
     property bool settingsOpen: false
@@ -112,6 +115,18 @@ Rectangle {
             }
             if (type === 118) {
                 root.applyDrainResult(contents)
+                return
+            }
+            if (type === 121) {
+                // Open-note: the backend wrote the jump command to the broker
+                // pipe. On success, close the app (the hook navigates). On error,
+                // stay put and surface it.
+                if (contents === "ok") {
+                    endpoint.terminate()
+                } else {
+                    statusText.text = contents
+                    root.closeDetail()
+                }
                 return
             }
             statusText.text = contents
@@ -284,7 +299,10 @@ Rectangle {
                 completed: t.completed === true,
                 due: t.due ? t.due : "",
                 mark: t.mark ? t.mark : "",
-                source: t.source ? t.source : ""
+                source: t.source ? t.source : "",
+                // M15 machine anchor for jump-back (empty when not note-captured).
+                doc: t.doc ? t.doc : "",
+                page: t.page ? t.page : ""
             })
         }
         root.conflictCount = data.conflicts ? data.conflicts : 0
@@ -324,6 +342,8 @@ Rectangle {
         root.detailDue = t.due ? t.due : ""
         root.detailSource = t.source ? t.source : ""
         root.detailMark = t.mark ? t.mark : ""
+        root.detailDoc = t.doc ? t.doc : ""
+        root.detailPage = t.page ? t.page : ""
         root.detailDeleteArmed = false
         detailSummaryInput.text = t.summary
         root.detailOpen = true
@@ -336,6 +356,15 @@ Rectangle {
         detailSummaryInput.focus = false
         Qt.inputMethod.hide()
         root.detailOpen = false
+    }
+
+    // M15 jump-back: ask the backend to signal the xochitl-side hook to open the
+    // source note, then terminate (the app closes itself; the hook navigates).
+    // We terminate on the MSG 121 reply, NOT here, so the backend's pipe write
+    // completes before our socket closes.
+    function openSourceNote() {
+        if (root.detailDoc.length === 0) return
+        endpoint.sendMessage(21, root.detailDoc + "," + root.detailPage)
     }
 
     // Human-readable pending-sync state from the row's mark.
@@ -977,14 +1006,14 @@ Rectangle {
             // Info block — every field comes from the tapped row (no fetch).
             Text {
                 text: "Status: " + (root.detailCompleted ? "Completed" : "Open")
-                font.pixelSize: 22
+                font.pixelSize: 26
                 color: "#1a1a1a"
             }
 
             Text {
                 visible: root.detailDue.length > 0
                 text: "Due: " + root.detailDue
-                font.pixelSize: 22
+                font.pixelSize: 26
                 color: "#1a1a1a"
             }
 
@@ -992,32 +1021,55 @@ Rectangle {
                 width: parent.width
                 visible: root.detailSource.length > 0
                 text: "📓 " + root.detailSource
-                font.pixelSize: 22
+                font.pixelSize: 26
                 wrapMode: Text.WrapAnywhere
                 color: "#333333"
             }
 
+            // M15 jump-back: present only for note-captured to-dos (those with a
+            // machine anchor). Closes reTaskable and opens the source note page.
+            Rectangle {
+                visible: root.detailDoc.length > 0
+                width: 320
+                height: 72
+                color: "white"
+                border.color: "black"
+                border.width: 3
+
+                Text {
+                    anchors.centerIn: parent
+                    text: "📓 Open note"
+                    font.pixelSize: 24
+                    color: "black"
+                }
+
+                MouseArea {
+                    anchors.fill: parent
+                    onClicked: root.openSourceNote()
+                }
+            }
+
             Text {
                 text: root.markLabel(root.detailMark)
-                font.pixelSize: 20
+                font.pixelSize: 24
                 color: root.detailMark === "!" ? "#c00000"
-                       : (root.detailMark === "*" ? "#b06000" : "#606060")
+                       : (root.detailMark === "*" ? "#b06000" : "#2a2a2a")
             }
 
             Text {
                 width: parent.width
                 text: "UID: " + root.detailUid
-                font.pixelSize: 15
+                font.pixelSize: 18
                 font.family: "monospace"
                 elide: Text.ElideRight
-                color: "#909090"
+                color: "#555555"
             }
 
             // Edit: a wrapping editable field shows the full summary AND edits it.
             Text {
                 text: "Summary"
-                font.pixelSize: 18
-                color: "#404040"
+                font.pixelSize: 22
+                color: "#1a1a1a"
             }
 
             TextArea {
@@ -1064,26 +1116,6 @@ Rectangle {
                             }))
                             root.closeDetail()
                         }
-                    }
-                }
-
-                Rectangle {
-                    width: 160
-                    height: 72
-                    color: "white"
-                    border.color: "black"
-                    border.width: 3
-
-                    Text {
-                        anchors.centerIn: parent
-                        text: "Close"
-                        font.pixelSize: 22
-                        color: "black"
-                    }
-
-                    MouseArea {
-                        anchors.fill: parent
-                        onClicked: root.closeDetail()
                     }
                 }
             }
@@ -1164,6 +1196,34 @@ Rectangle {
                         onClicked: root.detailDeleteArmed = false
                     }
                 }
+            }
+        }
+
+        // Top-right back affordance: its top aligns with the "Task" title and its
+        // right edge with the Summary box (both sit at the Column's 40px margin).
+        // Last child of the overlay so it draws above the Column.
+        Rectangle {
+            id: detailReturnBtn
+            anchors.top: parent.top
+            anchors.topMargin: 40
+            anchors.right: parent.right
+            anchors.rightMargin: 40
+            width: 340
+            height: 72
+            color: "white"
+            border.color: "black"
+            border.width: 3
+
+            Text {
+                anchors.centerIn: parent
+                text: "←  Return to List"
+                font.pixelSize: 24
+                color: "black"
+            }
+
+            MouseArea {
+                anchors.fill: parent
+                onClicked: root.closeDetail()
             }
         }
     }

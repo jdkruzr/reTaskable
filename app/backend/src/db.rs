@@ -926,6 +926,33 @@ pub fn source_labels(conn: &Connection, calendar_href: &str) -> Result<HashMap<S
     Ok(map)
 }
 
+/// Map of `uid -> (source_doc, source_page)` for live anchored tasks (M15
+/// jump-back). Parallels [`source_labels`]: the doc UUID + page key
+/// (`X-RETASKABLE-SOURCE-{DOC,PAGE}`) are parsed from each row's `ical_text`.
+/// A row is included if it carries either prop; the missing one is `""`.
+pub fn source_anchors(
+    conn: &Connection,
+    calendar_href: &str,
+) -> Result<HashMap<String, (String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT uid, ical_text FROM task \
+         WHERE calendar_href = ?1 AND pending_delete = 0",
+    )?;
+    let rows = stmt.query_map(params![calendar_href], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
+    let mut map = HashMap::new();
+    for row in rows {
+        let (uid, ical) = row?;
+        let doc = crate::nextcloud::extract_source_doc(&ical);
+        let page = crate::nextcloud::extract_source_page(&ical);
+        if doc.is_some() || page.is_some() {
+            map.insert(uid, (doc.unwrap_or_default(), page.unwrap_or_default()));
+        }
+    }
+    Ok(map)
+}
+
 /// Clear all errored pending_op rows and reset their cache-side effects:
 /// - For errored Deletes, unset `pending_delete = 0` on the corresponding
 ///   task rows (so the row becomes live again and sync-collection can

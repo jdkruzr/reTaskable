@@ -33,6 +33,7 @@ const MSG_DISCOVER_WITH: u32 = 17;
 const MSG_DRAIN_INTAKE: u32 = 18;
 const MSG_EDIT_BY_UID: u32 = 19;
 const MSG_DELETE_BY_UID: u32 = 20;
+const MSG_OPEN_NOTE: u32 = 21;
 const MSG_PONG: u32 = 101;
 const MSG_NEXTCLOUD_RESPONSE: u32 = 102;
 const MSG_CALENDARS_RESPONSE: u32 = 103;
@@ -53,6 +54,7 @@ const MSG_DISCOVER_WITH_RESPONSE: u32 = 117;
 const MSG_DRAIN_INTAKE_RESPONSE: u32 = 118;
 const MSG_EDIT_BY_UID_RESPONSE: u32 = 119;
 const MSG_DELETE_BY_UID_RESPONSE: u32 = 120;
+const MSG_OPEN_NOTE_RESPONSE: u32 = 121;
 
 #[tokio::main]
 async fn main() {
@@ -337,6 +339,18 @@ impl AppLoadBackend for Backend {
                 eprintln!("retaskable: delete-by-uid result:\n{response}");
                 send(replier, MSG_DELETE_BY_UID_RESPONSE, &response);
             }
+            MSG_OPEN_NOTE => {
+                eprintln!(
+                    "retaskable: open-note requested ({} chars)",
+                    msg.contents.len()
+                );
+                let response = match open_note(&msg.contents) {
+                    Ok(s) => s,
+                    Err(e) => format!("error: {e:#}"),
+                };
+                eprintln!("retaskable: open-note result: {response}");
+                send(replier, MSG_OPEN_NOTE_RESPONSE, &response);
+            }
             t => eprintln!("retaskable: ignoring unknown msg type {t}"),
         }
     }
@@ -372,6 +386,7 @@ fn show_tasks(db: &mut Connection, include_completed: bool) -> anyhow::Result<St
     let tasks = nextcloud::filter_for_display(tasks, include_completed);
     let marks = db::pending_marks(db, &cal_href)?;
     let sources = db::source_labels(db, &cal_href)?;
+    let anchors = db::source_anchors(db, &cal_href)?;
     let last_synced = match db::last_synced(db, &cal_href)? {
         Some(t) => Some(format!("Last synced {} ago.", humanize_since(t))),
         None => None,
@@ -381,6 +396,7 @@ fn show_tasks(db: &mut Connection, include_completed: bool) -> anyhow::Result<St
         &tasks,
         &marks,
         &sources,
+        &anchors,
         last_synced.as_deref(),
         conflicts,
     ))
@@ -616,6 +632,14 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         db::ensure_schema_v2(&conn).unwrap();
         assert!(delete_by_uid_inner(&mut conn, "/cal/", "nope").is_err());
+    }
+
+    #[test]
+    fn jump_command_uses_u_prefix_and_trailing_newline() {
+        // `u` = deliver to QML/UI; trailing newline terminates the pipe command.
+        assert_eq!(jump_command("doc-1,idx:2"), "ureTaskableJump:doc-1,idx:2\n");
+        // Anchor is trimmed (the value itself has no internal trimming).
+        assert_eq!(jump_command("  doc-1,idx:0  "), "ureTaskableJump:doc-1,idx:0\n");
     }
 
     #[test]
@@ -1681,6 +1705,36 @@ fn delete_by_uid_inner(
     let summary = task.summary.clone();
     let op_id = db::enqueue_delete(db, cal_href, uid)?;
     Ok(format!("Queued: delete \"{summary}\" (#{op_id})"))
+}
+
+/// Build the xovi-message-broker pipe command that drives the M15 jump-back.
+/// `anchor` is the `"<docUuid>,<pageKey>"` value; the **`u`** prefix routes the
+/// signal to the QML/UI side (the `retaskableJump` hook in MainView), which the
+/// M15 spike proved is the path that reaches QML (`e` is native-only). Pure +
+/// testable; the actual pipe write lives in `open_note`.
+fn jump_command(anchor: &str) -> String {
+    format!("ureTaskableJump:{}\n", anchor.trim())
+}
+
+/// MSG_OPEN_NOTE handler. The task-detail dialog's "Open note" sends the source
+/// anchor `"<docUuid>,<pageKey>"`; we write the jump command to `/run/xovi-mb`
+/// so the xochitl-side hook closes nothing here (the app terminates itself) and
+/// navigates to the note page. `sendSimpleSignal` from QML can't be used — it
+/// broadcasts to native extensions only, not QML listeners (M15 spike finding).
+fn open_note(anchor: &str) -> anyhow::Result<String> {
+    use anyhow::Context;
+    use std::io::Write;
+    let anchor = anchor.trim();
+    if anchor.is_empty() {
+        anyhow::bail!("empty note anchor");
+    }
+    let mut pipe = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/run/xovi-mb")
+        .context("opening xovi message-broker pipe /run/xovi-mb")?;
+    pipe.write_all(jump_command(anchor).as_bytes())
+        .context("writing jump command to /run/xovi-mb")?;
+    Ok("ok".to_string())
 }
 
 /// MSG_GET_CONFIG handler. Returns the current sync target for the Settings

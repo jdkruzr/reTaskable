@@ -955,6 +955,31 @@ pub fn extract_source_label(ical_text: &str) -> Option<String> {
     None
 }
 
+/// Extract the machine anchor X-props the M15 jump-back uses: the source document
+/// UUID (`X-RETASKABLE-SOURCE-DOC`) and page key (`X-RETASKABLE-SOURCE-PAGE`, e.g.
+/// `idx:0`). Unlike the LABEL these are not RFC 5545 text-escaped (a UUID / `idx:N`
+/// has no specials), so no unescape — just unfold + prefix-strip + trim.
+pub fn extract_source_doc(ical_text: &str) -> Option<String> {
+    extract_xprop(ical_text, "X-RETASKABLE-SOURCE-DOC:")
+}
+
+pub fn extract_source_page(ical_text: &str) -> Option<String> {
+    extract_xprop(ical_text, "X-RETASKABLE-SOURCE-PAGE:")
+}
+
+fn extract_xprop(ical_text: &str, prefix: &str) -> Option<String> {
+    let unfolded = unfold_ical(ical_text);
+    for line in unfolded.lines() {
+        if let Some(rest) = line.strip_prefix(prefix) {
+            let v = rest.trim();
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
 fn matching_mutation<'a>(
     line: &str,
     mutations: &'a [(&'a str, Option<String>)],
@@ -1089,6 +1114,7 @@ pub fn format_tasks_json(
     tasks: &[Task],
     marks: &HashMap<String, bool>,
     sources: &HashMap<String, String>,
+    anchors: &HashMap<String, (String, String)>,
     last_synced: Option<&str>,
     conflicts: i64,
 ) -> String {
@@ -1108,6 +1134,7 @@ pub fn format_tasks_json(
                 Some(false) => "*",
                 None => "",
             };
+            let (doc, page) = anchors.get(&t.uid).cloned().unwrap_or_default();
             serde_json::json!({
                 "uid": t.uid,
                 "summary": t.summary,
@@ -1115,6 +1142,10 @@ pub fn format_tasks_json(
                 "due": t.due,
                 "mark": mark,
                 "source": sources.get(&t.uid).cloned().unwrap_or_default(),
+                // M15 machine anchor for jump-back: doc UUID + page key ("idx:N").
+                // Empty strings when absent (never null) so QML keys off length.
+                "doc": doc,
+                "page": page,
             })
         })
         .collect();
@@ -1238,9 +1269,10 @@ fn propstat_is_ok(propstat: &roxmltree::Node) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_crlf, escape_ical_text, extract_source_label, filter_for_display,
-        format_tasks_json, get_task, parse_sync_response, replace_summary,
-        sync_collection_unsupported, unescape_ical_text,
+        ensure_crlf, escape_ical_text, extract_source_doc, extract_source_label,
+        extract_source_page, filter_for_display, format_tasks_json, get_task,
+        parse_sync_response, replace_summary, sync_collection_unsupported,
+        unescape_ical_text,
     };
 
     #[test]
@@ -1476,7 +1508,7 @@ mod tests {
 
     #[test]
     fn format_tasks_json_empty_renders_empty_envelope() {
-        let out = format_tasks_json(&[], &HashMap::new(), &HashMap::new(), None, 0);
+        let out = format_tasks_json(&[], &HashMap::new(), &HashMap::new(), &HashMap::new(), None, 0);
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["last_synced"], serde_json::Value::Null);
         assert_eq!(v["tasks"].as_array().unwrap().len(), 0);
@@ -1501,7 +1533,7 @@ mod tests {
         ];
         let mut marks = HashMap::new();
         marks.insert("uid-A".to_string(), false); // queued -> "*"
-        let out = format_tasks_json(&tasks, &marks, &HashMap::new(), Some("Last synced 5 minutes ago."), 0);
+        let out = format_tasks_json(&tasks, &marks, &HashMap::new(), &HashMap::new(), Some("Last synced 5 minutes ago."), 0);
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["last_synced"], "Last synced 5 minutes ago.");
         let arr = v["tasks"].as_array().unwrap();
@@ -1523,7 +1555,7 @@ mod tests {
         let tasks = vec![task("uid-A", "Buy milk")];
         let mut marks = HashMap::new();
         marks.insert("uid-A".to_string(), true);
-        let out = format_tasks_json(&tasks, &marks, &HashMap::new(), None, 3);
+        let out = format_tasks_json(&tasks, &marks, &HashMap::new(), &HashMap::new(), None, 3);
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["tasks"][0]["mark"], "!");
         assert_eq!(v["conflicts"], 3);
@@ -1534,14 +1566,23 @@ mod tests {
         let tasks = vec![task("uid-A", "Email Bob"), task("uid-B", "Buy milk")];
         let mut sources = HashMap::new();
         sources.insert("uid-A".to_string(), "Q3 Planning · p.3".to_string());
-        let out = format_tasks_json(&tasks, &HashMap::new(), &sources, None, 0);
+        let mut anchors = HashMap::new();
+        anchors.insert(
+            "uid-A".to_string(),
+            ("doc-uuid-123".to_string(), "idx:2".to_string()),
+        );
+        let out = format_tasks_json(&tasks, &HashMap::new(), &sources, &anchors, None, 0);
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         let arr = v["tasks"].as_array().unwrap();
         // uid-A and uid-B both open + undated, so href tiebreak keeps input order.
         assert_eq!(arr[0]["uid"], "uid-A");
         assert_eq!(arr[0]["source"], "Q3 Planning · p.3");
+        assert_eq!(arr[0]["doc"], "doc-uuid-123");
+        assert_eq!(arr[0]["page"], "idx:2");
         assert_eq!(arr[1]["uid"], "uid-B");
         assert_eq!(arr[1]["source"], ""); // absent -> empty string, never null
+        assert_eq!(arr[1]["doc"], ""); // absent anchor -> empty strings, never null
+        assert_eq!(arr[1]["page"], "");
     }
 
     #[test]
@@ -1563,6 +1604,9 @@ mod tests {
             extract_source_label(ical).as_deref(),
             Some("Q3 Planning, vol 2 · p.3")
         );
+        // M15 machine anchor: DOC/PAGE read verbatim (no unescape).
+        assert_eq!(extract_source_doc(ical).as_deref(), Some("e0cef3e0-1234"));
+        assert_eq!(extract_source_page(ical).as_deref(), Some("p:0.500000"));
     }
 
     #[test]
@@ -1582,6 +1626,8 @@ mod tests {
     fn extract_source_label_absent_is_none() {
         let ical = "BEGIN:VTODO\r\nSUMMARY:Buy milk\r\nSTATUS:NEEDS-ACTION\r\nEND:VTODO\r\n";
         assert_eq!(extract_source_label(ical), None);
+        assert_eq!(extract_source_doc(ical), None);
+        assert_eq!(extract_source_page(ical), None);
     }
 
     fn task_with_status(uid: &str, status: TaskStatus) -> Task {
