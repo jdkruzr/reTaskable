@@ -2,9 +2,7 @@
 
 A task client for the **reMarkable Paper Pro** that syncs your to-dos with any
 RFC-compliant **CalDAV** server (Nextcloud, and other standards-compliant
-servers). It runs on-device under [xovi](https://remarkable.guide/guide/software/xovi.html)
-+ [AppLoad](https://github.com/asivery/rmpp-appload), so your tasks live on your
-own server — no account, no cloud middleman.
+servers). It runs on-device under [xovi](https://remarkable.guide/guide/software/xovi.html) with [AppLoad](https://github.com/asivery/rmpp-appload). Your tasks live on your own server, or on iCloud sharing with your MacOS/iOS Reminders.
 
 What makes it paper-native: you can **lasso handwriting in any notebook and turn
 it into a to-do**, and that to-do keeps a link back to the exact page it came
