@@ -94,7 +94,7 @@ You can change the server, account, or calendar any time from **Settings**.
 
 1. In any notebook, use the **selection (lasso)** tool to circle some
    handwriting.
-2. In the selection menu, tap **Send to reTaskable**.
+2. In the selection menu, tap the **checkmark icon**.
 3. Your handwriting is recognized; review or edit the text, then tap **Create**.
    The note itself is never modified.
 4. The new to-do appears in reTaskable with a 📓 line showing the source
