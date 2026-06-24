@@ -1,6 +1,6 @@
 # reTaskable
 
-A task client for the **reMarkable Paper Pro** that syncs your to-dos with any
+A task client for **reMarkable tablets** that syncs your to-dos with any
 RFC-compliant **CalDAV** server (Nextcloud, and other standards-compliant
 servers). It runs on-device under [xovi](https://remarkable.guide/guide/software/xovi.html) with [AppLoad](https://github.com/asivery/rmpp-appload). Your tasks live on your own server, or on iCloud sharing with your MacOS/iOS Reminders.
 
@@ -30,7 +30,7 @@ from, so a tap takes you straight back to your notes.
 
 ## Requirements
 
-- A **reMarkable Paper Pro** with [xovi](https://remarkable.guide/guide/software/xovi.html)
+- A **reMarkable tablet** with [xovi](https://remarkable.guide/guide/software/xovi.html)
   and [AppLoad](https://github.com/asivery/rmpp-appload) installed.
 - A **CalDAV account** with a tasks/VTODO calendar (e.g. Nextcloud). You’ll need
   the server URL, your username, and an **app password** (not your main account
@@ -114,16 +114,19 @@ For development, or to install without Vellum.
 **Prerequisites**
 
 - Rust toolchain with the device target:
-  `rustup target add aarch64-unknown-linux-gnu`
-- The reMarkable cross-SDK extracted at `./sdk/` (provides `rcc` and the
-  `aarch64-remarkable-linux-gcc` linker).
-- A reMarkable Paper Pro with xovi + AppLoad for on-device install.
+  `rustup target add aarch64-unknown-linux-gnu armv7-unknown-linux-gnueabihf`
+- Qt's `rcc` on `PATH`.
+- The matching reMarkable cross linker on `PATH`
+  (`aarch64-remarkable-linux-gnu-gcc` for Paper Pro / Move,
+  `arm-linux-gnueabihf-gcc` for rM1/rM2).
+- A reMarkable tablet with xovi + AppLoad for on-device install.
 
 **Build**
 
 ```bash
 ./app/build-pc.sh      # host build for the AppLoad PC emulator
-./app/build-rmpp.sh    # aarch64 cross-build for the device
+./app/build-rmpp.sh    # aarch64 cross-build for Paper Pro / Move
+./app/build-rm.sh      # armv7 cross-build for rM1/rM2
 ```
 
 **Install the app on the device**
@@ -201,11 +204,11 @@ reTaskable/
 │   ├── backend/            Rust backend
 │   ├── xovi/               xochitl hooks: capture (retaskableSend.qmd) + jump-back (retaskableJump.qmd)
 │   ├── build-pc.sh         host build (AppLoad PC emulator)
-│   ├── build-rmpp.sh       aarch64 cross-build (device)
+│   ├── build-rmpp.sh       aarch64 cross-build (Paper Pro / Move)
+│   ├── build-rm.sh         armv7 cross-build (rM1/rM2)
 │   └── install-device.sh   deploy to a connected device
 ├── vendor/appload-client/  vendored AppLoad client crate
-├── docs/                   design / implementation / test plans
-└── sdk/                    reMarkable cross-compile SDK (not committed)
+└── docs/                   design / implementation / test plans
 ```
 
 ## License

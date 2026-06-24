@@ -9,8 +9,8 @@ Two packages, deliberately split:
 
 | Package | What | Arch | Fragility |
 |---|---|---|---|
-| `retaskable` | the AppLoad app (CalDAV tasks, due dates, offline) | `aarch64` | robust — sandboxed, doesn't touch xochitl |
-| `retaskable-capture` | the two xovi+qmldiff hooks (note capture + jump-back) | `noarch` | OS-pinned — patches xochitl 3.27's QML |
+| `retaskable` | the AppLoad app (CalDAV tasks, due dates, offline) | `aarch64 armv7` | robust — sandboxed, doesn't touch xochitl |
+| `retaskable-capture` | the two xovi+qmldiff hooks (note capture + jump-back) | `aarch64 armv7` | OS-pinned — verified against xochitl 3.27's QML |
 
 `retaskable-capture` **depends on** `retaskable`, so installing capture pulls the
 app too; installing the app alone is fully supported (you just don't get the
@@ -18,9 +18,9 @@ handwriting-capture / jump-back features).
 
 Why split: a `.qmd` that fails to apply makes `qt-resource-rebuilder` safe-fail
 **all** of the user's QML mods, not just ours. Pinning the hooks to the verified
-OS range (`remarkable-os>=3.27 <3.28`) means Vellum won't carry them onto an
-unverified xochitl, and they stay independently removable (`vellum remove
-retaskable-capture`) without losing the task client.
+minimum OS (`remarkable-os>=3.27`) keeps them off older unverified xochitl builds,
+and they stay independently removable (`vellum remove retaskable-capture`)
+without losing the task client.
 
 ## Dependency package names (verified against the Vellum index)
 
@@ -30,31 +30,19 @@ retaskable-capture`) without losing the task client.
   — **note: `qt-command-executor`, not `command-executor`**
 - `xovi-message-broker` — jump-back IPC (subpackage of `xovi-extensions`)
 
-## Release flow (prebuilt — no SDK in Vellum CI)
+## Release flow (source-built in Vellum)
 
-The app ships **prebuilt** because the cross-build needs the reMarkable SDK that
-Vellum's package CI doesn't have. So each release:
+Vellum builds the app from the tagged source with the Toltec Rust toolchain image.
+Each release:
 
-1. `cd app && ./build-rmpp.sh`
-2. Zip the build tree as the release artifact:
-   ```bash
-   (cd app/output-rmpp && zip -r ../../retaskable-aarch64.zip backend resources.rcc manifest.json icon.png)
-   ```
-3. `git tag v1.0.0 && git push --tags`, then create a GitHub release on that tag
-   and attach `retaskable-aarch64.zip`.
-4. Regenerate the `sha512sums` in both `VELBUILD`s against the published artifacts
-   (`abuild checksum`, or `sha512sum <files>`), and bump `pkgver`.
-5. Open a PR into `vellum-dev/vellum` adding `packages/retaskable/VELBUILD` and
-   `packages/retaskable-capture/VELBUILD` (copied from here).
+1. Make sure both device builds work in a cross-toolchain environment:
+   `cd app && ./build-rmpp.sh && ./build-rm.sh`.
+2. Tag and push the release, e.g. `git tag v1.0.1 && git push --tags`.
+3. Update the Vellum package's `pkgver` and `sha512sums` for the source archive.
+4. Open or update the Vellum PR.
 
-The capture hooks are plain text, pulled straight from the repo at the tag — no
-release artifact needed for them.
+## Packaging notes
 
-## Open decisions before first publish
-
-- **A `LICENSE` file is required and missing.** The hooks declare
-  `GPL-3.0-only` and both VELBUILDs install a `LICENSE`; add `GPL-3.0-only` text
-  as `/LICENSE` in the repo root (the README already links it).
 - **Readable vs hashed `.qmd`: ship HASHED** (resolved — our committed form is
   correct). Spot-checked the Vellum index: `bettertoc`, `quicksettings-screenshot`,
   and `convert-to-text-remover` all ship **hashed** `.qmd`. The hashed tokens are
@@ -63,7 +51,6 @@ release artifact needed for them.
   across same-version devices. So the capture VELBUILD sources our committed
   hashed hooks directly — no readable copies, no unhash step. (The *readable* form
   is only for offline `qmldiff apply-diffs` validation against decompiled source.)
-- **`pkgver` / tag.** No tags exist yet; `v1.0.0` is the first.
 
 These manifests are a staging copy; the canonical home is a PR into the Vellum
 repo. Keep them in sync when bumping versions.

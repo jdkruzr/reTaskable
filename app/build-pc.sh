@@ -5,11 +5,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SDK_ROOT="$(cd "$SCRIPT_DIR/../sdk" && pwd)"
-RCC="$SDK_ROOT/sysroots/x86_64-codexsdk-linux/usr/libexec/rcc"
 
-if [[ ! -x "$RCC" ]]; then
-    echo "rcc not found at $RCC" >&2
+if ! command -v rcc >/dev/null 2>&1; then
+    echo "rcc not found on PATH" >&2
     exit 1
 fi
 
@@ -17,7 +15,7 @@ cd "$SCRIPT_DIR"
 rm -rf output-pc
 mkdir -p output-pc/backend
 cp icon.png manifest.json output-pc/
-"$RCC" --binary -o output-pc/resources.rcc application.qrc
+rcc --binary -o output-pc/resources.rcc application.qrc
 
 (
     cd backend

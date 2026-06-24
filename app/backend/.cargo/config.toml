@@ -1,0 +1,16 @@
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-remarkable-linux-gnu-gcc"
+rustflags = [
+    "-C", "link-arg=-march=armv8-a+crc+crypto",
+    "-C", "link-arg=-mtune=cortex-a53",
+]
+
+[target.armv7-unknown-linux-gnueabihf]
+linker = "arm-linux-gnueabihf-gcc"
+rustflags = [
+    "-C", "link-arg=-march=armv7-a",
+    "-C", "link-arg=-marm",
+    "-C", "link-arg=-mfpu=neon",
+    "-C", "link-arg=-mfloat-abi=hard",
+    "-C", "link-arg=-mcpu=cortex-a9",
+]
