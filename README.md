@@ -1,6 +1,6 @@
 # reTaskable
 
-<img width="954" height="1696" alt="rTscreen" src="https://github.com/user-attachments/assets/db39b33f-66ed-4a9f-98fb-f9e6bd0bf9a2" />
+<img width="400" alt="rTscreen" src="https://github.com/user-attachments/assets/db39b33f-66ed-4a9f-98fb-f9e6bd0bf9a2" />
 
 A task client for **reMarkable tablets** that syncs your to-dos with any
 RFC-compliant **CalDAV** server (Nextcloud, and other standards-compliant
