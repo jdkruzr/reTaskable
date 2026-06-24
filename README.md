@@ -1,5 +1,7 @@
 # reTaskable
 
+<img width="954" height="1696" alt="rTscreen" src="https://github.com/user-attachments/assets/db39b33f-66ed-4a9f-98fb-f9e6bd0bf9a2" />
+
 A task client for **reMarkable tablets** that syncs your to-dos with any
 RFC-compliant **CalDAV** server (Nextcloud, and other standards-compliant
 servers). It runs on-device under [xovi](https://remarkable.guide/guide/software/xovi.html) with [AppLoad](https://github.com/asivery/rmpp-appload). Your tasks live on your own server, or on iCloud sharing with your MacOS/iOS Reminders.
