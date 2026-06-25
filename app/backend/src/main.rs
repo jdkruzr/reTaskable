@@ -404,26 +404,30 @@ fn show_tasks(db: &mut Connection, include_completed: bool) -> anyhow::Result<St
 
 fn show_pending(db: &mut Connection) -> anyhow::Result<String> {
     let ops = db::list_pending_ops(db)?;
-    if ops.is_empty() {
-        return Ok("No pending ops.".to_string());
-    }
-    let mut lines = Vec::with_capacity(ops.len());
+    let mut errors = Vec::new();
     for op in &ops {
+        if op.errored != 1 && op.error_count == 0 {
+            continue;
+        }
         let age = humanize_since(
             std::time::UNIX_EPOCH + Duration::from_secs(op.enqueued_at.max(0) as u64),
         );
-        let annotation = if op.errored == 1 || op.error_count > 0 {
-            let err = op.last_error.as_deref().unwrap_or("");
-            format!("  [errored {}x: {err}]", op.error_count.max(1))
-        } else {
-            String::new()
-        };
-        lines.push(format!(
-            "#{}  {}  \"{}\"  {}{}",
-            op.id, op.op_type, op.summary, age, annotation
-        ));
+        errors.push(serde_json::json!({
+            "id": op.id,
+            "op_type": op.op_type,
+            "summary": op.summary,
+            "age": age,
+            "error_count": op.error_count.max(1),
+            "errored": op.errored == 1,
+            "last_error": op.last_error.as_deref().unwrap_or(""),
+        }));
     }
-    Ok(lines.join("\n"))
+    Ok(serde_json::json!({
+        "pending_count": ops.len(),
+        "error_count": errors.len(),
+        "errors": errors,
+    })
+    .to_string())
 }
 
 fn clear_errored(db: &mut Connection) -> anyhow::Result<String> {
@@ -750,6 +754,56 @@ mod tests {
         // helper only inspects target, so it must report no change.
         let old = cfg("https://a", Some("Personal"));
         assert!(!target_changed(Some(&old), "https://a", &Some("Personal".to_string())));
+    }
+
+    #[test]
+    fn show_pending_returns_structured_error_report() {
+        use rusqlite::Connection;
+        let mut conn = Connection::open_in_memory().unwrap();
+        db::ensure_schema_v2(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO task
+                 (calendar_href, href, etag, ical_text, summary, status, due, uid, pending_delete)
+             VALUES ('/cal/', '/cal/t.ics', 'e', 'ical', 'Broken task', 'needs-action', NULL, 'uid-err', 0)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO pending_op
+                 (op_type, target_uid, target_calendar_href, payload, enqueued_at, error_count, last_error, errored)
+             VALUES ('toggle', 'uid-err', '/cal/', NULL, 1700000000, 5, 'server exploded', 1)",
+            [],
+        ).unwrap();
+
+        let out = show_pending(&mut conn).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+
+        assert_eq!(v["pending_count"], 1);
+        assert_eq!(v["error_count"], 1);
+        assert_eq!(v["errors"][0]["id"], 1);
+        assert_eq!(v["errors"][0]["op_type"], "toggle");
+        assert_eq!(v["errors"][0]["summary"], "Broken task");
+        assert_eq!(v["errors"][0]["error_count"], 5);
+        assert_eq!(v["errors"][0]["errored"], true);
+        assert_eq!(v["errors"][0]["last_error"], "server exploded");
+    }
+
+    #[test]
+    fn show_pending_omits_clean_queued_ops_from_error_report() {
+        use rusqlite::Connection;
+        let mut conn = Connection::open_in_memory().unwrap();
+        db::ensure_schema_v2(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO pending_op (op_type, target_uid, target_calendar_href, payload, enqueued_at)
+             VALUES ('create', 'uid-new', '/cal/', '{}', 1700000000)",
+            [],
+        ).unwrap();
+
+        let out = show_pending(&mut conn).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+
+        assert_eq!(v["pending_count"], 1);
+        assert_eq!(v["error_count"], 0);
+        assert_eq!(v["errors"].as_array().unwrap().len(), 0);
     }
 
     #[test]

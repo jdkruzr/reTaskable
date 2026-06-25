@@ -423,6 +423,23 @@ fn apply_outcome(
                 rusqlite::params![task_url, etag, ical_text, op.target_calendar_href, op.target_uid],
             )?;
             if affected == 0 {
+                let server_row_exists: bool = tx.query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM task
+                         WHERE calendar_href = ?1
+                           AND uid = ?2
+                           AND href NOT LIKE 'pending:%'
+                    )",
+                    rusqlite::params![op.target_calendar_href, op.target_uid],
+                    |row| row.get(0),
+                )?;
+                if server_row_exists {
+                    tx.execute("DELETE FROM pending_op WHERE id = ?1", rusqlite::params![op.id])?;
+                    tx.commit()?;
+                    summary.flushed += 1;
+                    eprintln!("retaskable: queue: flushed create #{} after server row already existed", op.id);
+                    return Ok(true);
+                }
                 // Cache row vanished (e.g., external delete, or sync-collection cleared during create).
                 // Roll back: pending_op deletion would orphan the queue. Treat as Terminal.
                 drop(tx); // explicit rollback

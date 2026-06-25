@@ -329,14 +329,32 @@ pub fn delete_tasks_not_in(
     // SQLite doesn't have a clean "DELETE WHERE NOT IN (set)" with a Rust-side
     // collection. Build a transaction: select existing hrefs, delete the diff.
     let tx = conn.unchecked_transaction()?;
-    let existing: Vec<String> = {
-        let mut stmt = tx.prepare("SELECT href FROM task WHERE calendar_href = ?1")?;
-        let rows = stmt.query_map(params![calendar_href], |row| row.get::<_, String>(0))?;
+    let existing: Vec<(String, String)> = {
+        let mut stmt = tx.prepare("SELECT href, uid FROM task WHERE calendar_href = ?1")?;
+        let rows = stmt.query_map(params![calendar_href], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
         rows.collect::<Result<Vec<_>, _>>()?
     };
     let mut deleted = 0;
-    for href in existing {
+    for (href, uid) in existing {
         if !kept.contains(&href) {
+            if href.starts_with("pending:") {
+                let has_pending_create: bool = tx.query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM pending_op
+                         WHERE target_calendar_href = ?1
+                           AND target_uid = ?2
+                           AND op_type = 'create'
+                           AND errored = 0
+                    )",
+                    params![calendar_href, uid],
+                    |row| row.get(0),
+                )?;
+                if has_pending_create {
+                    continue;
+                }
+            }
             tx.execute(
                 "DELETE FROM task WHERE calendar_href = ?1 AND href = ?2",
                 params![calendar_href, href],
@@ -1415,6 +1433,59 @@ mod tests {
         let meta_after: i64 = conn.query_row("SELECT COUNT(*) FROM meta", [], |r| r.get(0)).unwrap();
         assert_eq!((tc, pc, cc), (0, 0, 0));
         assert_eq!(meta_before, meta_after); // schema version untouched
+    }
+
+    #[test]
+    fn delete_tasks_not_in_preserves_pending_create_rows() {
+        let conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        conn.execute(
+            "INSERT INTO task
+             (calendar_href, href, etag, ical_text, summary, status, due, uid, pending_delete)
+             VALUES
+             ('/cal/', 'pending:uid-new', '', '', 'New local task', 'needs-action', NULL, 'uid-new', 0),
+             ('/cal/', '/cal/stale.ics', 'etag', '', 'Stale task', 'needs-action', NULL, 'uid-stale', 0)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO pending_op (op_type, target_uid, target_calendar_href, payload, enqueued_at)
+             VALUES ('create', 'uid-new', '/cal/', '{}', 1)",
+            [],
+        ).unwrap();
+
+        let deleted = delete_tasks_not_in(&conn, "/cal/", &HashSet::new()).unwrap();
+
+        assert_eq!(deleted, 1);
+        let pending_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM task WHERE href = 'pending:uid-new'",
+            [], |row| row.get(0),
+        ).unwrap();
+        let stale_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM task WHERE href = '/cal/stale.ics'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(pending_count, 1);
+        assert_eq!(stale_count, 0);
+    }
+
+    #[test]
+    fn delete_tasks_not_in_deletes_orphan_pending_create_rows() {
+        let conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        conn.execute(
+            "INSERT INTO task
+             (calendar_href, href, etag, ical_text, summary, status, due, uid, pending_delete)
+             VALUES ('/cal/', 'pending:uid-orphan', '', '', 'Orphan', 'needs-action', NULL, 'uid-orphan', 0)",
+            [],
+        ).unwrap();
+
+        let deleted = delete_tasks_not_in(&conn, "/cal/", &HashSet::new()).unwrap();
+
+        assert_eq!(deleted, 1);
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM task", [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count, 0);
     }
 
     #[test]

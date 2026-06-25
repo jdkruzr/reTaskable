@@ -66,6 +66,11 @@ Rectangle {
         id: calendarsModel
     }
 
+    // Settings diagnostics: errored or retrying pending ops from MSG 10 / 110.
+    ListModel {
+        id: syncErrorModel
+    }
+
     AppLoad {
         id: endpoint
         applicationID: "us.reticulum.retaskable"
@@ -106,6 +111,10 @@ Rectangle {
             }
             if (type === 115) {
                 root.applyConfig(contents)
+                return
+            }
+            if (type === 110) {
+                root.applySyncErrors(contents)
                 return
             }
             if (type === 116) {
@@ -163,8 +172,11 @@ Rectangle {
     function openSettings() {
         root.settingsOpen = true
         settingsStatus.text = ""
+        syncErrorsStatus.text = ""
         calendarsModel.clear()
+        syncErrorModel.clear()
         endpoint.sendMessage(15, "") // GET_CONFIG -> applyConfig
+        root.refreshSyncErrors()
     }
 
     function applyConfig(jsonText) {
@@ -255,6 +267,43 @@ Rectangle {
         root.settingsOpen = false
         statusText.text = "Settings saved. Syncing…"
         endpoint.sendMessage(5, "") // Sync repopulates (cache was reset if target changed)
+    }
+
+    function refreshSyncErrors() {
+        if (!root.settingsOpen) return
+        syncErrorsStatus.text = "Checking…"
+        endpoint.sendMessage(10, "")
+    }
+
+    function applySyncErrors(jsonText) {
+        var r
+        try {
+            r = JSON.parse(jsonText)
+        } catch (e) {
+            syncErrorModel.clear()
+            syncErrorsStatus.text = jsonText
+            return
+        }
+
+        syncErrorModel.clear()
+        var errors = r.errors || []
+        for (var i = 0; i < errors.length; i++) {
+            var item = errors[i]
+            syncErrorModel.append({
+                op_id: item.id ? item.id : 0,
+                op_type: item.op_type ? item.op_type : "",
+                summary: item.summary ? item.summary : "(unknown)",
+                age: item.age ? item.age : "",
+                error_count: item.error_count ? item.error_count : 1,
+                last_error: item.last_error ? item.last_error : ""
+            })
+        }
+
+        if (errors.length === 0) {
+            syncErrorsStatus.text = "No sync errors."
+        } else {
+            syncErrorsStatus.text = errors.length + " sync error" + (errors.length === 1 ? "" : "s")
+        }
     }
 
     // Jump exactly one screenful with no animation — a single, deliberate
@@ -871,12 +920,22 @@ Rectangle {
         visible: root.settingsOpen
         z: 100
 
-        Column {
-            anchors.top: parent.top
-            anchors.left: parent.left
-            anchors.right: parent.right
+        Flickable {
+            anchors.fill: parent
             anchors.margins: 40
-            spacing: 16
+            contentWidth: width
+            contentHeight: settingsContent.height
+            clip: true
+            boundsBehavior: Flickable.StopAtBounds
+
+            ScrollBar.vertical: ScrollBar {
+                policy: ScrollBar.AsNeeded
+            }
+
+            Column {
+                id: settingsContent
+                width: parent.width
+                spacing: 16
 
             Text {
                 text: "Settings — Sync Target"
@@ -985,6 +1044,107 @@ Rectangle {
             }
 
             Row {
+                width: parent.width
+                spacing: 16
+
+                Text {
+                    width: parent.width - refreshErrorsBtn.width - parent.spacing
+                    text: "Sync Errors"
+                    font.pixelSize: 22
+                    font.bold: true
+                    color: "black"
+                    anchors.verticalCenter: parent.verticalCenter
+                }
+
+                Rectangle {
+                    id: refreshErrorsBtn
+                    width: 180
+                    height: 56
+                    color: "white"
+                    border.color: "black"
+                    border.width: 2
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: "Refresh"
+                        font.pixelSize: 20
+                        color: "black"
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+                        onClicked: root.refreshSyncErrors()
+                    }
+                }
+            }
+
+            Text {
+                id: syncErrorsStatus
+                width: parent.width
+                text: ""
+                font.pixelSize: 18
+                font.family: "monospace"
+                color: syncErrorModel.count > 0 ? "#900000" : "#404040"
+                visible: text.length > 0
+            }
+
+            ListView {
+                id: syncErrorsList
+                width: parent.width
+                height: syncErrorModel.count > 0 ? 260 : 0
+                visible: syncErrorModel.count > 0
+                clip: true
+                model: syncErrorModel
+                boundsBehavior: Flickable.StopAtBounds
+
+                ScrollBar.vertical: ScrollBar {
+                    policy: ScrollBar.AsNeeded
+                }
+
+                delegate: Rectangle {
+                    width: syncErrorsList.width
+                    height: errorCardContent.implicitHeight + 20
+                    color: "white"
+                    border.color: "#808080"
+                    border.width: 1
+
+                    Column {
+                        id: errorCardContent
+                        anchors.top: parent.top
+                        anchors.left: parent.left
+                        anchors.right: parent.right
+                        anchors.margins: 10
+                        spacing: 4
+
+                        Text {
+                            width: parent.width
+                            text: "#" + model.op_id + "  " + model.op_type + "  " + model.summary
+                            font.pixelSize: 20
+                            font.bold: true
+                            elide: Text.ElideRight
+                            color: "black"
+                        }
+
+                        Text {
+                            width: parent.width
+                            text: model.age + " ago  ·  " + model.error_count + " attempt" + (model.error_count === 1 ? "" : "s")
+                            font.pixelSize: 17
+                            color: "#404040"
+                        }
+
+                        Text {
+                            width: parent.width
+                            text: model.last_error
+                            font.pixelSize: 16
+                            font.family: "monospace"
+                            wrapMode: Text.WrapAnywhere
+                            color: "#600000"
+                        }
+                    }
+                }
+            }
+
+            Row {
                 spacing: 16
 
                 Rectangle {
@@ -1032,6 +1192,7 @@ Rectangle {
                         onClicked: root.settingsOpen = false
                     }
                 }
+            }
             }
         }
     }
