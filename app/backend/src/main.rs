@@ -757,6 +757,50 @@ mod tests {
     }
 
     #[test]
+    fn normalize_base_url_adds_https_and_trims_slashes() {
+        assert_eq!(
+            normalize_base_url(" nextcloud.example.com/ ").unwrap(),
+            "https://nextcloud.example.com"
+        );
+        assert_eq!(
+            normalize_base_url("https://nextcloud.example.com/").unwrap(),
+            "https://nextcloud.example.com"
+        );
+    }
+
+    #[test]
+    fn normalize_base_url_strips_bare_remote_dav_path() {
+        assert_eq!(
+            normalize_base_url("https://nextcloud.example.com/remote.php/dav").unwrap(),
+            "https://nextcloud.example.com"
+        );
+        assert_eq!(
+            normalize_base_url("https://example.com/cloud/remote.php/dav/").unwrap(),
+            "https://example.com/cloud"
+        );
+    }
+
+    #[test]
+    fn normalize_base_url_rejects_collection_urls() {
+        let err = normalize_base_url(
+            "https://nextcloud.example.com/remote.php/dav/calendars/alice/tasks",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("bare Nextcloud server URL"), "got {err}");
+    }
+
+    #[test]
+    fn format_discover_error_explains_dns_failures() {
+        let err = anyhow::anyhow!(
+            "step 1: PROPFIND .well-known/caldav: sending request: No address associated with hostname"
+        );
+        let msg = format_discover_error(&err);
+        assert!(msg.contains("Could not resolve the server hostname"), "got {msg}");
+        assert!(msg.contains("step 1: PROPFIND"), "got {msg}");
+    }
+
+    #[test]
     fn show_pending_returns_structured_error_report() {
         use rusqlite::Connection;
         let mut conn = Connection::open_in_memory().unwrap();
@@ -1835,6 +1879,57 @@ fn target_changed(old: Option<&config::Config>, base_url: &str, calendar: &Optio
     }
 }
 
+fn normalize_base_url(input: &str) -> anyhow::Result<String> {
+    let mut raw = input.trim().trim_end_matches('/').to_string();
+    if raw.is_empty() {
+        anyhow::bail!("base_url is required");
+    }
+    if !raw.contains("://") {
+        raw = format!("https://{raw}");
+    }
+
+    let mut url = url::Url::parse(&raw).context("parsing server URL")?;
+    match url.scheme() {
+        "http" | "https" => {}
+        scheme => anyhow::bail!("server URL must start with http:// or https://, not {scheme:?}"),
+    }
+    if url.host_str().is_none() {
+        anyhow::bail!("server URL must include a hostname");
+    }
+    url.set_query(None);
+    url.set_fragment(None);
+
+    let path = url.path().trim_end_matches('/').to_string();
+    if path.contains("/remote.php/dav/") {
+        anyhow::bail!(
+            "use the bare Nextcloud server URL, not a CalDAV collection URL; remove /remote.php/dav/..."
+        );
+    }
+    if let Some(prefix) = path.strip_suffix("/remote.php/dav") {
+        url.set_path(if prefix.is_empty() { "/" } else { prefix });
+    }
+
+    Ok(url.as_str().trim_end_matches('/').to_string())
+}
+
+fn format_discover_error(err: &anyhow::Error) -> String {
+    let msg = format!("{err:#}");
+    let lower = msg.to_ascii_lowercase();
+    if lower.contains("no address associated with hostname")
+        || lower.contains("failed to lookup address information")
+        || lower.contains("dns")
+    {
+        return format!("Could not resolve the server hostname. Check the Server URL. Details: {msg}");
+    }
+    if lower.contains("parsing server url") || lower.contains("parsing base_url") {
+        return format!("Server URL is not valid. Use a bare URL like https://nextcloud.example.com. Details: {msg}");
+    }
+    if lower.contains("401") || lower.contains("403") {
+        return format!("Nextcloud rejected the username or app password. Details: {msg}");
+    }
+    msg
+}
+
 /// MSG_SAVE_CONFIG handler. Writes the new config (blank password keeps the
 /// existing one) and resets the cache only when the target changed. Returns
 /// `{ok: true}` or `{ok: false, error}`.
@@ -1847,7 +1942,7 @@ fn save_config(db: &mut Connection, payload: &str) -> String {
 
 fn save_config_inner(db: &mut Connection, payload: &str) -> anyhow::Result<()> {
     let v: serde_json::Value = serde_json::from_str(payload)?;
-    let base_url = v.get("base_url").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+    let base_url = normalize_base_url(v.get("base_url").and_then(|x| x.as_str()).unwrap_or(""))?;
     let username = v.get("username").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
     let new_password = v.get("app_password").and_then(|x| x.as_str()).unwrap_or("");
     let calendar = v
@@ -1893,13 +1988,13 @@ async fn discover_with(payload: &str) -> String {
                 .collect::<Vec<_>>(),
         })
         .to_string(),
-        Err(e) => serde_json::json!({ "ok": false, "error": format!("{e:#}") }).to_string(),
+        Err(e) => serde_json::json!({ "ok": false, "error": format_discover_error(&e) }).to_string(),
     }
 }
 
 async fn discover_with_inner(payload: &str) -> anyhow::Result<Vec<nextcloud::Calendar>> {
     let v: serde_json::Value = serde_json::from_str(payload)?;
-    let base_url = v.get("base_url").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+    let base_url = normalize_base_url(v.get("base_url").and_then(|x| x.as_str()).unwrap_or(""))?;
     let username = v.get("username").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
     let new_password = v.get("app_password").and_then(|x| x.as_str()).unwrap_or("");
     if base_url.is_empty() || username.is_empty() {

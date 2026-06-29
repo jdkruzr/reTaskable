@@ -49,11 +49,13 @@ Rectangle {
     // M11: settings screen state.
     property bool settingsOpen: false
     property bool settingsHasPassword: false
+    property bool settingsPasswordVisible: false
     property string selectedCalendar: ""
     // True when the server URL/username changed since the last successful
     // calendar discovery — Save is blocked until the user re-Tests, so we never
     // persist a calendar that doesn't exist on the (new) server.
     property bool needsDiscover: false
+    property bool createReady: false
 
     // M10: the task list is a structured ListModel populated from the JSON
     // envelope MSG 104 carries. Each row: { uid, summary, completed, due, mark }.
@@ -191,6 +193,7 @@ Rectangle {
         settingsUser.text = c.username ? c.username : ""
         settingsPass.text = ""
         root.settingsHasPassword = c.has_password === true
+        root.settingsPasswordVisible = false
         root.selectedCalendar = c.calendar ? c.calendar : ""
         // Setting the fields above fired onTextChanged (→ needsDiscover=true);
         // clear it, then auto-discover so the picker reflects the real server
@@ -265,6 +268,7 @@ Rectangle {
             return
         }
         root.settingsOpen = false
+        root.createReady = false
         statusText.text = "Settings saved. Syncing…"
         endpoint.sendMessage(5, "") // Sync repopulates (cache was reset if target changed)
     }
@@ -338,10 +342,12 @@ Rectangle {
             // Clear the model so stale rows from a previous target don't linger,
             // and surface the message.
             taskModel.clear()
+            root.createReady = false
             statusText.text = jsonText
             return
         }
         taskModel.clear()
+        root.createReady = true
         var tasks = data.tasks || []
         for (var i = 0; i < tasks.length; i++) {
             var t = tasks[i]
@@ -471,7 +477,7 @@ Rectangle {
 
         Text {
             text: "reTaskable"
-            font.pixelSize: 36
+            font.pixelSize: 44
             color: "black"
         }
 
@@ -490,14 +496,14 @@ Rectangle {
                 width: resolveConflictBtn.visible
                        ? parent.width - resolveConflictBtn.width - parent.spacing
                        : parent.width
-                height: 84
+                height: 96
                 wrapMode: Text.WrapAnywhere
                 maximumLineCount: 3
                 elide: Text.ElideRight
                 verticalAlignment: Text.AlignTop
                 clip: true
                 text: ""
-                font.pixelSize: 20
+                font.pixelSize: 22
                 font.family: "monospace"
                 color: "#1a1a1a"
             }
@@ -549,7 +555,8 @@ Rectangle {
 
                 Rectangle {
                     id: createBtn
-                    property bool active: summaryInput.text.trim().length > 0
+                    property bool hasSummary: summaryInput.text.trim().length > 0
+                    property bool active: createBtn.hasSummary && root.createReady
                     width: 180
                     height: 72
                     color: createBtn.active ? "white" : "#dddddd"
@@ -565,8 +572,12 @@ Rectangle {
 
                     MouseArea {
                         anchors.fill: parent
-                        enabled: createBtn.active
+                        enabled: createBtn.hasSummary
                         onClicked: {
+                            if (!root.createReady) {
+                                statusText.text = "Set up Settings and tap Sync before creating tasks."
+                                return
+                            }
                             // M16: create payload is JSON {summary, due}; due is
                             // the normalized token ("" when no date was set).
                             endpoint.sendMessage(8, JSON.stringify({
@@ -907,8 +918,8 @@ Rectangle {
             anchors.centerIn: parent
             visible: taskModel.count === 0
             text: root.showCompleted ? "No tasks." : "No open tasks. Tap Show Completed to review done items."
-            font.pixelSize: 24
-            color: "#808080"
+            font.pixelSize: 28
+            color: "#303030"
         }
     }
 
@@ -964,15 +975,41 @@ Rectangle {
             }
 
             Text { text: "App password"; font.pixelSize: 18; color: "#404040" }
-            TextField {
-                id: settingsPass
+            Row {
                 width: parent.width
-                height: 64
-                font.pixelSize: 22
-                echoMode: TextInput.Password
-                placeholderText: root.settingsHasPassword
-                                 ? "•••• (unchanged — leave blank to keep)"
-                                 : "app password"
+                spacing: 16
+
+                TextField {
+                    id: settingsPass
+                    width: parent.width - passwordRevealBtn.width - parent.spacing
+                    height: 64
+                    font.pixelSize: 22
+                    echoMode: root.settingsPasswordVisible ? TextInput.Normal : TextInput.Password
+                    placeholderText: root.settingsHasPassword
+                                     ? "•••• (unchanged — leave blank to keep)"
+                                     : "app password"
+                }
+
+                Rectangle {
+                    id: passwordRevealBtn
+                    width: 150
+                    height: 64
+                    color: "white"
+                    border.color: "black"
+                    border.width: 3
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: root.settingsPasswordVisible ? "Hide" : "Show"
+                        font.pixelSize: 20
+                        color: "black"
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+                        onClicked: root.settingsPasswordVisible = !root.settingsPasswordVisible
+                    }
+                }
             }
 
             Rectangle {
