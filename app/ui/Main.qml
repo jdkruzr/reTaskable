@@ -503,9 +503,8 @@ Rectangle {
                 verticalAlignment: Text.AlignTop
                 clip: true
                 text: ""
-                font.pixelSize: 22
-                font.family: "monospace"
-                color: "#1a1a1a"
+                font.pixelSize: 26
+                color: "black"
             }
 
             // M14 UX: present only when the backend reports a resolvable conflict.
@@ -523,7 +522,7 @@ Rectangle {
                     text: root.conflictCount > 1
                           ? "Resolve Conflicts (" + root.conflictCount + ")"
                           : "Resolve Conflict"
-                    font.pixelSize: 20
+                    font.pixelSize: 22
                     color: "black"
                 }
 
@@ -547,9 +546,9 @@ Rectangle {
                     id: summaryInput
                     width: parent.width - createBtn.width - 16
                     height: 72
-                    font.pixelSize: 22
+                    font.pixelSize: 26
                     color: "black"
-                    placeholderTextColor: "#606060"
+                    placeholderTextColor: "#303030"
                     placeholderText: "New task summary"
                 }
 
@@ -889,7 +888,7 @@ Rectangle {
                         text: model.summary + (root.formatDue(model.due) ? "  (due " + root.formatDue(model.due) + ")" : "")
                         font.pixelSize: 26
                         elide: Text.ElideRight
-                        color: model.completed ? "#909090" : "black"
+                        color: model.completed ? "#606060" : "black"
                         font.strikeout: model.completed
                     }
 
@@ -899,9 +898,9 @@ Rectangle {
                         width: parent.width
                         visible: model.source && model.source.length > 0
                         text: "📓 " + model.source
-                        font.pixelSize: 20
+                        font.pixelSize: 22
                         elide: Text.ElideRight
-                        color: "#333333"
+                        color: "black"
                     }
                 }
             }
@@ -910,7 +909,7 @@ Rectangle {
                 anchors.bottom: parent.bottom
                 width: parent.width
                 height: 1
-                color: "#d0d0d0"
+                color: "#909090"
             }
         }
 
@@ -954,27 +953,31 @@ Rectangle {
                 font.bold: true
             }
 
-            Text { text: "Server URL"; font.pixelSize: 18; color: "#404040" }
+            Text { text: "Server URL"; font.pixelSize: 24; color: "black" }
             TextField {
                 id: settingsUrl
                 width: parent.width
-                height: 64
-                font.pixelSize: 22
+                height: 72
+                font.pixelSize: 26
+                color: "black"
+                placeholderTextColor: "#303030"
                 placeholderText: "https://nextcloud.example.com"
                 onTextChanged: root.needsDiscover = true
             }
 
-            Text { text: "Username"; font.pixelSize: 18; color: "#404040" }
+            Text { text: "Username"; font.pixelSize: 24; color: "black" }
             TextField {
                 id: settingsUser
                 width: parent.width
-                height: 64
-                font.pixelSize: 22
+                height: 72
+                font.pixelSize: 26
+                color: "black"
+                placeholderTextColor: "#303030"
                 placeholderText: "username"
                 onTextChanged: root.needsDiscover = true
             }
 
-            Text { text: "App password"; font.pixelSize: 18; color: "#404040" }
+            Text { text: "App password"; font.pixelSize: 24; color: "black" }
             Row {
                 width: parent.width
                 spacing: 16
@@ -982,8 +985,10 @@ Rectangle {
                 TextField {
                     id: settingsPass
                     width: parent.width - passwordRevealBtn.width - parent.spacing
-                    height: 64
-                    font.pixelSize: 22
+                    height: 72
+                    font.pixelSize: 26
+                    color: "black"
+                    placeholderTextColor: "#303030"
                     echoMode: root.settingsPasswordVisible ? TextInput.Normal : TextInput.Password
                     placeholderText: root.settingsHasPassword
                                      ? "•••• (unchanged — leave blank to keep)"
@@ -993,7 +998,7 @@ Rectangle {
                 Rectangle {
                     id: passwordRevealBtn
                     width: 150
-                    height: 64
+                    height: 72
                     color: "white"
                     border.color: "black"
                     border.width: 3
@@ -1001,7 +1006,7 @@ Rectangle {
                     Text {
                         anchors.centerIn: parent
                         text: root.settingsPasswordVisible ? "Hide" : "Show"
-                        font.pixelSize: 20
+                        font.pixelSize: 24
                         color: "black"
                     }
 
@@ -1022,7 +1027,7 @@ Rectangle {
                 Text {
                     anchors.centerIn: parent
                     text: "Test & Load Calendars"
-                    font.pixelSize: 20
+                    font.pixelSize: 22
                     color: "black"
                 }
 
@@ -1037,15 +1042,14 @@ Rectangle {
                 width: parent.width
                 wrapMode: Text.WrapAnywhere
                 text: ""
-                font.pixelSize: 18
-                font.family: "monospace"
-                color: "#404040"
+                font.pixelSize: 22
+                color: "black"
                 visible: text.length > 0
             }
 
             Text {
                 text: "Calendar" + (root.selectedCalendar ? ": " + root.selectedCalendar : " (none selected)")
-                font.pixelSize: 20
+                font.pixelSize: 24
                 color: "black"
             }
 
@@ -1087,7 +1091,7 @@ Rectangle {
                 Text {
                     width: parent.width - refreshErrorsBtn.width - parent.spacing
                     text: "Sync Errors"
-                    font.pixelSize: 22
+                    font.pixelSize: 24
                     font.bold: true
                     color: "black"
                     anchors.verticalCenter: parent.verticalCenter
@@ -1104,7 +1108,7 @@ Rectangle {
                     Text {
                         anchors.centerIn: parent
                         text: "Refresh"
-                        font.pixelSize: 20
+                        font.pixelSize: 22
                         color: "black"
                     }
 
@@ -1119,9 +1123,8 @@ Rectangle {
                 id: syncErrorsStatus
                 width: parent.width
                 text: ""
-                font.pixelSize: 18
-                font.family: "monospace"
-                color: syncErrorModel.count > 0 ? "#900000" : "#404040"
+                font.pixelSize: 22
+                color: syncErrorModel.count > 0 ? "#900000" : "black"
                 visible: text.length > 0
             }
 
@@ -1156,7 +1159,7 @@ Rectangle {
                         Text {
                             width: parent.width
                             text: "#" + model.op_id + "  " + model.op_type + "  " + model.summary
-                            font.pixelSize: 20
+                            font.pixelSize: 22
                             font.bold: true
                             elide: Text.ElideRight
                             color: "black"
@@ -1165,15 +1168,14 @@ Rectangle {
                         Text {
                             width: parent.width
                             text: model.age + " ago  ·  " + model.error_count + " attempt" + (model.error_count === 1 ? "" : "s")
-                            font.pixelSize: 17
-                            color: "#404040"
+                            font.pixelSize: 20
+                            color: "black"
                         }
 
                         Text {
                             width: parent.width
                             text: model.last_error
-                            font.pixelSize: 16
-                            font.family: "monospace"
+                            font.pixelSize: 20
                             wrapMode: Text.WrapAnywhere
                             color: "#600000"
                         }

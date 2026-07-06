@@ -1,7 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
 use std::collections::HashMap;
-use reqwest::{header, Client, Method, StatusCode};
+use reqwest::{header, redirect::Policy, Client, Method, StatusCode};
 use serde::Serialize;
 use url::Url;
 use uuid::Uuid;
@@ -117,6 +117,15 @@ struct DavResp {
     final_url: Url,
 }
 
+const MAX_DAV_REDIRECTS: usize = 8;
+
+fn dav_client() -> Result<Client> {
+    Client::builder()
+        .redirect(Policy::none())
+        .build()
+        .context("building WebDAV HTTP client")
+}
+
 async fn dav_request(
     client: &Client,
     method_bytes: &[u8],
@@ -127,25 +136,50 @@ async fn dav_request(
 ) -> Result<DavResp> {
     let method = Method::from_bytes(method_bytes)
         .map_err(|e| anyhow!("invalid method bytes: {e}"))?;
-    let resp = client
-        .request(method, url.clone())
-        .basic_auth(auth.0, Some(auth.1))
-        .header("Depth", depth)
-        .header("Content-Type", "application/xml; charset=utf-8")
-        .body(body.into())
-        .send()
-        .await
-        .with_context(|| format!("sending request to {url}"))?;
-    let final_url = resp.url().clone();
-    let status = resp.status();
-    let body = resp
-        .text()
-        .await
-        .with_context(|| format!("reading body from {url}"))?;
-    if !status.is_success() {
-        bail!("{} -> {}: {}", url, status, body);
+    let body = body.into();
+    let mut current_url = url.clone();
+
+    for redirect_count in 0..=MAX_DAV_REDIRECTS {
+        let resp = client
+            .request(method.clone(), current_url.clone())
+            .basic_auth(auth.0, Some(auth.1))
+            .header("Depth", depth)
+            .header("Content-Type", "application/xml; charset=utf-8")
+            .body(body.clone())
+            .send()
+            .await
+            .with_context(|| format!("sending request to {current_url}"))?;
+        let status = resp.status();
+
+        if status.is_redirection() {
+            if redirect_count == MAX_DAV_REDIRECTS {
+                bail!("{current_url} redirected more than {MAX_DAV_REDIRECTS} times");
+            }
+            let location = resp
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| anyhow!("{current_url} -> {status} without Location header"))?;
+            let next_url = current_url
+                .join(location)
+                .with_context(|| format!("resolving redirect Location {location:?} from {current_url}"))?;
+            eprintln!("retaskable: DAV redirect {current_url} -> {next_url}");
+            current_url = next_url;
+            continue;
+        }
+
+        let final_url = resp.url().clone();
+        let body = resp
+            .text()
+            .await
+            .with_context(|| format!("reading body from {current_url}"))?;
+        if !status.is_success() {
+            bail!("{} -> {}: {}", current_url, status, body);
+        }
+        return Ok(DavResp { status, body, final_url });
     }
-    Ok(DavResp { status, body, final_url })
+
+    unreachable!("redirect loop exits by return or bail")
 }
 
 /// Returns (delta, was_full_sync). On 412 Precondition Failed (server says our
@@ -349,7 +383,7 @@ pub async fn probe(cfg: &NextcloudConfig) -> Result<String> {
     let base = cfg.base_url.trim_end_matches('/');
     let url = Url::parse(&format!("{}/remote.php/dav/calendars/{}/", base, cfg.username))
         .context("parsing calendar-home URL")?;
-    let client = Client::new();
+    let client = dav_client()?;
     let resp = dav_request(
         &client,
         b"PROPFIND",
@@ -365,7 +399,7 @@ pub async fn probe(cfg: &NextcloudConfig) -> Result<String> {
 
 pub async fn discover_calendars(cfg: &NextcloudConfig) -> Result<Vec<Calendar>> {
     let auth = (cfg.username.as_str(), cfg.app_password.as_str());
-    let client = Client::new();
+    let client = dav_client()?;
     let base = Url::parse(cfg.base_url.trim_end_matches('/'))
         .context("parsing base_url")?;
 
@@ -1340,9 +1374,10 @@ mod tests {
     use super::{
         due_property_line, ensure_crlf, escape_ical_text, extract_source_doc,
         extract_source_label, extract_source_page, filter_for_display, format_tasks_json,
-        get_task, parse_sync_response, replace_summary, set_due,
+        get_task, parse_sync_response, replace_summary, set_due, discover_calendars,
         sync_collection_unsupported, unescape_ical_text,
     };
+    use crate::config::NextcloudConfig;
 
     const DUE_FIXTURE: &str = "BEGIN:VCALENDAR\r\n\
         VERSION:2.0\r\n\
@@ -1598,6 +1633,177 @@ mod tests {
             .await
             .expect("get_task should not error on 410");
         assert!(got.is_none(), "410 should yield None, got {got:?}");
+    }
+
+    #[tokio::test]
+    async fn discover_calendars_reapplies_basic_auth_after_redirect() {
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn read_http_request(stream: &mut tokio::net::TcpStream) -> String {
+            let mut bytes = Vec::new();
+            let mut chunk = [0u8; 1024];
+            let header_end = loop {
+                let n = stream.read(&mut chunk).await.expect("read request");
+                assert!(n > 0, "client closed before request headers");
+                bytes.extend_from_slice(&chunk[..n]);
+                if let Some(pos) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+
+            let headers = String::from_utf8_lossy(&bytes[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            while bytes.len() < header_end + content_length {
+                let n = stream.read(&mut chunk).await.expect("read body");
+                assert!(n > 0, "client closed before request body");
+                bytes.extend_from_slice(&chunk[..n]);
+            }
+
+            String::from_utf8(bytes).expect("request is utf-8")
+        }
+
+        async fn write_response(stream: &mut tokio::net::TcpStream, status: &str, headers: &[(&str, &str)], body: &str) {
+            let mut response = format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n",
+                body.len()
+            );
+            for (name, value) in headers {
+                response.push_str(name);
+                response.push_str(": ");
+                response.push_str(value);
+                response.push_str("\r\n");
+            }
+            response.push_str("\r\n");
+            response.push_str(body);
+            stream.write_all(response.as_bytes()).await.expect("write response");
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let server_requests = Arc::clone(&requests);
+
+        let server = tokio::spawn(async move {
+            for step in 0..4 {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let request = read_http_request(&mut stream).await;
+                server_requests.lock().unwrap().push(request);
+                match step {
+                    0 => {
+                        write_response(&mut stream, "302 Found", &[("Location", "/remote.php/dav")], "").await;
+                    }
+                    1 => {
+                        write_response(
+                            &mut stream,
+                            "207 Multi-Status",
+                            &[("Content-Type", "application/xml")],
+                            r#"<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:">
+  <d:response>
+    <d:href>/remote.php/dav</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:current-user-principal>
+          <d:href>/remote.php/dav/principals/users/u/</d:href>
+        </d:current-user-principal>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#,
+                        )
+                        .await;
+                    }
+                    2 => {
+                        write_response(
+                            &mut stream,
+                            "207 Multi-Status",
+                            &[("Content-Type", "application/xml")],
+                            r#"<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:" xmlns:cal="urn:ietf:params:xml:ns:caldav">
+  <d:response>
+    <d:href>/remote.php/dav/principals/users/u/</d:href>
+    <d:propstat>
+      <d:prop>
+        <cal:calendar-home-set>
+          <d:href>/remote.php/dav/calendars/u/</d:href>
+        </cal:calendar-home-set>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#,
+                        )
+                        .await;
+                    }
+                    3 => {
+                        write_response(
+                            &mut stream,
+                            "207 Multi-Status",
+                            &[("Content-Type", "application/xml")],
+                            r#"<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:" xmlns:cal="urn:ietf:params:xml:ns:caldav">
+  <d:response>
+    <d:href>/remote.php/dav/calendars/u/tasks/</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:displayname>Tasks</d:displayname>
+        <d:resourcetype><d:collection/><cal:calendar/></d:resourcetype>
+        <cal:supported-calendar-component-set>
+          <cal:comp name="VTODO"/>
+        </cal:supported-calendar-component-set>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#,
+                        )
+                        .await;
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        });
+
+        let auth = "Basic dTpw";
+        let cfg = NextcloudConfig {
+            base_url: base_url.clone(),
+            username: "u".to_string(),
+            app_password: "p".to_string(),
+            calendar: None,
+        };
+        let got = discover_calendars(&cfg).await.expect("discovery succeeds");
+
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].display_name, "Tasks");
+        assert_eq!(got[0].href, format!("{base_url}/remote.php/dav/calendars/u/tasks/"));
+        server.await.expect("server completes");
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        assert!(requests[0].starts_with("PROPFIND /.well-known/caldav "));
+        assert!(requests[1].starts_with("PROPFIND /remote.php/dav "));
+        assert!(requests[2].starts_with("PROPFIND /remote.php/dav/principals/users/u/ "));
+        assert!(requests[3].starts_with("PROPFIND /remote.php/dav/calendars/u/ "));
+        for request in requests.iter().skip(1) {
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains(&format!("\r\nauthorization: {}\r\n", auth.to_ascii_lowercase())),
+                "{request}"
+            );
+        }
     }
 
     #[test]

@@ -88,15 +88,15 @@ Column {
         width: digits === 4 ? 110 : 78
         height: 64
         color: "white"
-        border.color: due.hasDate ? "black" : "#9a9a9a"
+        border.color: due.hasDate ? "black" : "#606060"
         border.width: 3
 
         Text {
             anchors.centerIn: parent
             visible: seg.text.length === 0
             text: segRoot.ph
-            font.pixelSize: 26
-            color: "#9a9a9a"
+            font.pixelSize: 28
+            color: "#303030"
         }
 
         TextInput {
@@ -105,7 +105,7 @@ Column {
             anchors.margins: 6
             horizontalAlignment: TextInput.AlignHCenter
             verticalAlignment: TextInput.AlignVCenter
-            font.pixelSize: 26
+            font.pixelSize: 28
             color: "black"
             clip: true
             inputMethodHints: Qt.ImhDigitsOnly
@@ -124,7 +124,7 @@ Column {
         property bool emphasised: false
         signal clicked
         width: lbl.implicitWidth + 36
-        height: 56
+        height: 60
         color: emphasised ? "#e8e8e8" : "white"
         border.color: "black"
         border.width: 3
@@ -132,7 +132,7 @@ Column {
         Text {
             id: lbl
             anchors.centerIn: parent
-            font.pixelSize: 22
+            font.pixelSize: 24
             color: "black"
         }
         MouseArea {
@@ -148,23 +148,23 @@ Column {
 
         Text {
             text: "Due:"
-            font.pixelSize: 24
+            font.pixelSize: 26
             color: "#1a1a1a"
             height: 64
             verticalAlignment: Text.AlignVCenter
         }
 
         Segment { id: yearBox; digits: 4; minVal: 2000; maxVal: 2099; ph: "YYYY" }
-        Text { text: "·"; font.pixelSize: 26; height: 64; verticalAlignment: Text.AlignVCenter }
+        Text { text: "·"; font.pixelSize: 28; height: 64; verticalAlignment: Text.AlignVCenter }
         Segment { id: monthBox; digits: 2; minVal: 1; maxVal: 12; ph: "MM" }
-        Text { text: "·"; font.pixelSize: 26; height: 64; verticalAlignment: Text.AlignVCenter }
+        Text { text: "·"; font.pixelSize: 28; height: 64; verticalAlignment: Text.AlignVCenter }
         Segment { id: dayBox; digits: 2; minVal: 1; maxVal: 31; ph: "DD" }
 
         // Time segments, revealed by the toggle.
-        Text { visible: due.timeEnabled; text: "  "; font.pixelSize: 26; height: 64
+        Text { visible: due.timeEnabled; text: "  "; font.pixelSize: 28; height: 64
                verticalAlignment: Text.AlignVCenter }
         Segment { id: hourBox; visible: due.timeEnabled; digits: 2; minVal: 0; maxVal: 23; ph: "HH" }
-        Text { visible: due.timeEnabled; text: ":"; font.pixelSize: 26; height: 64
+        Text { visible: due.timeEnabled; text: ":"; font.pixelSize: 28; height: 64
                verticalAlignment: Text.AlignVCenter }
         Segment { id: minBox; visible: due.timeEnabled; digits: 2; minVal: 0; maxVal: 59; ph: "MM" }
 
