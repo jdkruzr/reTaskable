@@ -1,43 +1,64 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::fs::OpenOptions;
-use std::io::{ErrorKind, Write};
+use std::io::ErrorKind;
 use std::path::PathBuf;
 
-#[derive(Debug, Deserialize, Serialize)]
-pub struct Config {
-    pub nextcloud: NextcloudConfig,
+pub const LOCAL_LIST_ID: &str = "local://default";
+
+fn default_provider() -> String {
+    "generic".to_string()
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-pub struct NextcloudConfig {
+pub struct Config {
+    /// Stable list href selected in the UI. Legacy configurations omit this;
+    /// callers then fall back to the configured calendar name until the next save.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_list: Option<String>,
+    /// `nextcloud` is accepted as a read-only compatibility alias for v1.0.x.
+    #[serde(alias = "nextcloud")]
+    pub caldav: CaldavConfig,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            active_list: Some(LOCAL_LIST_ID.to_string()),
+            caldav: CaldavConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct CaldavConfig {
+    #[serde(default = "default_provider")]
+    pub provider: String,
     pub base_url: String,
     pub username: String,
     pub app_password: String,
-    /// Display name of the calendar to pull tasks from. Required for the
-    /// Show Tasks button; optional so older configs still load and the
-    /// non-task buttons keep working.
+    /// Stable collection URL. New configurations use this for selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calendar_href: Option<String>,
+    /// Human-facing collection name. `calendar` is retained on disk for
+    /// compatibility with v1.0.x and is no longer treated as an identifier.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calendar: Option<String>,
 }
 
-const TEMPLATE: &str = r#"# reTaskable configuration.
-# Fill in real values, then relaunch the app.
-# Generate the app password in Nextcloud at:
-#   Settings -> Security -> Devices & sessions -> Create new app password
-# Use HTTPS only -- Basic auth over plain HTTP would leak your password.
+pub type NextcloudConfig = CaldavConfig;
 
-[nextcloud]
-# Bare server URL only -- DO NOT include /remote.php/dav. We append it.
-# Good: https://nextcloud.example.com
-#  Bad: https://nextcloud.example.com/remote.php/dav
-base_url     = "https://nextcloud.example.com"
-username     = "yourname"
-app_password = "xxx-xxx-xxx-xxx-xxx"
-# Display name of the calendar to read tasks from.
-# Run List Calendars in the app to see the available names; paste one here.
-calendar     = "Personal"
-"#;
+impl Default for CaldavConfig {
+    fn default() -> Self {
+        Self {
+            provider: default_provider(),
+            base_url: String::new(),
+            username: String::new(),
+            app_password: String::new(),
+            calendar_href: None,
+            calendar: None,
+        }
+    }
+}
 
 pub fn path() -> Result<PathBuf> {
     let base = dirs::config_dir().context("could not resolve user config dir")?;
@@ -49,40 +70,19 @@ pub fn load() -> Result<Config> {
     let raw = match std::fs::read_to_string(&path) {
         Ok(s) => s,
         Err(e) if e.kind() == ErrorKind::NotFound => {
-            write_template(&path)?;
-            return Err(anyhow!(
-                "no config found; wrote a template at {} -- fill in your credentials and try again",
-                path.display()
-            ));
+            return Ok(Config::default());
         }
         Err(e) => {
-            return Err(anyhow::Error::new(e)
-                .context(format!("reading config at {}", path.display())));
+            return Err(
+                anyhow::Error::new(e).context(format!("reading config at {}", path.display()))
+            );
         }
     };
-    toml::from_str(&raw)
-        .with_context(|| format!("parsing config at {}", path.display()))
+    toml::from_str(&raw).with_context(|| format!("parsing config at {}", path.display()))
 }
 
-fn write_template(path: &std::path::Path) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating config dir {}", parent.display()))?;
-    }
-    // create_new so a concurrent writer wins instead of getting clobbered.
-    let mut f = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .with_context(|| format!("writing template config at {}", path.display()))?;
-    f.write_all(TEMPLATE.as_bytes())
-        .with_context(|| format!("writing template body to {}", path.display()))?;
-    Ok(())
-}
-
-/// Like [`load`], but returns `Ok(None)` when no config file exists yet, instead
-/// of writing a template and erroring. The M11 Settings screen is the first-run
-/// path, so it must tolerate a missing file rather than fail.
+/// Like [`load`], but returns `Ok(None)` when no config file exists yet.
+/// The Settings screen and local-only mode both tolerate a missing file.
 pub fn load_optional() -> Result<Option<Config>> {
     let path = path()?;
     match std::fs::read_to_string(&path) {
@@ -117,13 +117,24 @@ pub fn save_to(path: &std::path::Path, cfg: &Config) -> Result<()> {
             .with_context(|| format!("creating config dir {}", parent.display()))?;
     }
     let body = toml::to_string(cfg).context("serializing config to TOML")?;
-    std::fs::write(path, body)
-        .with_context(|| format!("writing config to {}", path.display()))
+    std::fs::write(path, body).with_context(|| format!("writing config to {}", path.display()))
 }
 
 /// Write `cfg` to the standard config location.
 pub fn save(cfg: &Config) -> Result<()> {
     save_to(&path()?, cfg)
+}
+
+pub fn active_list(cfg: &Config) -> Option<&str> {
+    cfg.active_list
+        .as_deref()
+        .or(cfg.caldav.calendar_href.as_deref())
+}
+
+pub fn has_remote(cfg: &Config) -> bool {
+    !cfg.caldav.base_url.trim().is_empty()
+        && !cfg.caldav.username.trim().is_empty()
+        && !cfg.caldav.app_password.is_empty()
 }
 
 #[cfg(test)]
@@ -134,7 +145,10 @@ mod tests {
     fn merge_password_blank_keeps_existing() {
         assert_eq!(merge_password("", Some("old-secret")), "old-secret");
         assert_eq!(merge_password("", None), "");
-        assert_eq!(merge_password("new-secret", Some("old-secret")), "new-secret");
+        assert_eq!(
+            merge_password("new-secret", Some("old-secret")),
+            "new-secret"
+        );
     }
 
     #[test]
@@ -142,20 +156,23 @@ mod tests {
         let path = std::env::temp_dir().join("retaskable_cfg_roundtrip_test.toml");
         let _ = std::fs::remove_file(&path);
         let cfg = Config {
-            nextcloud: NextcloudConfig {
+            active_list: Some("https://nc.example.com/tasks/".into()),
+            caldav: CaldavConfig {
+                provider: "generic".into(),
                 base_url: "https://nc.example.com".to_string(),
                 username: "alice".to_string(),
                 app_password: "abc-def-ghi".to_string(),
+                calendar_href: Some("https://nc.example.com/tasks/".into()),
                 calendar: Some("Personal".to_string()),
             },
         };
         save_to(&path, &cfg).expect("save");
         let parsed: Config =
             toml::from_str(&std::fs::read_to_string(&path).unwrap()).expect("parse");
-        assert_eq!(parsed.nextcloud.base_url, "https://nc.example.com");
-        assert_eq!(parsed.nextcloud.username, "alice");
-        assert_eq!(parsed.nextcloud.app_password, "abc-def-ghi");
-        assert_eq!(parsed.nextcloud.calendar.as_deref(), Some("Personal"));
+        assert_eq!(parsed.caldav.base_url, "https://nc.example.com");
+        assert_eq!(parsed.caldav.username, "alice");
+        assert_eq!(parsed.caldav.app_password, "abc-def-ghi");
+        assert_eq!(parsed.caldav.calendar.as_deref(), Some("Personal"));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -164,17 +181,44 @@ mod tests {
         let path = std::env::temp_dir().join("retaskable_cfg_none_test.toml");
         let _ = std::fs::remove_file(&path);
         let cfg = Config {
-            nextcloud: NextcloudConfig {
+            active_list: Some(LOCAL_LIST_ID.into()),
+            caldav: CaldavConfig {
+                provider: "generic".into(),
                 base_url: "https://x".into(),
                 username: "u".into(),
                 app_password: "p".into(),
+                calendar_href: None,
                 calendar: None,
             },
         };
         save_to(&path, &cfg).expect("save");
         let parsed: Config =
             toml::from_str(&std::fs::read_to_string(&path).unwrap()).expect("parse");
-        assert!(parsed.nextcloud.calendar.is_none());
+        assert!(parsed.caldav.calendar.is_none());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn legacy_nextcloud_table_parses() {
+        let parsed: Config = toml::from_str(
+            r#"[nextcloud]
+base_url = "https://example.test"
+username = "u"
+app_password = "p"
+calendar = "Tasks"
+"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.caldav.base_url, "https://example.test");
+        assert_eq!(parsed.caldav.provider, "generic");
+        assert_eq!(parsed.active_list, None);
+    }
+
+    #[test]
+    fn missing_config_defaults_to_local_capable_shape() {
+        let parsed = Config::default();
+        assert_eq!(active_list(&parsed), Some(LOCAL_LIST_ID));
+        assert_eq!(parsed.caldav.provider, "generic");
+        assert!(!has_remote(&parsed));
     }
 }

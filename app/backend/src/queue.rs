@@ -5,8 +5,8 @@
 use anyhow::Result;
 use reqwest::Client;
 use rusqlite::{Connection, OptionalExtension};
-use url::Url;
 use std::error::Error;
+use url::Url;
 
 use crate::db::{self, PendingOp};
 
@@ -53,9 +53,7 @@ pub enum ExecOutcome {
         retried: bool,
     },
     /// Server confirmed a delete. Cache row is removed entirely.
-    SuccessDelete {
-        retried: bool,
-    },
+    SuccessDelete { retried: bool },
     /// Recoverable (network / 5xx). Mid-drain break; op stays queued.
     Transient(String),
     /// Unrecoverable (auth / 404 / double-412 / UID collision). Op flips
@@ -214,7 +212,11 @@ async fn dispatch_create(
                 }
                 None => {
                     crate::nextcloud::put_task_create_with_uid(
-                        http, &task_url, auth, &op.target_uid, &summary,
+                        http,
+                        &task_url,
+                        auth,
+                        &op.target_uid,
+                        &summary,
                     )
                     .await
                 }
@@ -225,6 +227,26 @@ async fn dispatch_create(
                     etag,
                     ical_text,
                 },
+                Err(err) if format!("{err:#}").contains("412") => {
+                    // A prior attempt may have reached the server before the
+                    // process died. The deterministic UID/resource URL makes
+                    // that distinguishable from a true collision.
+                    match crate::nextcloud::get_task(http, &task_url, auth).await {
+                        Ok(Some((etag, ical_text))) => {
+                            match crate::nextcloud::parse_vtodos_first(&ical_text) {
+                                Ok(task) if task.uid == op.target_uid => {
+                                    ExecOutcome::SuccessCreate {
+                                        task_url: task_url.to_string(),
+                                        etag,
+                                        ical_text,
+                                    }
+                                }
+                                _ => ExecOutcome::Terminal("UID collision on create".to_string()),
+                            }
+                        }
+                        _ => classify_error(&err),
+                    }
+                }
                 Err(err) => classify_error(&err),
             }
         }
@@ -397,7 +419,9 @@ pub fn build_task_url(calendar_url: &Url, href: &str) -> Result<Url> {
     // canonicalises to absolute URL strings via base.join().to_string(); CalDAV servers
     // also legally emit absolute-path hrefs. Url::parse handles the former; base.join
     // handles the latter. Try parse first; on failure (path-only), fall back.
-    Url::parse(href).or_else(|_| calendar_url.join(href)).map_err(Into::into)
+    Url::parse(href)
+        .or_else(|_| calendar_url.join(href))
+        .map_err(Into::into)
 }
 
 /// Apply a dispatch outcome to the DB. Returns Ok(true) to continue draining,
@@ -414,14 +438,62 @@ fn apply_outcome(
 ) -> Result<bool> {
     use ExecOutcome::*;
     match outcome {
-        SuccessCreate { task_url, etag, ical_text } => {
+        SuccessCreate {
+            task_url,
+            etag,
+            ical_text,
+        } => {
             let tx = conn.unchecked_transaction()?;
-            // Replace the sentinel row with the real href + etag.
-            let affected = tx.execute(
-                "UPDATE task SET href = ?1, etag = ?2, ical_text = ?3 \
-                 WHERE calendar_href = ?4 AND uid = ?5",
-                rusqlite::params![task_url, etag, ical_text, op.target_calendar_href, op.target_uid],
+            let sentinel_href = format!("pending:{}", op.target_uid);
+            let move_source = op
+                .payload
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                .and_then(|value| {
+                    value
+                        .get("move_source")
+                        .and_then(|source| source.as_str())
+                        .map(str::to_string)
+                });
+            let sentinel_exists: bool = tx.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM task
+                     WHERE calendar_href = ?1 AND href = ?2 AND uid = ?3
+                )",
+                rusqlite::params![op.target_calendar_href, sentinel_href, op.target_uid],
+                |row| row.get(0),
             )?;
+            let affected = if sentinel_exists {
+                // A deterministic create may be retried after the same UID has
+                // already been pulled from the server. Remove that older cache
+                // representation before replacing the sentinel, or both rows
+                // would be updated to the same primary key.
+                let reconciled = tx.execute(
+                    "DELETE FROM task
+                      WHERE calendar_href = ?1 AND uid = ?2 AND href <> ?3",
+                    rusqlite::params![op.target_calendar_href, op.target_uid, sentinel_href],
+                )?;
+                if reconciled > 0 {
+                    eprintln!(
+                        "retaskable: queue: reconciled {reconciled} existing cache row(s) for create #{}",
+                        op.id
+                    );
+                }
+                tx.execute(
+                    "UPDATE task SET href = ?1, etag = ?2, ical_text = ?3
+                     WHERE calendar_href = ?4 AND href = ?5 AND uid = ?6",
+                    rusqlite::params![
+                        task_url,
+                        etag,
+                        ical_text,
+                        op.target_calendar_href,
+                        sentinel_href,
+                        op.target_uid
+                    ],
+                )?
+            } else {
+                0
+            };
             if affected == 0 {
                 let server_row_exists: bool = tx.query_row(
                     "SELECT EXISTS(
@@ -434,10 +506,22 @@ fn apply_outcome(
                     |row| row.get(0),
                 )?;
                 if server_row_exists {
-                    tx.execute("DELETE FROM pending_op WHERE id = ?1", rusqlite::params![op.id])?;
+                    if let Some(source) = move_source.as_deref() {
+                        tx.execute(
+                            "DELETE FROM task WHERE calendar_href = ?1 AND uid = ?2",
+                            rusqlite::params![source, op.target_uid],
+                        )?;
+                    }
+                    tx.execute(
+                        "DELETE FROM pending_op WHERE id = ?1",
+                        rusqlite::params![op.id],
+                    )?;
                     tx.commit()?;
                     summary.flushed += 1;
-                    eprintln!("retaskable: queue: flushed create #{} after server row already existed", op.id);
+                    eprintln!(
+                        "retaskable: queue: flushed create #{} after server row already existed",
+                        op.id
+                    );
                     return Ok(true);
                 }
                 // Cache row vanished (e.g., external delete, or sync-collection cleared during create).
@@ -450,13 +534,26 @@ fn apply_outcome(
                 eprintln!("retaskable: queue: cache vanished for create #{} -> errored; cascaded {cascaded}", op.id);
                 return Ok(true);
             }
-            tx.execute("DELETE FROM pending_op WHERE id = ?1", rusqlite::params![op.id])?;
+            if let Some(source) = move_source.as_deref() {
+                tx.execute(
+                    "DELETE FROM task WHERE calendar_href = ?1 AND uid = ?2",
+                    rusqlite::params![source, op.target_uid],
+                )?;
+            }
+            tx.execute(
+                "DELETE FROM pending_op WHERE id = ?1",
+                rusqlite::params![op.id],
+            )?;
             tx.commit()?;
             summary.flushed += 1;
             eprintln!("retaskable: queue: flushed create #{} -> {task_url}", op.id);
             Ok(true)
         }
-        SuccessUpdate { new_etag, new_ical, retried } => {
+        SuccessUpdate {
+            new_etag,
+            new_ical,
+            retried,
+        } => {
             let tx = conn.unchecked_transaction()?;
             // The cached row was optimistically updated at enqueue time; here
             // we replace etag + ical_text with the server-canonical version
@@ -477,13 +574,19 @@ fn apply_outcome(
                 eprintln!("retaskable: queue: cache vanished for #{} ({}) -> errored; cascaded {cascaded}", op.id, op.op_type);
                 return Ok(true);
             }
-            tx.execute("DELETE FROM pending_op WHERE id = ?1", rusqlite::params![op.id])?;
+            tx.execute(
+                "DELETE FROM pending_op WHERE id = ?1",
+                rusqlite::params![op.id],
+            )?;
             tx.commit()?;
             summary.flushed += 1;
             if retried {
                 summary.retried += 1;
             }
-            eprintln!("retaskable: queue: flushed {} #{} (retried={retried})", op.op_type, op.id);
+            eprintln!(
+                "retaskable: queue: flushed {} #{} (retried={retried})",
+                op.op_type, op.id
+            );
             Ok(true)
         }
         SuccessDelete { retried } => {
@@ -494,9 +597,15 @@ fn apply_outcome(
             )?;
             if affected == 0 {
                 // Task already gone (idempotent). Server-side it's already deleted.
-                eprintln!("retaskable: queue: delete #{} -- cache row already gone (idempotent)", op.id);
+                eprintln!(
+                    "retaskable: queue: delete #{} -- cache row already gone (idempotent)",
+                    op.id
+                );
             }
-            tx.execute("DELETE FROM pending_op WHERE id = ?1", rusqlite::params![op.id])?;
+            tx.execute(
+                "DELETE FROM pending_op WHERE id = ?1",
+                rusqlite::params![op.id],
+            )?;
             tx.commit()?;
             summary.flushed += 1;
             if retried {
@@ -523,7 +632,10 @@ fn apply_outcome(
                 );
             } else {
                 summary.transient_failed += 1;
-                eprintln!("retaskable: queue: transient #{} ({}): {msg}", op.id, op.op_type);
+                eprintln!(
+                    "retaskable: queue: transient #{} ({}): {msg}",
+                    op.id, op.op_type
+                );
             }
             tx.commit()?;
             Ok(false) // mid-drain break per AC1.4
@@ -598,7 +710,6 @@ mod tests {
         assert_eq!(summary.flushed, 0);
     }
 
-
     #[test]
     fn apply_outcome_success_update_with_retry_increments_retried() {
         let mut conn = fresh();
@@ -620,21 +731,28 @@ mod tests {
                 retried: true,
             },
             &mut summary,
-        ).unwrap();
+        )
+        .unwrap();
         assert!(cont);
         assert_eq!(summary.flushed, 1);
         assert_eq!(summary.retried, 1);
         // pending_op gone.
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM pending_op WHERE id = ?1",
-            rusqlite::params![op.id], |r| r.get(0),
-        ).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pending_op WHERE id = ?1",
+                rusqlite::params![op.id],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(count, 0);
         // Cache row updated.
-        let (etag, ical): (String, String) = conn.query_row(
-            "SELECT etag, ical_text FROM task WHERE uid = 'uid-x'",
-            [], |r| Ok((r.get(0)?, r.get(1)?)),
-        ).unwrap();
+        let (etag, ical): (String, String) = conn
+            .query_row(
+                "SELECT etag, ical_text FROM task WHERE uid = 'uid-x'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
         assert_eq!(etag, "new-etag");
         assert_eq!(ical, "new-ical");
     }
@@ -659,20 +777,29 @@ mod tests {
                 retried: false,
             },
             &mut summary,
-        ).unwrap();
+        )
+        .unwrap();
 
-        assert!(cont, "missing cache row treated as terminal (continue drain)");
+        assert!(
+            cont,
+            "missing cache row treated as terminal (continue drain)"
+        );
         assert_eq!(summary.newly_errored, 1, "op must be marked errored");
         assert_eq!(summary.flushed, 0, "op must NOT count as flushed");
 
         // Verify the pending_op is marked errored with the right message.
-        let (errored, last_error): (i64, String) = conn.query_row(
-            "SELECT errored, last_error FROM pending_op WHERE id = ?1",
-            rusqlite::params![op.id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        ).unwrap();
+        let (errored, last_error): (i64, String) = conn
+            .query_row(
+                "SELECT errored, last_error FROM pending_op WHERE id = ?1",
+                rusqlite::params![op.id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
         assert_eq!(errored, 1, "pending_op.errored must be 1");
-        assert!(last_error.contains("cache row vanished"), "error message must explain the race");
+        assert!(
+            last_error.contains("cache row vanished"),
+            "error message must explain the race"
+        );
     }
 
     #[test]
@@ -751,9 +878,9 @@ mod tests {
             .unwrap();
         assert_eq!(row, (1, 0), "first transient strike increments error_count");
         // Both ops remain in the queue (drain broke, uid-b was never fetched).
-        let total: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM pending_op", [], |r| r.get(0),
-        ).unwrap();
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pending_op", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(total, 2, "both ops still in queue");
     }
 
@@ -797,20 +924,25 @@ mod tests {
             .await
             .expect("flush");
 
-        assert_eq!(summary.flushed, 1, "operation must succeed despite absolute href");
+        assert_eq!(
+            summary.flushed, 1,
+            "operation must succeed despite absolute href"
+        );
         assert_eq!(summary.newly_errored, 0);
         put_mock.assert_async().await;
 
         // Verify the queue was drained.
-        let remaining: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM pending_op", [], |r| r.get(0),
-        ).unwrap();
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pending_op", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(remaining, 0);
 
         // Verify the cache was updated.
-        let etag: String = conn.query_row(
-            "SELECT etag FROM task WHERE uid = 'uid-test'", [], |r| r.get(0),
-        ).unwrap();
+        let etag: String = conn
+            .query_row("SELECT etag FROM task WHERE uid = 'uid-test'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
         assert_eq!(etag, "etag-v2");
     }
 
@@ -893,9 +1025,8 @@ mod tests {
 
     #[test]
     fn classify_uid_collision_as_terminal() {
-        let err = anyhow::anyhow!(
-            "412 on create -- UID collision (should never happen with v4 UUIDs)"
-        );
+        let err =
+            anyhow::anyhow!("412 on create -- UID collision (should never happen with v4 UUIDs)");
         assert!(matches!(classify_error(&err), ExecOutcome::Terminal(_)));
     }
 
@@ -909,17 +1040,15 @@ mod tests {
 
     #[test]
     fn classify_401_as_terminal() {
-        let err = anyhow::anyhow!(
-            "PUT https://example.com/cal/x.ics -> 401 Unauthorized: bad creds"
-        );
+        let err =
+            anyhow::anyhow!("PUT https://example.com/cal/x.ics -> 401 Unauthorized: bad creds");
         assert!(matches!(classify_error(&err), ExecOutcome::Terminal(_)));
     }
 
     #[test]
     fn classify_500_as_transient() {
-        let err = anyhow::anyhow!(
-            "PUT https://example.com/cal/x.ics -> 500 Internal Server Error: oops"
-        );
+        let err =
+            anyhow::anyhow!("PUT https://example.com/cal/x.ics -> 500 Internal Server Error: oops");
         assert!(matches!(classify_error(&err), ExecOutcome::Transient(_)));
     }
 
@@ -990,15 +1119,17 @@ mod tests {
         put_mock.assert_async().await;
 
         // pending_op gone.
-        let remaining: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM pending_op", [], |r| r.get(0),
-        ).unwrap();
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pending_op", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(remaining, 0);
 
         // Cache row has the new etag.
-        let etag: String = conn.query_row(
-            "SELECT etag FROM task WHERE uid = 'uid-walk'", [], |r| r.get(0),
-        ).unwrap();
+        let etag: String = conn
+            .query_row("SELECT etag FROM task WHERE uid = 'uid-walk'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
         assert_eq!(etag, "etag-fresh");
     }
 
@@ -1042,7 +1173,10 @@ mod tests {
 
         assert_eq!(summary.flushed, 0);
         assert_eq!(summary.transient_failed, 1);
-        assert_eq!(summary.newly_errored, 0, "first transient strike must NOT mark errored");
+        assert_eq!(
+            summary.newly_errored, 0,
+            "first transient strike must NOT mark errored"
+        );
         assert_eq!(summary.cascade_errored, 0);
 
         // First op's error_count is now 1, errored still 0.
@@ -1054,9 +1188,9 @@ mod tests {
         assert_eq!(errored, 0);
 
         // The other two ops (uid-x #2 and uid-y) are untouched.
-        let total: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM pending_op", [], |r| r.get(0),
-        ).unwrap();
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pending_op", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(total, 3);
     }
 
@@ -1100,8 +1234,14 @@ mod tests {
         assert_eq!(summary.cascade_errored, 1, "sibling on uid-x cascaded");
 
         let (errored_count, total): (i64, i64) = (
-            conn.query_row("SELECT COUNT(*) FROM pending_op WHERE errored = 1", [], |r| r.get(0)).unwrap(),
-            conn.query_row("SELECT COUNT(*) FROM pending_op", [], |r| r.get(0)).unwrap(),
+            conn.query_row(
+                "SELECT COUNT(*) FROM pending_op WHERE errored = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap(),
+            conn.query_row("SELECT COUNT(*) FROM pending_op", [], |r| r.get(0))
+                .unwrap(),
         );
         assert_eq!(errored_count, 2);
         assert_eq!(total, 2);
@@ -1153,10 +1293,13 @@ mod tests {
         //   #3 toggle uid-y     → terminal (newly_errored += 1, no siblings)
         assert_eq!(summary.newly_errored, 2);
         assert_eq!(summary.cascade_errored, 1);
-        let errored_on_x: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM pending_op WHERE target_uid = 'uid-x' AND errored = 1",
-            [], |r| r.get(0),
-        ).unwrap();
+        let errored_on_x: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pending_op WHERE target_uid = 'uid-x' AND errored = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(errored_on_x, 2);
     }
 
@@ -1209,12 +1352,15 @@ mod tests {
         // by the property that no row has the old etag while its pending_op is
         // already gone, AND no pending_op exists for a row whose etag has been
         // updated.
-        let stale_pairs: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM task t
+        let stale_pairs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task t
              WHERE t.etag = 'old'
                AND NOT EXISTS (SELECT 1 FROM pending_op p WHERE p.target_uid = t.uid)",
-            [], |r| r.get(0),
-        ).unwrap();
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(stale_pairs, 0, "no orphaned stale cache rows");
         let stale_ops: i64 = conn.query_row(
             "SELECT COUNT(*) FROM pending_op p
@@ -1222,5 +1368,124 @@ mod tests {
             [], |r| r.get(0),
         ).unwrap();
         assert_eq!(stale_ops, 0, "no orphaned ops for already-fresh rows");
+    }
+
+    #[test]
+    fn successful_move_create_deletes_local_source_only_at_apply() {
+        let mut conn = fresh();
+        crate::db::ensure_local_list(&conn).unwrap();
+        crate::db::create_local_with_anchor(&mut conn, "move-1", "Move safely", None, None)
+            .unwrap();
+        let op_id =
+            crate::db::transfer_local_to_remote(&mut conn, "move-1", "/cal/", true).unwrap();
+        let op = crate::db::get_pending_op_by_id(&conn, op_id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            crate::db::get_cached_task_by_uid(&conn, crate::db::LOCAL_LIST_ID, "move-1")
+                .unwrap()
+                .is_some()
+        );
+
+        let mut summary = FlushSummary::default();
+        apply_outcome(
+            &mut conn,
+            &op,
+            ExecOutcome::SuccessCreate {
+                task_url: "https://example.test/tasks/move-1.ics".into(),
+                etag: "\"e1\"".into(),
+                ical_text: "BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:move-1\r\nSUMMARY:Move safely\r\nEND:VTODO\r\nEND:VCALENDAR\r\n".into(),
+            },
+            &mut summary,
+        )
+        .unwrap();
+        assert!(
+            crate::db::get_cached_task_by_uid(&conn, crate::db::LOCAL_LIST_ID, "move-1")
+                .unwrap()
+                .is_none()
+        );
+        assert!(crate::db::get_pending_op_by_id(&conn, op_id)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn repeated_copy_reconciles_existing_destination_row() {
+        let mut conn = fresh();
+        crate::db::ensure_local_list(&conn).unwrap();
+        crate::db::create_local_with_anchor(&mut conn, "copy-1", "Copy safely", None, None)
+            .unwrap();
+
+        let task_url = "https://example.test/tasks/copy-1.ics";
+        let first_id =
+            crate::db::transfer_local_to_remote(&mut conn, "copy-1", "/cal/", false).unwrap();
+        let first_op = crate::db::get_pending_op_by_id(&conn, first_id)
+            .unwrap()
+            .unwrap();
+        let first_body = "BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:copy-1\r\nSUMMARY:Copy safely\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        let mut summary = FlushSummary::default();
+        apply_outcome(
+            &mut conn,
+            &first_op,
+            ExecOutcome::SuccessCreate {
+                task_url: task_url.into(),
+                etag: "\"e1\"".into(),
+                ical_text: first_body.into(),
+            },
+            &mut summary,
+        )
+        .unwrap();
+
+        // A later sync may represent the same server resource with a path href.
+        conn.execute(
+            "UPDATE task SET href = '/cal/copy-1.ics'
+              WHERE calendar_href = '/cal/' AND uid = 'copy-1'",
+            [],
+        )
+        .unwrap();
+
+        let second_id =
+            crate::db::transfer_local_to_remote(&mut conn, "copy-1", "/cal/", false).unwrap();
+        let second_op = crate::db::get_pending_op_by_id(&conn, second_id)
+            .unwrap()
+            .unwrap();
+        apply_outcome(
+            &mut conn,
+            &second_op,
+            ExecOutcome::SuccessCreate {
+                task_url: task_url.into(),
+                etag: "\"e2\"".into(),
+                ical_text: first_body.into(),
+            },
+            &mut summary,
+        )
+        .unwrap();
+
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM task WHERE calendar_href = '/cal/' AND uid = 'copy-1'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT href FROM task WHERE calendar_href = '/cal/' AND uid = 'copy-1'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            task_url
+        );
+        assert!(
+            crate::db::get_cached_task_by_uid(&conn, crate::db::LOCAL_LIST_ID, "copy-1")
+                .unwrap()
+                .is_some()
+        );
+        assert!(crate::db::get_pending_op_by_id(&conn, second_id)
+            .unwrap()
+            .is_none());
     }
 }

@@ -1,8 +1,9 @@
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
-use std::collections::HashMap;
 use reqwest::{header, redirect::Policy, Client, Method, StatusCode};
 use serde::Serialize;
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 use url::Url;
 use uuid::Uuid;
 
@@ -117,13 +118,54 @@ struct DavResp {
     final_url: Url,
 }
 
-const MAX_DAV_REDIRECTS: usize = 8;
+const MAX_DAV_REDIRECTS: usize = 5;
 
-fn dav_client() -> Result<Client> {
+pub fn dav_client() -> Result<Client> {
     Client::builder()
         .redirect(Policy::none())
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(120))
         .build()
         .context("building WebDAV HTTP client")
+}
+
+fn is_icloud_caldav_host(host: &str) -> bool {
+    if host == "caldav.icloud.com" {
+        return true;
+    }
+    let Some(prefix) = host.strip_suffix("-caldav.icloud.com") else {
+        return false;
+    };
+    prefix
+        .strip_prefix('p')
+        .is_some_and(|digits| !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()))
+}
+
+fn same_origin(a: &Url, b: &Url) -> bool {
+    a.scheme() == b.scheme()
+        && a.host_str() == b.host_str()
+        && a.port_or_known_default() == b.port_or_known_default()
+}
+
+fn redirect_allowed(from: &Url, to: &Url) -> bool {
+    if from.scheme() == "https" && to.scheme() != "https" {
+        return false;
+    }
+    if same_origin(from, to) {
+        return true;
+    }
+    matches!(
+        (from.host_str(), to.host_str()),
+        (Some(a), Some(b)) if is_icloud_caldav_host(a) && is_icloud_caldav_host(b)
+    )
+}
+
+fn endpoint_label(url: &Url) -> String {
+    format!(
+        "{}://{}",
+        url.scheme(),
+        url.host_str().unwrap_or("<invalid-host>")
+    )
 }
 
 async fn dav_request(
@@ -134,22 +176,43 @@ async fn dav_request(
     depth: &str,
     auth: (&str, &str),
 ) -> Result<DavResp> {
-    let method = Method::from_bytes(method_bytes)
-        .map_err(|e| anyhow!("invalid method bytes: {e}"))?;
+    let method =
+        Method::from_bytes(method_bytes).map_err(|e| anyhow!("invalid method bytes: {e}"))?;
     let body = body.into();
     let mut current_url = url.clone();
+    let request_timeout = if method.as_str() == "REPORT" {
+        Duration::from_secs(120)
+    } else {
+        Duration::from_secs(30)
+    };
 
     for redirect_count in 0..=MAX_DAV_REDIRECTS {
-        let resp = client
+        let started = Instant::now();
+        let send = client
             .request(method.clone(), current_url.clone())
             .basic_auth(auth.0, Some(auth.1))
             .header("Depth", depth)
             .header("Content-Type", "application/xml; charset=utf-8")
             .body(body.clone())
-            .send()
+            .send();
+        let resp = tokio::time::timeout(request_timeout, send)
             .await
+            .map_err(|_| {
+                anyhow!(
+                    "DAV-DISCOVERY-TIMEOUT: {} {} timed out",
+                    method,
+                    endpoint_label(&current_url)
+                )
+            })?
             .with_context(|| format!("sending request to {current_url}"))?;
         let status = resp.status();
+        crate::diagnostics::record(&format!(
+            "dav method={} endpoint={} status={} elapsed_ms={}",
+            method,
+            endpoint_label(&current_url),
+            status.as_u16(),
+            started.elapsed().as_millis()
+        ));
 
         if status.is_redirection() {
             if redirect_count == MAX_DAV_REDIRECTS {
@@ -160,10 +223,26 @@ async fn dav_request(
                 .get(header::LOCATION)
                 .and_then(|v| v.to_str().ok())
                 .ok_or_else(|| anyhow!("{current_url} -> {status} without Location header"))?;
-            let next_url = current_url
-                .join(location)
-                .with_context(|| format!("resolving redirect Location {location:?} from {current_url}"))?;
-            eprintln!("retaskable: DAV redirect {current_url} -> {next_url}");
+            let next_url = current_url.join(location).with_context(|| {
+                format!("resolving redirect Location {location:?} from {current_url}")
+            })?;
+            if !redirect_allowed(&current_url, &next_url) {
+                crate::diagnostics::record(&format!(
+                    "dav error=DAV-UNSAFE-REDIRECT from={} to={}",
+                    endpoint_label(&current_url),
+                    endpoint_label(&next_url)
+                ));
+                bail!(
+                    "DAV-UNSAFE-REDIRECT: refused redirect from {} to {}",
+                    endpoint_label(&current_url),
+                    endpoint_label(&next_url)
+                );
+            }
+            eprintln!(
+                "retaskable: DAV redirect {} -> {}",
+                endpoint_label(&current_url),
+                endpoint_label(&next_url)
+            );
             current_url = next_url;
             continue;
         }
@@ -176,7 +255,11 @@ async fn dav_request(
         if !status.is_success() {
             bail!("{} -> {}: {}", current_url, status, body);
         }
-        return Ok(DavResp { status, body, final_url });
+        return Ok(DavResp {
+            status,
+            body,
+            final_url,
+        });
     }
 
     unreachable!("redirect loop exits by return or bail")
@@ -197,9 +280,7 @@ pub async fn sync_collection_with_fallback(
             Err(e) => {
                 let msg = format!("{e:#}");
                 if msg.contains("412") || msg.contains("403") || sync_collection_unsupported(&msg) {
-                    eprintln!(
-                        "retaskable: sync-token rejected ({msg}); falling back to full sync"
-                    );
+                    eprintln!("retaskable: sync-token rejected ({msg}); falling back to full sync");
                 } else {
                     return Err(e);
                 }
@@ -285,9 +366,16 @@ async fn calendar_query_all(
     calendar_url: &Url,
     auth: (&str, &str),
 ) -> Result<SyncDelta> {
-    let resp = dav_request(client, b"REPORT", calendar_url, calendar_query_body(), "1", auth)
-        .await
-        .context("REPORT calendar-query")?;
+    let resp = dav_request(
+        client,
+        b"REPORT",
+        calendar_url,
+        calendar_query_body(),
+        "1",
+        auth,
+    )
+    .await
+    .context("REPORT calendar-query")?;
     parse_sync_response(&resp.body, &resp.final_url)
 }
 
@@ -308,7 +396,9 @@ fn parse_sync_response(xml: &str, base: &Url) -> Result<SyncDelta> {
         let Some(href_node) = response.children().find(|n| n.has_tag_name("href")) else {
             continue;
         };
-        let Some(href_text) = href_node.text() else { continue };
+        let Some(href_text) = href_node.text() else {
+            continue;
+        };
         let href_text = href_text.trim();
         if href_text.is_empty() {
             continue;
@@ -381,8 +471,11 @@ fn parse_sync_response(xml: &str, base: &Url) -> Result<SyncDelta> {
 
 pub async fn probe(cfg: &NextcloudConfig) -> Result<String> {
     let base = cfg.base_url.trim_end_matches('/');
-    let url = Url::parse(&format!("{}/remote.php/dav/calendars/{}/", base, cfg.username))
-        .context("parsing calendar-home URL")?;
+    let url = Url::parse(&format!(
+        "{}/remote.php/dav/calendars/{}/",
+        base, cfg.username
+    ))
+    .context("parsing calendar-home URL")?;
     let client = dav_client()?;
     let resp = dav_request(
         &client,
@@ -394,52 +487,135 @@ pub async fn probe(cfg: &NextcloudConfig) -> Result<String> {
     )
     .await?;
     let snippet_end = resp.body.len().min(500);
-    Ok(format!("status={}\n\n{}", resp.status.as_u16(), &resp.body[..snippet_end]))
+    Ok(format!(
+        "status={}\n\n{}",
+        resp.status.as_u16(),
+        &resp.body[..snippet_end]
+    ))
 }
 
 pub async fn discover_calendars(cfg: &NextcloudConfig) -> Result<Vec<Calendar>> {
     let auth = (cfg.username.as_str(), cfg.app_password.as_str());
     let client = dav_client()?;
-    let base = Url::parse(cfg.base_url.trim_end_matches('/'))
-        .context("parsing base_url")?;
+    let base = Url::parse(cfg.base_url.trim_end_matches('/')).context("parsing base_url")?;
 
+    if cfg.provider == "icloud" {
+        match discover_from(&client, cfg, &base, auth).await {
+            Ok(calendars) => return Ok(calendars),
+            Err(root_error) => {
+                let error_kind = if format!("{root_error:#}").contains("TIMEOUT") {
+                    "timeout"
+                } else {
+                    "protocol"
+                };
+                crate::diagnostics::record(&format!(
+                    "icloud root discovery failed; fallback=well-known error_kind={error_kind}"
+                ));
+            }
+        }
+    }
     let well_known = base
         .join("/.well-known/caldav")
         .context("building .well-known/caldav URL")?;
-    eprintln!("retaskable: discovery step 1 -- PROPFIND {well_known}");
-    let s1 = dav_request(&client, b"PROPFIND", &well_known, PRINCIPAL_BODY, "0", auth)
+    discover_from(&client, cfg, &well_known, auth).await
+}
+
+async fn discover_from(
+    client: &Client,
+    cfg: &NextcloudConfig,
+    start: &Url,
+    auth: (&str, &str),
+) -> Result<Vec<Calendar>> {
+    eprintln!(
+        "retaskable: discovery step 1 -- PROPFIND {}",
+        endpoint_label(start)
+    );
+    crate::diagnostics::record(&format!(
+        "discovery phase=current-user-principal endpoint={}",
+        endpoint_label(start)
+    ));
+    let s1 = dav_request(client, b"PROPFIND", start, PRINCIPAL_BODY, "0", auth)
         .await
-        .context("step 1: PROPFIND .well-known/caldav for current-user-principal")?;
+        .context("step 1: PROPFIND for current-user-principal")?;
     let principal_href = parse_href_property(&s1.body, "current-user-principal")
         .context("parsing current-user-principal from step 1")?;
     let principal_url = s1
         .final_url
         .join(&principal_href)
         .context("resolving principal href")?;
-    eprintln!("retaskable: principal = {principal_url}");
+    validate_discovered_url(cfg, &s1.final_url, &principal_url)?;
+    eprintln!(
+        "retaskable: principal endpoint = {}",
+        endpoint_label(&principal_url)
+    );
 
-    let s2 = dav_request(&client, b"PROPFIND", &principal_url, HOME_SET_BODY, "0", auth)
-        .await
-        .context("step 2: PROPFIND principal for calendar-home-set")?;
+    crate::diagnostics::record(&format!(
+        "discovery phase=calendar-home-set endpoint={}",
+        endpoint_label(&principal_url)
+    ));
+    let s2 = dav_request(
+        client,
+        b"PROPFIND",
+        &principal_url,
+        HOME_SET_BODY,
+        "0",
+        auth,
+    )
+    .await
+    .context("step 2: PROPFIND principal for calendar-home-set")?;
     let home_href = parse_href_property(&s2.body, "calendar-home-set")
         .context("parsing calendar-home-set from step 2")?;
     let home_url = s2
         .final_url
         .join(&home_href)
         .context("resolving calendar-home-set href")?;
-    eprintln!("retaskable: calendar-home = {home_url}");
+    validate_discovered_url(cfg, &s2.final_url, &home_url)?;
+    eprintln!(
+        "retaskable: calendar-home endpoint = {}",
+        endpoint_label(&home_url)
+    );
 
-    let s3 = dav_request(&client, b"PROPFIND", &home_url, CALENDAR_LIST_BODY, "1", auth)
-        .await
-        .context("step 3: PROPFIND calendar-home Depth:1")?;
-    let calendars = parse_calendars(&s3.body, &s3.final_url)
-        .context("parsing calendar list from step 3")?;
+    crate::diagnostics::record(&format!(
+        "discovery phase=list-collections endpoint={}",
+        endpoint_label(&home_url)
+    ));
+    let s3 = dav_request(
+        client,
+        b"PROPFIND",
+        &home_url,
+        CALENDAR_LIST_BODY,
+        "1",
+        auth,
+    )
+    .await
+    .context("step 3: PROPFIND calendar-home Depth:1")?;
+    let calendars =
+        parse_calendars(&s3.body, &s3.final_url).context("parsing calendar list from step 3")?;
     eprintln!(
         "retaskable: discovered {} VTODO-capable calendar(s)",
         calendars.len()
     );
+    if calendars.is_empty() {
+        bail!("DAV-NO-VTODO: the account exposed no VTODO-capable task lists");
+    }
 
     Ok(calendars)
+}
+
+fn validate_discovered_url(cfg: &NextcloudConfig, from: &Url, target: &Url) -> Result<()> {
+    if from.scheme() == "https" && target.scheme() != "https" {
+        bail!("DAV-UNSAFE-REDIRECT: discovered URL attempted an HTTPS downgrade");
+    }
+    if same_origin(from, target) {
+        return Ok(());
+    }
+    if cfg.provider == "icloud" && target.host_str().is_some_and(is_icloud_caldav_host) {
+        return Ok(());
+    }
+    bail!(
+        "DAV-UNSAFE-REDIRECT: discovered unrelated endpoint {}",
+        endpoint_label(target)
+    )
 }
 
 // M6 write-path types. Most callers go through the `*_with_retry` wrappers
@@ -944,7 +1120,10 @@ pub fn due_property_line(token: &str) -> Option<String> {
     if t.len() == 15 && t.as_bytes()[8] == b'T' && all_digits(&t[..8]) && all_digits(&t[9..]) {
         return Some(format!("DUE:{t}"));
     }
-    eprintln!("retaskable: ignoring malformed due token ({} chars)", t.len());
+    eprintln!(
+        "retaskable: ignoring malformed due token ({} chars)",
+        t.len()
+    );
     None
 }
 
@@ -998,7 +1177,9 @@ pub fn set_due(ical_text: &str, token: &str) -> String {
 /// Strategy: collapse CRLF pairs to LF first, then convert any orphan CRs
 /// to LF, then expand all LFs to CRLF. Idempotent on already-CRLF input.
 pub fn ensure_crlf(s: &str) -> String {
-    s.replace("\r\n", "\n").replace('\r', "\n").replace('\n', "\r\n")
+    s.replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .replace('\n', "\r\n")
 }
 
 /// Escape a text value for inclusion in an iCalendar property (RFC 5545
@@ -1117,10 +1298,7 @@ fn parse_vtodos(ical_text: &str) -> Result<Vec<Task>> {
         let CalendarComponent::Todo(todo) = component else {
             continue;
         };
-        let uid = todo
-            .property_value("UID")
-            .unwrap_or("")
-            .to_string();
+        let uid = todo.property_value("UID").unwrap_or("").to_string();
         let summary = todo
             .property_value("SUMMARY")
             .unwrap_or("(no summary)")
@@ -1130,7 +1308,12 @@ fn parse_vtodos(ical_text: &str) -> Result<Vec<Task>> {
             .map(parse_status)
             .unwrap_or(TaskStatus::Unknown);
         let due = todo.property_value("DUE").map(|s| s.to_string());
-        out.push(Task { uid, summary, status, due });
+        out.push(Task {
+            uid,
+            summary,
+            status,
+            due,
+        });
     }
     Ok(out)
 }
@@ -1286,7 +1469,10 @@ fn parse_href_property(xml: &str, property_local_name: &str) -> Result<String> {
             let Some(prop) = propstat.children().find(|n| n.has_tag_name("prop")) else {
                 continue;
             };
-            let Some(target) = prop.children().find(|n| n.has_tag_name(property_local_name)) else {
+            let Some(target) = prop
+                .children()
+                .find(|n| n.has_tag_name(property_local_name))
+            else {
                 continue;
             };
             if let Some(href) = target.descendants().find(|n| n.has_tag_name("href")) {
@@ -1372,9 +1558,9 @@ fn propstat_is_ok(propstat: &roxmltree::Node) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        due_property_line, ensure_crlf, escape_ical_text, extract_source_doc,
-        extract_source_label, extract_source_page, filter_for_display, format_tasks_json,
-        get_task, parse_sync_response, replace_summary, set_due, discover_calendars,
+        discover_calendars, due_property_line, ensure_crlf, escape_ical_text, extract_source_doc,
+        extract_source_label, extract_source_page, filter_for_display, format_tasks_json, get_task,
+        is_icloud_caldav_host, parse_sync_response, redirect_allowed, replace_summary, set_due,
         sync_collection_unsupported, unescape_ical_text,
     };
     use crate::config::NextcloudConfig;
@@ -1412,7 +1598,14 @@ mod tests {
 
     #[test]
     fn due_property_line_rejects_malformed() {
-        for bad in ["2026062", "202606222", "2026-06-22", "20260622T1400", "20260622Z140000", "notadate"] {
+        for bad in [
+            "2026062",
+            "202606222",
+            "2026-06-22",
+            "20260622T1400",
+            "20260622Z140000",
+            "notadate",
+        ] {
             assert_eq!(due_property_line(bad), None, "expected None for {bad:?}");
         }
     }
@@ -1493,19 +1686,42 @@ mod tests {
             END:VTODO\r\n\
             END:VCALENDAR\r\n";
         let out = replace_summary(input, "New summary");
-        assert!(out.contains("SUMMARY:New summary\r\n"), "SUMMARY not replaced:\n{out}");
-        assert!(!out.contains("SUMMARY:Old summary"), "Old SUMMARY still present:\n{out}");
-        assert!(out.contains("STATUS:NEEDS-ACTION\r\n"), "STATUS dropped:\n{out}");
-        assert!(out.contains("X-CUSTOM-PROP:keep-me\r\n"), "X-property dropped:\n{out}");
-        assert!(out.contains("BEGIN:VALARM\r\n"), "VALARM begin dropped:\n{out}");
-        assert!(out.contains("ACTION:DISPLAY\r\n"), "VALARM body dropped:\n{out}");
+        assert!(
+            out.contains("SUMMARY:New summary\r\n"),
+            "SUMMARY not replaced:\n{out}"
+        );
+        assert!(
+            !out.contains("SUMMARY:Old summary"),
+            "Old SUMMARY still present:\n{out}"
+        );
+        assert!(
+            out.contains("STATUS:NEEDS-ACTION\r\n"),
+            "STATUS dropped:\n{out}"
+        );
+        assert!(
+            out.contains("X-CUSTOM-PROP:keep-me\r\n"),
+            "X-property dropped:\n{out}"
+        );
+        assert!(
+            out.contains("BEGIN:VALARM\r\n"),
+            "VALARM begin dropped:\n{out}"
+        );
+        assert!(
+            out.contains("ACTION:DISPLAY\r\n"),
+            "VALARM body dropped:\n{out}"
+        );
         assert!(out.contains("END:VALARM\r\n"), "VALARM end dropped:\n{out}");
         // LAST-MODIFIED should be present (we inject it).
-        assert!(out.contains("LAST-MODIFIED:"), "LAST-MODIFIED not added:\n{out}");
+        assert!(
+            out.contains("LAST-MODIFIED:"),
+            "LAST-MODIFIED not added:\n{out}"
+        );
         // DTSTAMP should be updated (different from the input's 20260101 value).
-        assert!(!out.contains("DTSTAMP:20260101T000000Z"), "DTSTAMP not bumped:\n{out}");
+        assert!(
+            !out.contains("DTSTAMP:20260101T000000Z"),
+            "DTSTAMP not bumped:\n{out}"
+        );
     }
-
 
     #[test]
     fn escape_ical_text_handles_all_specials() {
@@ -1518,7 +1734,6 @@ mod tests {
         // backslashes we introduce for , ; and \n.
         assert_eq!(escape_ical_text("a, b; c\nd\\e"), "a\\, b\\; c\\nd\\\\e");
     }
-
 
     #[test]
     fn ensure_crlf_handles_lf_only_input() {
@@ -1586,7 +1801,9 @@ mod tests {
         let _mock = server
             .mock_async(|when, then| {
                 when.method(GET).path("/cal/t.ics");
-                then.status(200).header("ETag", "\"etag-fresh\"").body(lf_body);
+                then.status(200)
+                    .header("ETag", "\"etag-fresh\"")
+                    .body(lf_body);
             })
             .await;
         let url: url::Url = format!("{}/cal/t.ics", server.base_url()).parse().unwrap();
@@ -1609,7 +1826,9 @@ mod tests {
                 then.status(404);
             })
             .await;
-        let url: url::Url = format!("{}/cal/gone.ics", server.base_url()).parse().unwrap();
+        let url: url::Url = format!("{}/cal/gone.ics", server.base_url())
+            .parse()
+            .unwrap();
         let client = reqwest::Client::new();
         let got = get_task(&client, &url, ("u", "p"))
             .await
@@ -1627,7 +1846,9 @@ mod tests {
                 then.status(410);
             })
             .await;
-        let url: url::Url = format!("{}/cal/gone.ics", server.base_url()).parse().unwrap();
+        let url: url::Url = format!("{}/cal/gone.ics", server.base_url())
+            .parse()
+            .unwrap();
         let client = reqwest::Client::new();
         let got = get_task(&client, &url, ("u", "p"))
             .await
@@ -1671,7 +1892,12 @@ mod tests {
             String::from_utf8(bytes).expect("request is utf-8")
         }
 
-        async fn write_response(stream: &mut tokio::net::TcpStream, status: &str, headers: &[(&str, &str)], body: &str) {
+        async fn write_response(
+            stream: &mut tokio::net::TcpStream,
+            status: &str,
+            headers: &[(&str, &str)],
+            body: &str,
+        ) {
             let mut response = format!(
                 "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n",
                 body.len()
@@ -1684,7 +1910,10 @@ mod tests {
             }
             response.push_str("\r\n");
             response.push_str(body);
-            stream.write_all(response.as_bytes()).await.expect("write response");
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
         }
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1701,7 +1930,13 @@ mod tests {
                 server_requests.lock().unwrap().push(request);
                 match step {
                     0 => {
-                        write_response(&mut stream, "302 Found", &[("Location", "/remote.php/dav")], "").await;
+                        write_response(
+                            &mut stream,
+                            "302 Found",
+                            &[("Location", "/remote.php/dav")],
+                            "",
+                        )
+                        .await;
                     }
                     1 => {
                         write_response(
@@ -1778,16 +2013,21 @@ mod tests {
 
         let auth = "Basic dTpw";
         let cfg = NextcloudConfig {
+            provider: "generic".to_string(),
             base_url: base_url.clone(),
             username: "u".to_string(),
             app_password: "p".to_string(),
+            calendar_href: None,
             calendar: None,
         };
         let got = discover_calendars(&cfg).await.expect("discovery succeeds");
 
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].display_name, "Tasks");
-        assert_eq!(got[0].href, format!("{base_url}/remote.php/dav/calendars/u/tasks/"));
+        assert_eq!(
+            got[0].href,
+            format!("{base_url}/remote.php/dav/calendars/u/tasks/")
+        );
         server.await.expect("server completes");
 
         let requests = requests.lock().unwrap();
@@ -1798,9 +2038,10 @@ mod tests {
         assert!(requests[3].starts_with("PROPFIND /remote.php/dav/calendars/u/ "));
         for request in requests.iter().skip(1) {
             assert!(
-                request
-                    .to_ascii_lowercase()
-                    .contains(&format!("\r\nauthorization: {}\r\n", auth.to_ascii_lowercase())),
+                request.to_ascii_lowercase().contains(&format!(
+                    "\r\nauthorization: {}\r\n",
+                    auth.to_ascii_lowercase()
+                )),
                 "{request}"
             );
         }
@@ -1878,7 +2119,14 @@ mod tests {
 
     #[test]
     fn format_tasks_json_empty_renders_empty_envelope() {
-        let out = format_tasks_json(&[], &HashMap::new(), &HashMap::new(), &HashMap::new(), None, 0);
+        let out = format_tasks_json(
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            None,
+            0,
+        );
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["last_synced"], serde_json::Value::Null);
         assert_eq!(v["tasks"].as_array().unwrap().len(), 0);
@@ -1903,7 +2151,14 @@ mod tests {
         ];
         let mut marks = HashMap::new();
         marks.insert("uid-A".to_string(), false); // queued -> "*"
-        let out = format_tasks_json(&tasks, &marks, &HashMap::new(), &HashMap::new(), Some("Last synced 5 minutes ago."), 0);
+        let out = format_tasks_json(
+            &tasks,
+            &marks,
+            &HashMap::new(),
+            &HashMap::new(),
+            Some("Last synced 5 minutes ago."),
+            0,
+        );
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["last_synced"], "Last synced 5 minutes ago.");
         let arr = v["tasks"].as_array().unwrap();
@@ -2038,8 +2293,12 @@ mod tests {
                    400 Bad Request: caldav: unsupported REPORT root \"DAV:\" \"sync-collection\"";
         assert!(sync_collection_unsupported(msg));
         // Unrelated failures must NOT trigger the calendar-query fallback.
-        assert!(!sync_collection_unsupported("PUT failed -> 412 Precondition Failed"));
-        assert!(!sync_collection_unsupported("network error: connection refused"));
+        assert!(!sync_collection_unsupported(
+            "PUT failed -> 412 Precondition Failed"
+        ));
+        assert!(!sync_collection_unsupported(
+            "network error: connection refused"
+        ));
     }
 
     #[test]
@@ -2061,5 +2320,24 @@ mod tests {
         assert_eq!(delta.added_or_updated.len(), 1);
         assert_eq!(delta.added_or_updated[0].task.summary, "Buy milk");
         assert_eq!(delta.added_or_updated[0].etag, "\"e1\"");
+    }
+
+    #[test]
+    fn icloud_host_scope_accepts_only_known_caldav_hosts() {
+        assert!(is_icloud_caldav_host("caldav.icloud.com"));
+        assert!(is_icloud_caldav_host("p12-caldav.icloud.com"));
+        assert!(!is_icloud_caldav_host("evil.icloud.com"));
+        assert!(!is_icloud_caldav_host("p12-caldav.icloud.com.example.org"));
+    }
+
+    #[test]
+    fn redirect_policy_rejects_downgrade_and_unrelated_origin() {
+        let origin = url::Url::parse("https://caldav.icloud.com/").unwrap();
+        let shard = url::Url::parse("https://p12-caldav.icloud.com/123/").unwrap();
+        let evil = url::Url::parse("https://example.org/steal").unwrap();
+        let downgrade = url::Url::parse("http://caldav.icloud.com/").unwrap();
+        assert!(redirect_allowed(&origin, &shard));
+        assert!(!redirect_allowed(&origin, &evil));
+        assert!(!redirect_allowed(&origin, &downgrade));
     }
 }

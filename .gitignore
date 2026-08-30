@@ -3,3 +3,5 @@ app/output-rmpp/
 app/backend/target/
 sdk/
 .claude/
+AGENTS.md
+CLAUDE.md

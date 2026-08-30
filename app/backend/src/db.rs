@@ -34,14 +34,17 @@ pub struct PendingOp {
 pub struct PendingOpView {
     pub id: i64,
     pub op_type: String,
-    pub summary: String,           // COALESCE'd; "(unknown)" if no cache row
+    pub summary: String, // COALESCE'd; "(unknown)" if no cache row
     pub enqueued_at: i64,
     pub error_count: i64,
     pub last_error: Option<String>,
     pub errored: i64,
 }
 
-const SCHEMA_V2: &str = "
+pub const LOCAL_LIST_ID: &str = "local://default";
+pub const LOCAL_LIST_NAME: &str = "On This reMarkable";
+
+const SCHEMA_V3: &str = "
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -50,6 +53,7 @@ CREATE TABLE IF NOT EXISTS meta (
 CREATE TABLE IF NOT EXISTS calendar (
     href TEXT PRIMARY KEY,
     display_name TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'caldav',
     sync_token TEXT,
     last_synced_at INTEGER
 );
@@ -85,7 +89,7 @@ CREATE TABLE IF NOT EXISTS pending_op (
 CREATE INDEX IF NOT EXISTS idx_pending_op_drain ON pending_op(errored, id);
 ";
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 pub fn path() -> Result<PathBuf> {
     let base = dirs::data_dir().context("could not resolve user data dir")?;
@@ -114,10 +118,11 @@ pub fn open() -> Result<Connection> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating db dir {}", parent.display()))?;
     }
-    let conn = Connection::open(&p)
-        .with_context(|| format!("opening sqlite at {}", p.display()))?;
+    let conn =
+        Connection::open(&p).with_context(|| format!("opening sqlite at {}", p.display()))?;
     configure_connection(&conn)?;
-    ensure_schema_v2(&conn)?;
+    ensure_schema(&conn)?;
+    ensure_local_list(&conn)?;
 
     // Ensure the intake spool dir exists so the M14 xochitl capture hook's
     // `file://` PUT always has a target (XMLHttpRequest PUT does not mkdir).
@@ -148,13 +153,24 @@ fn configure_connection(conn: &Connection) -> Result<()> {
 
 /// Apply the v2 migration to an already-opened connection. Used by both
 /// `open()` and the test module.
-pub fn ensure_schema_v2(conn: &Connection) -> Result<()> {
+pub fn ensure_schema(conn: &Connection) -> Result<()> {
     let current = read_schema_version(conn)?;
-    if current < SCHEMA_VERSION {
-        migrate_to_v2(conn)
+    if current <= 1 {
+        migrate_fresh_or_legacy_to_v3(conn)
             .with_context(|| format!("migrating db from v{current} to v{SCHEMA_VERSION}"))?;
+    } else if current == 2 {
+        migrate_v2_to_v3(conn).context("migrating db from v2 to v3")?;
+    } else if current != SCHEMA_VERSION {
+        anyhow::bail!(
+            "unsupported database schema v{current}; this build supports v{SCHEMA_VERSION}"
+        );
     }
     Ok(())
+}
+
+/// Compatibility name retained for older tests and downstream callers.
+pub fn ensure_schema_v2(conn: &Connection) -> Result<()> {
+    ensure_schema(conn)
 }
 
 fn read_schema_version(conn: &Connection) -> Result<i64> {
@@ -180,9 +196,10 @@ fn read_schema_version(conn: &Connection) -> Result<i64> {
     Ok(v.and_then(|s| s.parse::<i64>().ok()).unwrap_or(0))
 }
 
-fn migrate_to_v2(conn: &Connection) -> Result<()> {
-    // Drop every table that may exist from any prior version. Using IF EXISTS
-    // makes this idempotent regardless of which subset was present.
+fn migrate_fresh_or_legacy_to_v3(conn: &Connection) -> Result<()> {
+    // v1 never contained a durable offline queue and was previously treated as
+    // disposable cache. Preserve the historical behavior only for v0/v1;
+    // v2 and later use non-destructive migrations below.
     conn.execute_batch(
         "DROP INDEX IF EXISTS idx_task_cal;
          DROP INDEX IF EXISTS idx_task_uid;
@@ -193,22 +210,109 @@ fn migrate_to_v2(conn: &Connection) -> Result<()> {
          DROP TABLE IF EXISTS meta;",
     )
     .context("dropping pre-v2 tables")?;
-    conn.execute_batch(SCHEMA_V2).context("applying v2 schema")?;
+    conn.execute_batch(SCHEMA_V3)
+        .context("applying v3 schema")?;
     conn.execute(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)",
         params![SCHEMA_VERSION.to_string()],
     )
-    .context("writing schema_version=2")?;
+    .context("writing schema_version=3")?;
+    Ok(())
+}
+
+fn migrate_v2_to_v3(conn: &Connection) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "ALTER TABLE calendar ADD COLUMN kind TEXT NOT NULL DEFAULT 'caldav'",
+        [],
+    )
+    .context("adding calendar.kind")?;
+    tx.execute(
+        "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
+        params![SCHEMA_VERSION.to_string()],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn ensure_local_list(conn: &Connection) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "INSERT INTO calendar (href, display_name, kind)
+         VALUES (?1, ?2, 'local')
+         ON CONFLICT(href) DO UPDATE SET
+            display_name = excluded.display_name,
+            kind = 'local'",
+        params![LOCAL_LIST_ID, LOCAL_LIST_NAME],
+    )?;
+    // Local mutations reuse the well-tested iCalendar mutation path, which
+    // briefly creates an outbox row before immediately finalizing it. If power
+    // is lost in that tiny interval, finish the local mutation here before any
+    // sync can see the outbox. Local operations must never reach CalDAV.
+    tx.execute(
+        "DELETE FROM task
+          WHERE calendar_href = ?1 AND pending_delete = 1",
+        params![LOCAL_LIST_ID],
+    )?;
+    tx.execute(
+        "UPDATE task
+            SET href = 'local:' || uid
+          WHERE calendar_href = ?1 AND href LIKE 'pending:%'",
+        params![LOCAL_LIST_ID],
+    )?;
+    tx.execute(
+        "DELETE FROM pending_op WHERE target_calendar_href = ?1",
+        params![LOCAL_LIST_ID],
+    )?;
+    tx.commit()?;
     Ok(())
 }
 
 pub fn upsert_calendar(conn: &Connection, href: &str, display_name: &str) -> Result<()> {
     conn.execute(
-        "INSERT INTO calendar (href, display_name) VALUES (?1, ?2)
-         ON CONFLICT(href) DO UPDATE SET display_name = excluded.display_name",
+        "INSERT INTO calendar (href, display_name, kind) VALUES (?1, ?2, 'caldav')
+         ON CONFLICT(href) DO UPDATE SET
+            display_name = excluded.display_name,
+            kind = CASE WHEN calendar.kind = 'local' THEN 'local' ELSE 'caldav' END",
         params![href, display_name],
     )?;
     Ok(())
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TaskList {
+    pub id: String,
+    pub display_name: String,
+    pub kind: String,
+}
+
+pub fn list_calendars(conn: &Connection) -> Result<Vec<TaskList>> {
+    let mut stmt = conn.prepare(
+        "SELECT href, display_name, kind
+           FROM calendar
+          ORDER BY CASE kind WHEN 'local' THEN 0 ELSE 1 END, display_name, href",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(TaskList {
+            id: row.get(0)?,
+            display_name: row.get(1)?,
+            kind: row.get(2)?,
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+pub fn calendar_exists(conn: &Connection, href: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM calendar WHERE href = ?1)",
+        params![href],
+        |row| row.get(0),
+    )?)
+}
+
+pub fn is_local_list(href: &str) -> bool {
+    href == LOCAL_LIST_ID
 }
 
 pub fn get_sync_token(conn: &Connection, href: &str) -> Result<Option<String>> {
@@ -275,10 +379,7 @@ pub fn last_synced(conn: &Connection, href: &str) -> Result<Option<SystemTime>> 
     Ok(secs.map(|s| UNIX_EPOCH + Duration::from_secs(s as u64)))
 }
 
-pub fn get_calendar_href_by_display_name(
-    conn: &Connection,
-    name: &str,
-) -> Result<Option<String>> {
+pub fn get_calendar_href_by_display_name(conn: &Connection, name: &str) -> Result<Option<String>> {
     Ok(conn
         .query_row(
             "SELECT href FROM calendar WHERE display_name = ?1",
@@ -405,9 +506,7 @@ pub fn enqueue_create_with_anchor(
     anchor: Option<&Anchor>,
     due: Option<&str>,
 ) -> Result<i64> {
-    let now_iso = Utc::now()
-        .format("%Y%m%dT%H%M%SZ")
-        .to_string();
+    let now_iso = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
     let escaped = crate::nextcloud::escape_ical_text(summary);
     // M16: an optional DUE line, rendered from the normalized due token. None /
     // empty / malformed → no DUE line (and the cache `due` column stays NULL).
@@ -475,11 +574,7 @@ pub fn enqueue_create_with_anchor(
     Ok(op_id)
 }
 
-pub fn enqueue_toggle(
-    conn: &mut Connection,
-    calendar_href: &str,
-    uid: &str,
-) -> Result<i64> {
+pub fn enqueue_toggle(conn: &mut Connection, calendar_href: &str, uid: &str) -> Result<i64> {
     let tx = conn.unchecked_transaction()?;
 
     // Fetch the cached row's ical_text by (calendar_href, uid).
@@ -491,13 +586,11 @@ pub fn enqueue_toggle(
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
-    let (href, ical_text) = row
-        .ok_or_else(|| anyhow::anyhow!("no live task with uid {uid}"))?;
+    let (href, ical_text) = row.ok_or_else(|| anyhow::anyhow!("no live task with uid {uid}"))?;
 
     // Mutate via the existing M5 helper. toggle_completion returns
     // (new_ical, prior_status, new_status).
-    let (new_ical, _prior, new_status) =
-        crate::nextcloud::toggle_completion(&ical_text)?;
+    let (new_ical, _prior, new_status) = crate::nextcloud::toggle_completion(&ical_text)?;
     let new_status_str = status_to_str(new_status);
 
     let affected = tx.execute(
@@ -539,8 +632,8 @@ pub fn enqueue_edit(
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?;
-    let (href, ical_text, existing_due) = row
-        .ok_or_else(|| anyhow::anyhow!("no live task with uid {uid}"))?;
+    let (href, ical_text, existing_due) =
+        row.ok_or_else(|| anyhow::anyhow!("no live task with uid {uid}"))?;
 
     let summarised = crate::nextcloud::replace_summary(&ical_text, new_summary);
     // M16: `due = Some(token)` sets/clears DUE (empty or malformed token clears);
@@ -549,8 +642,8 @@ pub fn enqueue_edit(
     let (new_ical, final_due): (String, Option<String>) = match due {
         Some(token) => {
             // Cache the token only when it validates, so cache == what set_due wrote.
-            let cache_due = crate::nextcloud::due_property_line(token.trim())
-                .map(|_| token.trim().to_string());
+            let cache_due =
+                crate::nextcloud::due_property_line(token.trim()).map(|_| token.trim().to_string());
             (crate::nextcloud::set_due(&summarised, token), cache_due)
         }
         None => (summarised, existing_due),
@@ -586,11 +679,7 @@ pub fn enqueue_edit(
     Ok(op_id)
 }
 
-pub fn enqueue_delete(
-    conn: &mut Connection,
-    calendar_href: &str,
-    uid: &str,
-) -> Result<i64> {
+pub fn enqueue_delete(conn: &mut Connection, calendar_href: &str, uid: &str) -> Result<i64> {
     let tx = conn.unchecked_transaction()?;
 
     let affected = tx.execute(
@@ -613,6 +702,155 @@ pub fn enqueue_delete(
     let op_id = tx.last_insert_rowid();
     tx.commit()?;
     Ok(op_id)
+}
+
+/// Local-list variants reuse the same iCalendar mutation code as CalDAV tasks
+/// but finalize the optimistic cache mutation immediately instead of leaving an
+/// outbox row. This keeps the on-device representation wire-compatible for a
+/// later explicit Copy/Move.
+pub fn create_local_with_anchor(
+    conn: &mut Connection,
+    uid: &str,
+    summary: &str,
+    anchor: Option<&Anchor>,
+    due: Option<&str>,
+) -> Result<()> {
+    let op_id = enqueue_create_with_anchor(conn, LOCAL_LIST_ID, uid, summary, anchor, due)?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "UPDATE task SET href = ?1 WHERE calendar_href = ?2 AND uid = ?3",
+        params![format!("local:{uid}"), LOCAL_LIST_ID, uid],
+    )?;
+    tx.execute("DELETE FROM pending_op WHERE id = ?1", params![op_id])?;
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn toggle_local(conn: &mut Connection, uid: &str) -> Result<()> {
+    let op_id = enqueue_toggle(conn, LOCAL_LIST_ID, uid)?;
+    delete_pending_op(conn, op_id)
+}
+
+pub fn edit_local(
+    conn: &mut Connection,
+    uid: &str,
+    summary: &str,
+    due: Option<&str>,
+) -> Result<()> {
+    let op_id = enqueue_edit(conn, LOCAL_LIST_ID, uid, summary, due)?;
+    delete_pending_op(conn, op_id)
+}
+
+pub fn delete_local(conn: &mut Connection, uid: &str) -> Result<()> {
+    let op_id = enqueue_delete(conn, LOCAL_LIST_ID, uid)?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "DELETE FROM task WHERE calendar_href = ?1 AND uid = ?2",
+        params![LOCAL_LIST_ID, uid],
+    )?;
+    tx.execute("DELETE FROM pending_op WHERE id = ?1", params![op_id])?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Queue an exact-body copy from the local list into a CalDAV list. A move is
+/// represented in the create payload and finalized transactionally only after
+/// the server confirms the destination resource.
+pub fn transfer_local_to_remote(
+    conn: &mut Connection,
+    uid: &str,
+    destination_href: &str,
+    move_source: bool,
+) -> Result<i64> {
+    if is_local_list(destination_href) {
+        anyhow::bail!("destination must be a synced list");
+    }
+    let source = get_cached_task_by_uid(conn, LOCAL_LIST_ID, uid)?
+        .ok_or_else(|| anyhow::anyhow!("no local task with uid {uid}"))?;
+    let payload = serde_json::to_string(&serde_json::json!({
+        "summary": source.summary,
+        "ical": source.ical_text,
+        "move_source": if move_source { Some(LOCAL_LIST_ID) } else { None::<&str> },
+    }))?;
+    let sentinel_href = format!("pending:{uid}");
+    let due: Option<String> = conn
+        .query_row(
+            "SELECT due FROM task WHERE calendar_href = ?1 AND uid = ?2",
+            params![LOCAL_LIST_ID, uid],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    let tx = conn.unchecked_transaction()?;
+    let existing_create: Option<(i64, Option<String>)> = tx
+        .query_row(
+            "SELECT id, payload FROM pending_op
+              WHERE op_type = 'create'
+                AND target_uid = ?1
+                AND target_calendar_href = ?2
+              ORDER BY id ASC
+              LIMIT 1",
+            params![uid, destination_href],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if let Some((id, existing_payload)) = existing_create {
+        let is_transfer = existing_payload
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .is_some_and(|value| value.get("move_source").is_some());
+        if !is_transfer {
+            anyhow::bail!("destination already has a pending create for uid {uid}");
+        }
+
+        let affected = tx.execute(
+            "UPDATE task
+                SET ical_text = ?1, summary = ?2, status = ?3, due = ?4
+              WHERE calendar_href = ?5 AND href = ?6 AND uid = ?7",
+            params![
+                source.ical_text,
+                source.summary,
+                source.status,
+                due,
+                destination_href,
+                sentinel_href,
+                uid
+            ],
+        )?;
+        if affected == 0 {
+            anyhow::bail!("queued transfer cache row missing for uid {uid}");
+        }
+        tx.execute(
+            "UPDATE pending_op SET payload = ?1 WHERE id = ?2",
+            params![payload, id],
+        )?;
+        tx.commit()?;
+        return Ok(id);
+    }
+
+    tx.execute(
+        "INSERT INTO task
+            (calendar_href, href, etag, ical_text, summary, status, due, uid, pending_delete)
+         VALUES (?1, ?2, '', ?3, ?4, ?5, ?6, ?7, 0)",
+        params![
+            destination_href,
+            sentinel_href,
+            source.ical_text,
+            source.summary,
+            source.status,
+            due,
+            uid
+        ],
+    )?;
+    tx.execute(
+        "INSERT INTO pending_op
+            (op_type, target_uid, target_calendar_href, payload, enqueued_at)
+         VALUES ('create', ?1, ?2, ?3, ?4)",
+        params![uid, destination_href, payload, unix_secs_now()],
+    )?;
+    let id = tx.last_insert_rowid();
+    tx.commit()?;
+    Ok(id)
 }
 
 /// Return the lowest-id pending_op row that is not errored. `Ok(None)` means
@@ -668,11 +906,7 @@ pub fn mark_op_errored(conn: &Connection, id: i64, msg: &str) -> Result<()> {
 ///
 /// `blocking_op_type` is the op_type of the op that just failed; it's used
 /// to format the cascaded `last_error` message.
-pub fn cascade_uid(
-    conn: &Connection,
-    target_uid: &str,
-    blocking_op_type: &str,
-) -> Result<usize> {
+pub fn cascade_uid(conn: &Connection, target_uid: &str, blocking_op_type: &str) -> Result<usize> {
     let msg = format!("blocked by failed {blocking_op_type}");
     let affected = conn.execute(
         "UPDATE pending_op
@@ -686,11 +920,7 @@ pub fn cascade_uid(
 /// Increment a pending_op row's error_count and stamp last_error. Returns
 /// the post-increment value so the caller can detect the 5-strike threshold.
 /// Takes a `&Transaction` so it composes with apply_outcome's tx.
-pub fn bump_error_count_tx(
-    tx: &rusqlite::Transaction,
-    id: i64,
-    msg: &str,
-) -> Result<i64> {
+pub fn bump_error_count_tx(tx: &rusqlite::Transaction, id: i64, msg: &str) -> Result<i64> {
     tx.execute(
         "UPDATE pending_op SET error_count = error_count + 1, last_error = ?1 \
          WHERE id = ?2",
@@ -704,10 +934,7 @@ pub fn bump_error_count_tx(
     Ok(count)
 }
 
-pub fn get_first_task(
-    conn: &Connection,
-    calendar_href: &str,
-) -> Result<Option<CachedTask>> {
+pub fn get_first_task(conn: &Connection, calendar_href: &str) -> Result<Option<CachedTask>> {
     // Match nextcloud::format_tasks_marked's display sort: incomplete first, then
     // undated last, then by due ascending, then href as tiebreak. Keeps
     // "First" buttons (Toggle / Delete / Edit) in sync with what the user
@@ -893,9 +1120,17 @@ pub fn get_cached_task_by_uid(
 /// `sync_token` + `last_synced_at`); leaves `meta` (schema version) intact.
 pub fn reset_cache(conn: &Connection) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
-    tx.execute("DELETE FROM task", [])?;
+    // Local operations never belong in the outbox. Delete every outbox row so
+    // this also repairs an interrupted local mutation from an older build.
     tx.execute("DELETE FROM pending_op", [])?;
-    tx.execute("DELETE FROM calendar", [])?;
+    tx.execute(
+        "DELETE FROM task WHERE calendar_href <> ?1",
+        params![LOCAL_LIST_ID],
+    )?;
+    tx.execute(
+        "DELETE FROM calendar WHERE href <> ?1",
+        params![LOCAL_LIST_ID],
+    )?;
     tx.commit()?;
     Ok(())
 }
@@ -924,7 +1159,8 @@ pub fn list_pending_ops(conn: &Connection) -> Result<Vec<PendingOpView>> {
             errored: r.get(6)?,
         })
     })?;
-    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.into())
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| e.into())
 }
 
 /// Per-UID pending-op state for one calendar, used to mark rows in the Show
@@ -1020,9 +1256,7 @@ pub fn clear_errored(conn: &mut Connection) -> Result<usize> {
             "SELECT target_uid, op_type FROM pending_op \
              WHERE errored = 1 AND op_type IN ('delete', 'create')",
         )?;
-        let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        })?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
         for row in rows {
             let (uid, op_type) = row?;
             match op_type.as_str() {
@@ -1137,7 +1371,10 @@ mod tests {
         seed_op(&conn, "cal2", "uid-B", "toggle", 1);
         let marks = pending_marks(&conn, "cal1").unwrap();
         assert_eq!(marks.get("uid-A"), Some(&false));
-        assert!(marks.get("uid-B").is_none(), "other calendar's op must not leak in");
+        assert!(
+            marks.get("uid-B").is_none(),
+            "other calendar's op must not leak in"
+        );
     }
 
     #[test]
@@ -1166,7 +1403,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_from_empty_db_creates_v2_layout() {
+    fn migration_from_empty_db_creates_v3_layout() {
         let conn = fresh();
         ensure_schema_v2(&conn).expect("migrate");
         // meta table populated
@@ -1177,7 +1414,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(version, "2");
+        assert_eq!(version, "3");
         // new task columns exist
         let cols: Vec<String> = conn
             .prepare("PRAGMA table_info(task)")
@@ -1186,11 +1423,22 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
-        assert!(cols.iter().any(|c| c == "uid"), "uid column missing: {cols:?}");
+        assert!(
+            cols.iter().any(|c| c == "uid"),
+            "uid column missing: {cols:?}"
+        );
         assert!(
             cols.iter().any(|c| c == "pending_delete"),
             "pending_delete column missing: {cols:?}"
         );
+        let calendar_cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(calendar)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(calendar_cols.iter().any(|c| c == "kind"));
         // pending_op table exists
         let has_pending_op: bool = conn
             .query_row(
@@ -1269,6 +1517,81 @@ mod tests {
             )
             .unwrap();
         assert!(token.is_none(), "sync_token should be NULL post-migration");
+    }
+
+    #[test]
+    fn migration_from_v2_preserves_cache_and_outbox() {
+        let conn = fresh();
+        conn.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta VALUES ('schema_version', '2');
+             CREATE TABLE calendar (
+                 href TEXT PRIMARY KEY,
+                 display_name TEXT NOT NULL,
+                 sync_token TEXT,
+                 last_synced_at INTEGER
+             );
+             CREATE TABLE task (
+                 calendar_href TEXT NOT NULL,
+                 href TEXT NOT NULL,
+                 etag TEXT NOT NULL,
+                 ical_text TEXT NOT NULL,
+                 summary TEXT,
+                 status TEXT,
+                 due TEXT,
+                 uid TEXT NOT NULL,
+                 pending_delete INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY (calendar_href, href)
+             );
+             CREATE TABLE pending_op (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 op_type TEXT NOT NULL,
+                 target_uid TEXT NOT NULL,
+                 target_calendar_href TEXT NOT NULL,
+                 payload TEXT,
+                 enqueued_at INTEGER NOT NULL,
+                 error_count INTEGER NOT NULL DEFAULT 0,
+                 last_error TEXT,
+                 errored INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO calendar VALUES ('/cal/', 'Tasks', 'tok', 10);
+             INSERT INTO task VALUES (
+                 '/cal/', '/cal/a.ics', 'etag', 'ical', 'Keep', 'needs-action',
+                 NULL, 'uid-a', 0
+             );
+             INSERT INTO pending_op
+                 (op_type, target_uid, target_calendar_href, enqueued_at)
+             VALUES ('toggle', 'uid-a', '/cal/', 11);",
+        )
+        .unwrap();
+        ensure_schema(&conn).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT value FROM meta WHERE key='schema_version'",
+                [],
+                |r| { r.get::<_, String>(0) }
+            )
+            .unwrap(),
+            "3"
+        );
+        assert_eq!(
+            conn.query_row("SELECT kind FROM calendar WHERE href='/cal/'", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap(),
+            "caldav"
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM task", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM pending_op", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
@@ -1423,14 +1746,24 @@ mod tests {
              VALUES ('toggle','u','/c/',NULL,1)",
             [],
         ).unwrap();
-        let meta_before: i64 = conn.query_row("SELECT COUNT(*) FROM meta", [], |r| r.get(0)).unwrap();
+        let meta_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM meta", [], |r| r.get(0))
+            .unwrap();
 
         reset_cache(&conn).expect("reset");
 
-        let tc: i64 = conn.query_row("SELECT COUNT(*) FROM task", [], |r| r.get(0)).unwrap();
-        let pc: i64 = conn.query_row("SELECT COUNT(*) FROM pending_op", [], |r| r.get(0)).unwrap();
-        let cc: i64 = conn.query_row("SELECT COUNT(*) FROM calendar", [], |r| r.get(0)).unwrap();
-        let meta_after: i64 = conn.query_row("SELECT COUNT(*) FROM meta", [], |r| r.get(0)).unwrap();
+        let tc: i64 = conn
+            .query_row("SELECT COUNT(*) FROM task", [], |r| r.get(0))
+            .unwrap();
+        let pc: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pending_op", [], |r| r.get(0))
+            .unwrap();
+        let cc: i64 = conn
+            .query_row("SELECT COUNT(*) FROM calendar", [], |r| r.get(0))
+            .unwrap();
+        let meta_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM meta", [], |r| r.get(0))
+            .unwrap();
         assert_eq!((tc, pc, cc), (0, 0, 0));
         assert_eq!(meta_before, meta_after); // schema version untouched
     }
@@ -1456,14 +1789,20 @@ mod tests {
         let deleted = delete_tasks_not_in(&conn, "/cal/", &HashSet::new()).unwrap();
 
         assert_eq!(deleted, 1);
-        let pending_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM task WHERE href = 'pending:uid-new'",
-            [], |row| row.get(0),
-        ).unwrap();
-        let stale_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM task WHERE href = '/cal/stale.ics'",
-            [], |row| row.get(0),
-        ).unwrap();
+        let pending_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task WHERE href = 'pending:uid-new'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let stale_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task WHERE href = '/cal/stale.ics'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(pending_count, 1);
         assert_eq!(stale_count, 0);
     }
@@ -1482,9 +1821,9 @@ mod tests {
         let deleted = delete_tasks_not_in(&conn, "/cal/", &HashSet::new()).unwrap();
 
         assert_eq!(deleted, 1);
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM task", [], |row| row.get(0),
-        ).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM task", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(count, 0);
     }
 
@@ -1498,19 +1837,34 @@ mod tests {
         )
         .unwrap();
 
-        let op_id = enqueue_create(&mut conn, "/cal/", "uid-new-1", "Buy milk")
-            .expect("enqueue");
+        let op_id = enqueue_create(&mut conn, "/cal/", "uid-new-1", "Buy milk").expect("enqueue");
         assert!(op_id > 0);
 
         // Task row: sentinel href, empty etag, NEEDS-ACTION, pending_delete=0.
         let (href, etag, status, summary, uid, pending_delete): (
-            String, String, String, String, String, i64,
-        ) = conn.query_row(
-            "SELECT href, etag, status, summary, uid, pending_delete \
+            String,
+            String,
+            String,
+            String,
+            String,
+            i64,
+        ) = conn
+            .query_row(
+                "SELECT href, etag, status, summary, uid, pending_delete \
              FROM task WHERE calendar_href = '/cal/' AND uid = 'uid-new-1'",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
-        ).unwrap();
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
         assert_eq!(href, "pending:uid-new-1");
         assert_eq!(etag, "");
         assert_eq!(status, "needs-action");
@@ -1519,11 +1873,13 @@ mod tests {
         assert_eq!(pending_delete, 0);
 
         // ical_text contains the VTODO with the UID and summary.
-        let ical: String = conn.query_row(
-            "SELECT ical_text FROM task WHERE uid = 'uid-new-1'",
-            [],
-            |r| r.get(0),
-        ).unwrap();
+        let ical: String = conn
+            .query_row(
+                "SELECT ical_text FROM task WHERE uid = 'uid-new-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert!(ical.contains("UID:uid-new-1\r\n"));
         assert!(ical.contains("SUMMARY:Buy milk\r\n"));
         assert!(ical.contains("STATUS:NEEDS-ACTION\r\n"));
@@ -1532,13 +1888,29 @@ mod tests {
 
         // pending_op row: op_type=create, target_uid, JSON payload.
         let (op_type, target_uid, target_cal, payload, error_count, errored): (
-            String, String, String, String, i64, i64,
-        ) = conn.query_row(
-            "SELECT op_type, target_uid, target_calendar_href, payload, error_count, errored \
+            String,
+            String,
+            String,
+            String,
+            i64,
+            i64,
+        ) = conn
+            .query_row(
+                "SELECT op_type, target_uid, target_calendar_href, payload, error_count, errored \
              FROM pending_op WHERE id = ?1",
-            params![op_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
-        ).unwrap();
+                params![op_id],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
         assert_eq!(op_type, "create");
         assert_eq!(target_uid, "uid-new-1");
         assert_eq!(target_cal, "/cal/");
@@ -1564,9 +1936,16 @@ mod tests {
         .unwrap();
         enqueue_create(&mut conn, "/cal/", "uid-plain", "Buy milk").unwrap();
         let ical: String = conn
-            .query_row("SELECT ical_text FROM task WHERE uid = 'uid-plain'", [], |r| r.get(0))
+            .query_row(
+                "SELECT ical_text FROM task WHERE uid = 'uid-plain'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
-        assert!(!ical.contains("X-RETASKABLE"), "plain create must carry no anchor:\n{ical}");
+        assert!(
+            !ical.contains("X-RETASKABLE"),
+            "plain create must carry no anchor:\n{ical}"
+        );
         assert!(ical.contains("SUMMARY:Buy milk\r\nSTATUS:NEEDS-ACTION\r\n"));
     }
 
@@ -1584,22 +1963,45 @@ mod tests {
             page_key: "p:0.500000".to_string(),
             label: "Q3 Planning, vol 2 · p.3".to_string(),
         };
-        enqueue_create_with_anchor(&mut conn, "/cal/", "uid-anch", "Email Bob", Some(&anchor), None)
-            .unwrap();
+        enqueue_create_with_anchor(
+            &mut conn,
+            "/cal/",
+            "uid-anch",
+            "Email Bob",
+            Some(&anchor),
+            None,
+        )
+        .unwrap();
         let ical: String = conn
-            .query_row("SELECT ical_text FROM task WHERE uid = 'uid-anch'", [], |r| r.get(0))
+            .query_row(
+                "SELECT ical_text FROM task WHERE uid = 'uid-anch'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
-        assert!(ical.contains("X-RETASKABLE-SOURCE-DOC:e0cef3e0-1234\r\n"), "{ical}");
-        assert!(ical.contains("X-RETASKABLE-SOURCE-PAGE:p:0.500000\r\n"), "{ical}");
+        assert!(
+            ical.contains("X-RETASKABLE-SOURCE-DOC:e0cef3e0-1234\r\n"),
+            "{ical}"
+        );
+        assert!(
+            ical.contains("X-RETASKABLE-SOURCE-PAGE:p:0.500000\r\n"),
+            "{ical}"
+        );
         // Label is escaped on the wire (comma) ...
-        assert!(ical.contains("X-RETASKABLE-SOURCE-LABEL:Q3 Planning\\, vol 2 · p.3\r\n"), "{ical}");
+        assert!(
+            ical.contains("X-RETASKABLE-SOURCE-LABEL:Q3 Planning\\, vol 2 · p.3\r\n"),
+            "{ical}"
+        );
         // ... and reads back unescaped via the extractor + source_labels map.
         assert_eq!(
             crate::nextcloud::extract_source_label(&ical).as_deref(),
             Some("Q3 Planning, vol 2 · p.3")
         );
         let sources = source_labels(&conn, "/cal/").unwrap();
-        assert_eq!(sources.get("uid-anch").map(String::as_str), Some("Q3 Planning, vol 2 · p.3"));
+        assert_eq!(
+            sources.get("uid-anch").map(String::as_str),
+            Some("Q3 Planning, vol 2 · p.3")
+        );
     }
 
     #[test]
@@ -1617,11 +2019,21 @@ mod tests {
             page_key: String::new(),
             label: "Notebook · p.1".to_string(),
         };
-        enqueue_create_with_anchor(&mut conn, "/cal/", "uid-anch", "has label", Some(&anchor), None)
-            .unwrap();
+        enqueue_create_with_anchor(
+            &mut conn,
+            "/cal/",
+            "uid-anch",
+            "has label",
+            Some(&anchor),
+            None,
+        )
+        .unwrap();
         let sources = source_labels(&conn, "/cal/").unwrap();
         assert_eq!(sources.len(), 1);
-        assert_eq!(sources.get("uid-anch").map(String::as_str), Some("Notebook · p.1"));
+        assert_eq!(
+            sources.get("uid-anch").map(String::as_str),
+            Some("Notebook · p.1")
+        );
         assert!(sources.get("uid-plain").is_none());
     }
 
@@ -1647,7 +2059,8 @@ mod tests {
         conn.execute(
             "INSERT INTO calendar (href, display_name) VALUES ('/cal/', 'Cal')",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         let ical = "BEGIN:VCALENDAR\r\n\
             VERSION:2.0\r\n\
             BEGIN:VTODO\r\n\
@@ -1668,22 +2081,26 @@ mod tests {
         assert!(op_id > 0);
 
         // Status flipped, ical_text mutated (now contains COMPLETED markers).
-        let (status, new_ical): (String, String) = conn.query_row(
-            "SELECT status, ical_text FROM task WHERE uid = 'uid-t'",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        ).unwrap();
+        let (status, new_ical): (String, String) = conn
+            .query_row(
+                "SELECT status, ical_text FROM task WHERE uid = 'uid-t'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
         assert_eq!(status, "completed");
         assert!(new_ical.contains("STATUS:COMPLETED\r\n"));
         assert!(new_ical.contains("COMPLETED:"));
         assert!(new_ical.contains("PERCENT-COMPLETE:100\r\n"));
 
         // pending_op: toggle, payload NULL.
-        let (op_type, payload): (String, Option<String>) = conn.query_row(
-            "SELECT op_type, payload FROM pending_op WHERE id = ?1",
-            params![op_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        ).unwrap();
+        let (op_type, payload): (String, Option<String>) = conn
+            .query_row(
+                "SELECT op_type, payload FROM pending_op WHERE id = ?1",
+                params![op_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
         assert_eq!(op_type, "toggle");
         assert!(payload.is_none());
     }
@@ -1696,12 +2113,13 @@ mod tests {
         conn.execute(
             "INSERT INTO calendar (href, display_name) VALUES ('/cal/', 'Cal')",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         let err = enqueue_toggle(&mut conn, "/cal/", "uid-missing");
         assert!(err.is_err(), "expected error for missing uid");
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM pending_op", [], |r| r.get(0),
-        ).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pending_op", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(count, 0, "no orphan pending_op should exist");
     }
 
@@ -1712,7 +2130,8 @@ mod tests {
         conn.execute(
             "INSERT INTO calendar (href, display_name) VALUES ('/cal/', 'Cal')",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         let ical = "BEGIN:VCALENDAR\r\n\
             VERSION:2.0\r\n\
             BEGIN:VTODO\r\n\
@@ -1727,25 +2146,31 @@ mod tests {
              (calendar_href, href, etag, ical_text, summary, status, due, uid, pending_delete)
              VALUES ('/cal/', '/cal/e.ics', 'etag-1', ?1, 'Old', 'needs-action', NULL, 'uid-e', 0)",
             params![ical],
-        ).unwrap();
+        )
+        .unwrap();
 
-        let op_id = enqueue_edit(&mut conn, "/cal/", "uid-e", "New summary", None).expect("enqueue");
+        let op_id =
+            enqueue_edit(&mut conn, "/cal/", "uid-e", "New summary", None).expect("enqueue");
         assert!(op_id > 0);
 
-        let (summary, new_ical): (String, String) = conn.query_row(
-            "SELECT summary, ical_text FROM task WHERE uid = 'uid-e'",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        ).unwrap();
+        let (summary, new_ical): (String, String) = conn
+            .query_row(
+                "SELECT summary, ical_text FROM task WHERE uid = 'uid-e'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
         assert_eq!(summary, "New summary");
         assert!(new_ical.contains("SUMMARY:New summary\r\n"));
         assert!(!new_ical.contains("SUMMARY:Old\r\n"));
 
-        let (op_type, payload): (String, String) = conn.query_row(
-            "SELECT op_type, payload FROM pending_op WHERE id = ?1",
-            params![op_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        ).unwrap();
+        let (op_type, payload): (String, String) = conn
+            .query_row(
+                "SELECT op_type, payload FROM pending_op WHERE id = ?1",
+                params![op_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
         assert_eq!(op_type, "edit");
         assert_eq!(payload, r#"{"summary":"New summary"}"#);
     }
@@ -1757,7 +2182,8 @@ mod tests {
         conn.execute(
             "INSERT INTO calendar (href, display_name) VALUES ('/cal/', 'Cal')",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         let ical = "BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:uid-q\r\n\
                     SUMMARY:plain\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
         conn.execute(
@@ -1765,16 +2191,19 @@ mod tests {
              (calendar_href, href, etag, ical_text, summary, status, due, uid, pending_delete)
              VALUES ('/cal/', '/cal/q.ics', '', ?1, 'plain', 'needs-action', NULL, 'uid-q', 0)",
             params![ical],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Summary contains a double-quote and a newline.
         let weird = "He said \"hi\"\nand left";
         enqueue_edit(&mut conn, "/cal/", "uid-q", weird, None).unwrap();
-        let payload: String = conn.query_row(
-            "SELECT payload FROM pending_op WHERE target_uid = 'uid-q'",
-            [],
-            |r| r.get(0),
-        ).unwrap();
+        let payload: String = conn
+            .query_row(
+                "SELECT payload FROM pending_op WHERE target_uid = 'uid-q'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         // Payload must be valid JSON that roundtrips.
         let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
         assert_eq!(parsed["summary"], weird);
@@ -1785,8 +2214,15 @@ mod tests {
         let mut conn = fresh();
         ensure_schema_v2(&conn).expect("migrate");
         // All-day.
-        enqueue_create_with_anchor(&mut conn, "/cal/", "uid-d1", "Pay rent", None, Some("20260622"))
-            .unwrap();
+        enqueue_create_with_anchor(
+            &mut conn,
+            "/cal/",
+            "uid-d1",
+            "Pay rent",
+            None,
+            Some("20260622"),
+        )
+        .unwrap();
         let (ical, due): (String, Option<String>) = conn
             .query_row(
                 "SELECT ical_text, due FROM task WHERE uid = 'uid-d1'",
@@ -1907,12 +2343,13 @@ mod tests {
         conn.execute(
             "INSERT INTO calendar (href, display_name) VALUES ('/cal/', 'Cal')",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         let err = enqueue_edit(&mut conn, "/cal/", "uid-missing", "anything", None);
         assert!(err.is_err());
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM pending_op", [], |r| r.get(0),
-        ).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pending_op", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(count, 0);
     }
 
@@ -1923,7 +2360,8 @@ mod tests {
         conn.execute(
             "INSERT INTO calendar (href, display_name) VALUES ('/cal/', 'Cal')",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO task
              (calendar_href, href, etag, ical_text, summary, status, due, uid, pending_delete)
@@ -1934,20 +2372,29 @@ mod tests {
         let op_id = enqueue_delete(&mut conn, "/cal/", "uid-d").unwrap();
         assert!(op_id > 0);
 
-        let pending_delete: i64 = conn.query_row(
-            "SELECT pending_delete FROM task WHERE uid = 'uid-d'", [], |r| r.get(0),
-        ).unwrap();
+        let pending_delete: i64 = conn
+            .query_row(
+                "SELECT pending_delete FROM task WHERE uid = 'uid-d'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(pending_delete, 1);
 
         // Task disappears from the displayed list.
         let rows = list_tasks(&conn, "/cal/").unwrap();
-        assert!(rows.is_empty(), "tombstoned task must not appear in list_tasks");
+        assert!(
+            rows.is_empty(),
+            "tombstoned task must not appear in list_tasks"
+        );
 
-        let (op_type, payload): (String, Option<String>) = conn.query_row(
-            "SELECT op_type, payload FROM pending_op WHERE id = ?1",
-            params![op_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        ).unwrap();
+        let (op_type, payload): (String, Option<String>) = conn
+            .query_row(
+                "SELECT op_type, payload FROM pending_op WHERE id = ?1",
+                params![op_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
         assert_eq!(op_type, "delete");
         assert!(payload.is_none());
     }
@@ -1959,12 +2406,13 @@ mod tests {
         conn.execute(
             "INSERT INTO calendar (href, display_name) VALUES ('/cal/', 'Cal')",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         let err = enqueue_delete(&mut conn, "/cal/", "uid-nope");
         assert!(err.is_err());
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM pending_op", [], |r| r.get(0),
-        ).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pending_op", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(count, 0);
     }
 
@@ -1975,21 +2423,26 @@ mod tests {
         conn.execute(
             "INSERT INTO calendar (href, display_name) VALUES ('/cal/', 'Cal')",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO task
              (calendar_href, href, etag, ical_text, summary, status, due, uid, pending_delete)
              VALUES ('/cal/', '/cal/d.ics', '', '', 's', 'needs-action', NULL, 'uid-dup', 0)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         enqueue_delete(&mut conn, "/cal/", "uid-dup").unwrap();
         let again = enqueue_delete(&mut conn, "/cal/", "uid-dup");
         assert!(again.is_err());
         // Only one delete op exists.
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM pending_op WHERE target_uid = 'uid-dup'",
-            [], |r| r.get(0),
-        ).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pending_op WHERE target_uid = 'uid-dup'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(count, 1);
     }
 
@@ -2000,7 +2453,8 @@ mod tests {
         conn.execute(
             "INSERT INTO calendar (href, display_name) VALUES ('/cal/', 'Cal')",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO task (calendar_href, href, etag, ical_text, summary, status, due, uid, pending_delete)
              VALUES ('/cal/', '/cal/t.ics', 'e', 'ical', 'walk', 'completed', NULL, 'uid-1', 0)",
@@ -2019,7 +2473,8 @@ mod tests {
         conn.execute(
             "INSERT INTO calendar (href, display_name) VALUES ('/cal/', 'Cal')",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         // Seed 3 ops: id 1 errored, id 2 ok, id 3 ok.
         conn.execute(
             "INSERT INTO pending_op (op_type, target_uid, target_calendar_href, payload, enqueued_at, errored)
@@ -2055,13 +2510,17 @@ mod tests {
              VALUES ('toggle', 'a', '/cal/', NULL, 0)",
             [],
         ).unwrap();
-        let id: i64 = conn.query_row(
-            "SELECT id FROM pending_op WHERE target_uid = 'a'", [], |r| r.get(0),
-        ).unwrap();
+        let id: i64 = conn
+            .query_row(
+                "SELECT id FROM pending_op WHERE target_uid = 'a'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         delete_pending_op(&conn, id).unwrap();
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM pending_op", [], |r| r.get(0),
-        ).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pending_op", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(count, 0);
     }
 
@@ -2081,14 +2540,21 @@ mod tests {
              VALUES ('toggle', 'a', '/cal/', NULL, 0)",
             [],
         ).unwrap();
-        let id: i64 = conn.query_row(
-            "SELECT id FROM pending_op WHERE target_uid = 'a'", [], |r| r.get(0),
-        ).unwrap();
+        let id: i64 = conn
+            .query_row(
+                "SELECT id FROM pending_op WHERE target_uid = 'a'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         mark_op_errored(&conn, id, "404 not found").unwrap();
-        let (errored, msg): (i64, String) = conn.query_row(
-            "SELECT errored, last_error FROM pending_op WHERE id = ?1",
-            params![id], |r| Ok((r.get(0)?, r.get(1)?)),
-        ).unwrap();
+        let (errored, msg): (i64, String) = conn
+            .query_row(
+                "SELECT errored, last_error FROM pending_op WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
         assert_eq!(errored, 1);
         assert_eq!(msg, "404 not found");
     }
@@ -2111,9 +2577,13 @@ mod tests {
         assert_eq!(cascaded, 2, "should cascade two clean siblings");
 
         // The already-errored row keeps its original message (AC3.6).
-        let pre: String = conn.query_row(
-            "SELECT last_error FROM pending_op WHERE enqueued_at = 0", [], |r| r.get(0),
-        ).unwrap();
+        let pre: String = conn
+            .query_row(
+                "SELECT last_error FROM pending_op WHERE enqueued_at = 0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(pre, "pre-existing");
 
         // The two clean siblings on uid-x are now errored with the cascade message.
@@ -2128,9 +2598,13 @@ mod tests {
         assert!(cascaded_msgs.iter().all(|m| m == "blocked by failed edit"));
 
         // uid-y is untouched.
-        let y_errored: i64 = conn.query_row(
-            "SELECT errored FROM pending_op WHERE target_uid = 'uid-y'", [], |r| r.get(0),
-        ).unwrap();
+        let y_errored: i64 = conn
+            .query_row(
+                "SELECT errored FROM pending_op WHERE target_uid = 'uid-y'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(y_errored, 0);
     }
 
@@ -2141,7 +2615,8 @@ mod tests {
         conn.execute(
             "INSERT INTO calendar (href, display_name) VALUES ('/cal/', 'Cal')",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO task (calendar_href, href, etag, ical_text, summary, status, due, uid, pending_delete)
              VALUES ('/cal/', '/cal/a.ics', '', '', 'Apple', 'needs-action', NULL, 'uid-a', 0),
@@ -2172,7 +2647,8 @@ mod tests {
         conn.execute(
             "INSERT INTO calendar (href, display_name) VALUES ('/cal/', 'Cal')",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         // Two cache rows: one tombstoned (errored delete will reset it), one
         // locally-created (errored create will drop it).
         conn.execute(
@@ -2193,25 +2669,31 @@ mod tests {
         assert_eq!(cleared, 2);
 
         // Tombstoned Keep is restored (pending_delete = 0).
-        let pd: i64 = conn.query_row(
-            "SELECT pending_delete FROM task WHERE uid = 'uid-keep'", [], |r| r.get(0),
-        ).unwrap();
+        let pd: i64 = conn
+            .query_row(
+                "SELECT pending_delete FROM task WHERE uid = 'uid-keep'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(pd, 0);
 
         // Locally-created row dropped.
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM task WHERE uid = 'uid-new'", [], |r| r.get(0),
-        ).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM task WHERE uid = 'uid-new'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
         assert_eq!(count, 0);
 
         // Only the non-errored toggle remains in pending_op.
-        let remaining: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM pending_op", [], |r| r.get(0),
-        ).unwrap();
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pending_op", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(remaining, 1);
-        let kind: String = conn.query_row(
-            "SELECT op_type FROM pending_op", [], |r| r.get(0),
-        ).unwrap();
+        let kind: String = conn
+            .query_row("SELECT op_type FROM pending_op", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(kind, "toggle");
     }
 
@@ -2316,7 +2798,9 @@ mod tests {
              VALUES ('/cal/', '/cal/t.ics', 'e', 'ical', 'walk', 'completed', NULL, 'uid-1', 0)",
             [],
         ).unwrap();
-        let cached = get_cached_task_by_uid(&conn, "/cal/", "uid-1").unwrap().expect("some");
+        let cached = get_cached_task_by_uid(&conn, "/cal/", "uid-1")
+            .unwrap()
+            .expect("some");
         assert_eq!(cached.uid, "uid-1");
         assert_eq!(cached.summary, "walk");
         assert_eq!(cached.etag, "e");
@@ -2334,14 +2818,18 @@ mod tests {
              VALUES ('/cal/', '/cal/t.ics', 'e', 'ical', 'walk', 'completed', NULL, 'uid-1', 1)",
             [],
         ).unwrap();
-        assert!(get_cached_task_by_uid(&conn, "/cal/", "uid-1").unwrap().is_some());
+        assert!(get_cached_task_by_uid(&conn, "/cal/", "uid-1")
+            .unwrap()
+            .is_some());
     }
 
     #[test]
     fn get_cached_task_by_uid_returns_none_for_missing() {
         let conn = fresh();
         ensure_schema_v2(&conn).expect("migrate");
-        assert!(get_cached_task_by_uid(&conn, "/cal/", "nope").unwrap().is_none());
+        assert!(get_cached_task_by_uid(&conn, "/cal/", "nope")
+            .unwrap()
+            .is_none());
     }
 
     // --- M9b Phase 3: get_pending_op_by_id + drop_resolved_conflict ---
@@ -2360,7 +2848,146 @@ mod tests {
         let op = get_pending_op_by_id(&conn, 1).unwrap().expect("some");
         assert_eq!(op.target_uid, "uid-x");
         assert_eq!(op.errored, 1);
-        assert_eq!(op.last_error.as_deref(), Some("double-412 (server-side conflict)"));
+        assert_eq!(
+            op.last_error.as_deref(),
+            Some("double-412 (server-side conflict)")
+        );
     }
 
+    #[test]
+    fn local_crud_never_leaves_pending_operations() {
+        let mut conn = fresh();
+        ensure_schema(&conn).unwrap();
+        ensure_local_list(&conn).unwrap();
+        create_local_with_anchor(&mut conn, "local-1", "Buy milk", None, Some("20260727")).unwrap();
+        assert_eq!(list_tasks(&conn, LOCAL_LIST_ID).unwrap().len(), 1);
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM pending_op", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        toggle_local(&mut conn, "local-1").unwrap();
+        edit_local(&mut conn, "local-1", "Buy oat milk", Some("")).unwrap();
+        let task = get_cached_task_by_uid(&conn, LOCAL_LIST_ID, "local-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.summary, "Buy oat milk");
+        assert_eq!(task.status, "completed");
+        delete_local(&mut conn, "local-1").unwrap();
+        assert!(list_tasks(&conn, LOCAL_LIST_ID).unwrap().is_empty());
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM pending_op", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn opening_repairs_an_interrupted_local_mutation_without_syncing_it() {
+        let conn = fresh();
+        ensure_schema(&conn).unwrap();
+        ensure_local_list(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO task
+                (calendar_href, href, etag, ical_text, summary, status, due, uid, pending_delete)
+             VALUES (?1, 'pending:local-create', '', 'ical', 'Create survived',
+                     'needs-action', NULL, 'local-create', 0)",
+            params![LOCAL_LIST_ID],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task
+                (calendar_href, href, etag, ical_text, summary, status, due, uid, pending_delete)
+             VALUES (?1, 'local:local-delete', '', 'ical', 'Delete finished',
+                     'needs-action', NULL, 'local-delete', 1)",
+            params![LOCAL_LIST_ID],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pending_op
+                (op_type, target_uid, target_calendar_href, enqueued_at)
+             VALUES ('create', 'local-create', ?1, 1),
+                    ('delete', 'local-delete', ?1, 2)",
+            params![LOCAL_LIST_ID],
+        )
+        .unwrap();
+
+        ensure_local_list(&conn).unwrap();
+
+        assert!(get_cached_task_by_uid(&conn, LOCAL_LIST_ID, "local-create")
+            .unwrap()
+            .is_some());
+        assert!(get_cached_task_by_uid(&conn, LOCAL_LIST_ID, "local-delete")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM pending_op", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn reset_cache_preserves_local_list_and_tasks() {
+        let mut conn = fresh();
+        ensure_schema(&conn).unwrap();
+        ensure_local_list(&conn).unwrap();
+        create_local_with_anchor(&mut conn, "local-1", "Keep me", None, None).unwrap();
+        upsert_calendar(&conn, "https://example.test/tasks/", "Remote").unwrap();
+        reset_cache(&conn).unwrap();
+        assert_eq!(list_tasks(&conn, LOCAL_LIST_ID).unwrap().len(), 1);
+        let lists = list_calendars(&conn).unwrap();
+        assert_eq!(lists.len(), 1);
+        assert_eq!(lists[0].id, LOCAL_LIST_ID);
+    }
+
+    #[test]
+    fn transfer_move_payload_keeps_local_source_until_flush() {
+        let mut conn = fresh();
+        ensure_schema(&conn).unwrap();
+        ensure_local_list(&conn).unwrap();
+        create_local_with_anchor(&mut conn, "local-1", "Move me", None, None).unwrap();
+        let remote = "https://example.test/tasks/";
+        upsert_calendar(&conn, remote, "Remote").unwrap();
+        let op = transfer_local_to_remote(&mut conn, "local-1", remote, true).unwrap();
+        assert!(op > 0);
+        assert!(get_cached_task_by_uid(&conn, LOCAL_LIST_ID, "local-1")
+            .unwrap()
+            .is_some());
+        let queued = fetch_next_drainable(&conn).unwrap().unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_str(queued.payload.as_deref().unwrap()).unwrap();
+        assert_eq!(payload["move_source"], LOCAL_LIST_ID);
+    }
+
+    #[test]
+    fn repeated_pending_transfer_reuses_op_and_latest_operation() {
+        let mut conn = fresh();
+        ensure_schema(&conn).unwrap();
+        ensure_local_list(&conn).unwrap();
+        create_local_with_anchor(&mut conn, "local-1", "Move me", None, None).unwrap();
+        let remote = "https://example.test/tasks/";
+        upsert_calendar(&conn, remote, "Remote").unwrap();
+
+        let copy_id = transfer_local_to_remote(&mut conn, "local-1", remote, false).unwrap();
+        let move_id = transfer_local_to_remote(&mut conn, "local-1", remote, true).unwrap();
+
+        assert_eq!(move_id, copy_id);
+        let queued = get_pending_op_by_id(&conn, copy_id).unwrap().unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_str(queued.payload.as_deref().unwrap()).unwrap();
+        assert_eq!(payload["move_source"], LOCAL_LIST_ID);
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM task WHERE calendar_href = ?1 AND uid = ?2",
+                params![remote, "local-1"],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+    }
 }

@@ -3,9 +3,12 @@
 <img width="400" alt="rTscreen" src="https://github.com/user-attachments/assets/db39b33f-66ed-4a9f-98fb-f9e6bd0bf9a2" /> <img width="400" alt="rTselect" src="https://github.com/user-attachments/assets/df5f9e0c-b45a-4aa9-8e58-634c80ca6e3f" />
 
 
-A task client for **reMarkable tablets** that syncs your to-dos with any
-RFC-compliant **CalDAV** server (Nextcloud, and other standards-compliant
-servers). It runs on-device under [xovi](https://remarkable.guide/guide/software/xovi.html) with [AppLoad](https://github.com/asivery/rmpp-appload). Your tasks live on your own server, or on iCloud sharing with your MacOS/iOS Reminders.
+A local-first task client for **reMarkable tablets**, with optional sync to an
+RFC-compliant **CalDAV** server. It runs on-device under
+[xovi](https://remarkable.guide/guide/software/xovi.html) with
+[AppLoad](https://github.com/asivery/rmpp-appload). You can keep a list entirely
+on the tablet, sync with Nextcloud or another CalDAV server, or try the beta
+iCloud Reminders integration.
 
 What makes it paper-native: you can **lasso handwriting in any notebook and turn
 it into a to-do**, and that to-do keeps a link back to the exact page it came
@@ -13,19 +16,26 @@ from, so a tap takes you straight back to your notes.
 
 ## Features
 
-- **Sync to-dos over CalDAV** — two-way sync with your own server. Complete,
-  create, edit, reschedule, and delete tasks.
+- **Works without an account** — the permanent **On This reMarkable** list is
+  ready on first launch and never depends on a sync server.
+- **Optional CalDAV sync** — two-way sync with Nextcloud and other compliant
+  servers. Complete, create, edit, reschedule, and delete tasks.
+- **iCloud Reminders (beta)** — root-first Apple CalDAV discovery handles the
+  per-user server redirect while keeping credentials on approved Apple hosts.
+- **Explicit copy and move** — send a local task to your synced list; a move
+  deletes the local copy only after the remote create is confirmed.
 - **Due dates & times** — set a due date (and optional time) when you create a
   task or later from its detail view, with one-tap presets (Today / Tomorrow /
   +1 week) or a tap-and-type date field.
 - **Capture from handwriting** *(optional)* — circle some handwriting in a
   notebook, tap **Send to reTaskable**, and it’s recognized into a to-do. The
-  task shows a 📓 link to the source notebook and page.
+  task lands in the currently selected list and shows a 📓 link to the source
+  notebook and page.
 - **Jump back to your notes** *(optional)* — open a captured to-do and tap
   **📓 Open note** to jump straight to the page you wrote it on.
-- **Works offline** — every change is saved instantly and queued; it syncs to
-  the server the next time you’re online. Sync conflicts get a clear
-  keep-mine / take-theirs prompt.
+- **Works offline** — local-list changes stay local, while synced-list changes
+  are saved instantly and queued. Sync conflicts get a clear keep-mine /
+  take-theirs prompt.
 - **In-app setup** — point it at your server, username, and app password right
   on the device; no config files to edit.
 - **e-ink friendly** — clean, high-contrast layout with discrete page turns (no
@@ -35,9 +45,12 @@ from, so a tap takes you straight back to your notes.
 
 - A **reMarkable tablet** with [xovi](https://remarkable.guide/guide/software/xovi.html)
   and [AppLoad](https://github.com/asivery/rmpp-appload) installed.
-- A **CalDAV account** with a tasks/VTODO calendar (e.g. Nextcloud). You’ll need
-  the server URL, your username, and an **app password** (not your main account
-  password).
+- The optional handwriting-capture and jump-back hooks currently support
+  **reMarkable OS 3.27.x**. The standalone reTaskable app has a broader support
+  range because it does not patch xochitl's private QML.
+- A **CalDAV account is optional**. For sync you need a tasks/VTODO calendar,
+  its server URL and username, and an **app password** rather than your main
+  account password.
 
 ## Install
 
@@ -66,14 +79,19 @@ the handwriting-capture and jump-back features) the **command-executor** and
 
 ## First-run setup
 
-1. Open **reTaskable** from the AppLoad launcher.
-2. Tap **Settings**.
-3. Enter your CalDAV **server URL** (e.g. `https://nextcloud.example.com`), your
-   **username**, and an **app password**.
+1. Open **reTaskable** from the AppLoad launcher. **On This reMarkable** is
+   immediately available; no setup is required for local tasks.
+2. To add sync, tap **Settings**, choose **Generic / Nextcloud** or
+   **iCloud Reminders (Beta)**, and enter your username and app password.
+3. For a generic server, also enter its CalDAV URL (for example,
+   `https://nextcloud.example.com`).
    - In Nextcloud: *Settings → Security → Devices & sessions → Create new app
      password*. Always use `https://`.
-4. Tap to discover your calendars, pick the one that holds your tasks, and save.
-5. Tap **Sync**. Your tasks appear.
+   - For iCloud, create an app-specific password in your Apple Account. Do not
+     enter your normal Apple Account password.
+4. Discover the available VTODO collections, pick one, and save.
+5. Select either list from the task-list strip. Tap **Sync** to exchange changes
+   with the configured remote list.
 
 You can change the server, account, or calendar any time from **Settings**.
 
@@ -86,6 +104,8 @@ You can change the server, account, or calendar any time from **Settings**.
 - **Edit / reschedule / delete** — tap a task’s text to open its detail view.
   Edit the summary, change or clear the due date, or delete it (two taps to
   confirm).
+- **Copy or move a local task** — open a task from **On This reMarkable** and
+  choose **Copy to synced list** or **Move to synced list**.
 - **Sync** — tap **Sync** to push your queued changes and pull the latest from
   the server. The header shows when you last synced.
 - **Page through a long list** — use the ▲ / ▼ buttons (paging is per-screen,
@@ -98,9 +118,10 @@ You can change the server, account, or calendar any time from **Settings**.
 2. In the selection menu, tap the **checkmark icon**.
 3. Your handwriting is recognized; review or edit the text, then tap **Create**.
    The note itself is never modified.
-4. The new to-do appears in reTaskable with a 📓 line showing the source
-   notebook and page — and it syncs to your server automatically, even if
-   reTaskable isn’t open.
+4. The new to-do appears in whichever task list was selected most recently,
+   with a 📓 line showing the source notebook and page. A synced-list capture is
+   pushed automatically even if reTaskable isn't open; a local-list capture
+   stays on the tablet until you explicitly copy or move it.
 
 > Online handwriting recognition needs Wi-Fi and a signed-in reMarkable account.
 > Offline, you’ll get a text field to type the task instead.
@@ -171,31 +192,58 @@ writes this file for you. You can also edit it directly at
 `/home/root/.config/retaskable/config.toml`):
 
 ```toml
-[nextcloud]
+[caldav]
+provider     = "generic"
 base_url     = "https://nextcloud.example.com"
 username     = "yourname"
 app_password = "xxx-xxx-xxx-xxx-xxx"
+calendar_href = "https://nextcloud.example.com/remote.php/dav/calendars/yourname/tasks/"
 calendar     = "Tasks"
 ```
 
-(The `[nextcloud]` section name is historical — reTaskable speaks standard
-CalDAV and works with any compliant server, not just Nextcloud.)
+`calendar_href` is the stable collection identity; `calendar` is only its
+display name. Existing `[nextcloud]` configurations remain readable and are
+migrated the next time Settings saves them. For a local-only configuration,
+the file may be absent entirely.
+
+### Diagnostics
+
+Settings has a **Load diagnostics** button that shows the tail of a persistent,
+rotating log. The log records DAV methods, status/error categories, elapsed
+time, and sanitized host names; it does not record passwords, calendar paths,
+task contents, or server response bodies.
+
+For a support bundle, use reManager's terminal/SSH facility or connect over USB
+and run:
+
+```bash
+ssh root@10.11.99.1 \
+  /home/root/xovi/exthome/appload/retaskable/backend/entry --diagnostics
+```
+
+The current and previous files are
+`/home/root/.local/share/retaskable/diagnostics.log` and
+`diagnostics.log.1`. reManager's AppLoad **Debug** action is also useful for
+foreground startup errors that occur before the persistent logger is ready.
 
 ## Compatibility & roadmap
 
 reTaskable targets **RFC-compliant CalDAV**, not any one server. It’s verified
 against **Nextcloud** and a **go-webdav** server, and it degrades gracefully on
-servers that don’t support the optional WebDAV-Sync extension (it falls back to a
-full `calendar-query` each sync).
+servers that don’t support the optional WebDAV-Sync extension (it falls back to
+a full `calendar-query` each sync).
+
+iCloud Reminders support is beta until it has broader live-account coverage.
+It uses Apple's CalDAV surface with an app-specific password, starts discovery
+at `https://caldav.icloud.com`, and only forwards authentication to the
+corresponding approved Apple CalDAV shard. reTaskable currently edits its
+existing task fields and preserves unknown iCalendar properties when it rewrites
+a task; recurrence and alarms still have no dedicated UI.
 
 Not yet supported, on the roadmap:
 
 - **Setting a due date at capture time** — today a to-do captured from a note
   comes in without a due date; you add it afterward in reTaskable.
-- **iCloud CalDAV** — reTaskable already speaks the standards iCloud uses
-  (RFC 6764 discovery, Basic auth with an app-specific password, VTODO sync), but
-  iCloud’s login redirect to a per-user server needs targeted handling (and live
-  testing) before it’s officially supported. Tracked for a future release.
 - Recurring tasks (`RRULE`) and reminders/alarms.
 
 ## Project layout

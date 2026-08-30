@@ -50,7 +50,16 @@ Rectangle {
     property bool settingsOpen: false
     property bool settingsHasPassword: false
     property bool settingsPasswordVisible: false
+    property string settingsProvider: "generic"
+    property string settingsLoadedProvider: "generic"
+    property string settingsLoadedUrl: ""
+    property string settingsLoadedUsername: ""
+    property bool settingsLoadedHasPassword: false
     property string selectedCalendar: ""
+    property string selectedCalendarHref: ""
+    property string activeListId: "local://default"
+    property string activeListName: "On This reMarkable"
+    property string remoteDestinationId: ""
     // True when the server URL/username changed since the last successful
     // calendar discovery — Save is blocked until the user re-Tests, so we never
     // persist a calendar that doesn't exist on the (new) server.
@@ -66,6 +75,10 @@ Rectangle {
     // M11: calendars discovered for the Settings picker.
     ListModel {
         id: calendarsModel
+    }
+
+    ListModel {
+        id: sourcesModel
     }
 
     // Settings diagnostics: errored or retrying pending ops from MSG 10 / 110.
@@ -143,6 +156,24 @@ Rectangle {
                 }
                 return
             }
+            if (type === 122) {
+                root.applySources(contents)
+                return
+            }
+            if (type === 123) {
+                root.applySourceSelection(contents)
+                return
+            }
+            if (type === 124) {
+                statusText.text = contents
+                root.closeDetail()
+                root.refreshList()
+                return
+            }
+            if (type === 125) {
+                diagnosticsText.text = contents
+                return
+            }
             statusText.text = contents
         }
     }
@@ -151,6 +182,54 @@ Rectangle {
     // default; "all" includes finished tasks.
     function refreshList() {
         endpoint.sendMessage(4, root.showCompleted ? "all" : "open")
+    }
+
+    function refreshSources() {
+        endpoint.sendMessage(22, "")
+    }
+
+    function applySources(jsonText) {
+        var data
+        try {
+            data = JSON.parse(jsonText)
+        } catch (e) {
+            statusText.text = jsonText
+            return
+        }
+        sourcesModel.clear()
+        root.activeListId = data.active ? data.active : "local://default"
+        root.remoteDestinationId = ""
+        var sources = data.sources || []
+        for (var i = 0; i < sources.length; i++) {
+            sourcesModel.append({
+                source_id: sources[i].id,
+                display_name: sources[i].display_name,
+                kind: sources[i].kind
+            })
+            if (sources[i].id === root.activeListId) {
+                root.activeListName = sources[i].display_name
+            }
+            if (sources[i].kind === "caldav" && root.remoteDestinationId.length === 0) {
+                root.remoteDestinationId = sources[i].id
+            }
+        }
+    }
+
+    function applySourceSelection(jsonText) {
+        var data
+        try {
+            data = JSON.parse(jsonText)
+        } catch (e) {
+            statusText.text = jsonText
+            return
+        }
+        if (data.ok) {
+            root.activeListId = data.active
+            root.refreshSources()
+            root.refreshList()
+        } else {
+            statusText.text = jsonText
+        }
     }
 
     // Reply to the MSG 18 intake drain (M13). The backend has already ingested any
@@ -189,12 +268,19 @@ Rectangle {
             settingsStatus.text = jsonText
             return
         }
-        settingsUrl.text = c.base_url ? c.base_url : ""
-        settingsUser.text = c.username ? c.username : ""
+        root.settingsLoadedProvider = c.provider ? c.provider : "generic"
+        root.settingsLoadedUrl = c.base_url ? c.base_url : ""
+        root.settingsLoadedUsername = c.username ? c.username : ""
+        root.settingsLoadedHasPassword = c.has_password === true
+        root.settingsProvider = root.settingsLoadedProvider
+        settingsUrl.text = root.settingsLoadedUrl
+        settingsUser.text = root.settingsLoadedUsername
         settingsPass.text = ""
-        root.settingsHasPassword = c.has_password === true
+        root.settingsHasPassword = root.settingsLoadedHasPassword
         root.settingsPasswordVisible = false
         root.selectedCalendar = c.calendar ? c.calendar : ""
+        root.selectedCalendarHref = c.calendar_href ? c.calendar_href : ""
+        if (c.active_list) root.activeListId = c.active_list
         // Setting the fields above fired onTextChanged (→ needsDiscover=true);
         // clear it, then auto-discover so the picker reflects the real server
         // and the prefilled calendar is validated against it.
@@ -207,6 +293,7 @@ Rectangle {
     function loadCalendars() {
         settingsStatus.text = "Contacting server…"
         endpoint.sendMessage(17, JSON.stringify({
+            provider: root.settingsProvider,
             base_url: settingsUrl.text.trim(),
             username: settingsUser.text.trim(),
             app_password: settingsPass.text
@@ -230,7 +317,7 @@ Rectangle {
         var stillValid = false
         for (var i = 0; i < cals.length; i++) {
             calendarsModel.append({ display_name: cals[i].display_name, href: cals[i].href })
-            if (cals[i].display_name === root.selectedCalendar) {
+            if (cals[i].href === root.selectedCalendarHref) {
                 stillValid = true
             }
         }
@@ -238,6 +325,7 @@ Rectangle {
         // (auto-pick when there's exactly one) so we can't save a stale choice.
         if (!stillValid) {
             root.selectedCalendar = (cals.length === 1) ? cals[0].display_name : ""
+            root.selectedCalendarHref = (cals.length === 1) ? cals[0].href : ""
         }
         root.needsDiscover = false
         settingsStatus.text = "Found " + cals.length + " calendar(s). "
@@ -248,10 +336,13 @@ Rectangle {
     function saveSettings() {
         settingsStatus.text = "Saving…"
         endpoint.sendMessage(16, JSON.stringify({
+            provider: root.settingsProvider,
             base_url: settingsUrl.text.trim(),
             username: settingsUser.text.trim(),
             app_password: settingsPass.text,
-            calendar: root.selectedCalendar
+            calendar: root.selectedCalendar,
+            calendar_href: root.selectedCalendarHref,
+            active_list: root.selectedCalendarHref
         }))
     }
 
@@ -271,6 +362,7 @@ Rectangle {
         root.createReady = false
         statusText.text = "Settings saved. Syncing…"
         endpoint.sendMessage(5, "") // Sync repopulates (cache was reset if target changed)
+        root.refreshSources()
     }
 
     function refreshSyncErrors() {
@@ -327,7 +419,10 @@ Rectangle {
         interval: 300
         repeat: false
         running: true
-        onTriggered: endpoint.sendMessage(18, "")
+        onTriggered: {
+            root.refreshSources()
+            endpoint.sendMessage(18, "")
+        }
     }
 
     // Parse the MSG 104 JSON envelope and repopulate the list. Non-JSON replies
@@ -431,6 +526,7 @@ Rectangle {
 
     // Human-readable pending-sync state from the row's mark.
     function markLabel(m) {
+        if (root.activeListId === "local://default") return "Stored on this reMarkable"
         if (m === "!") return "Sync error — will retry"
         if (m === "*") return "Queued — not yet synced"
         return "Synced"
@@ -479,6 +575,46 @@ Rectangle {
             text: "reTaskable"
             font.pixelSize: 44
             color: "black"
+        }
+
+        Flickable {
+            width: parent.width
+            height: 60
+            contentWidth: sourceButtons.width
+            contentHeight: height
+            clip: true
+            flickableDirection: Flickable.HorizontalFlick
+
+            Row {
+                id: sourceButtons
+                height: parent.height
+                spacing: 10
+
+                Repeater {
+                    model: sourcesModel
+
+                    delegate: Rectangle {
+                        width: Math.max(210, sourceLabel.implicitWidth + 30)
+                        height: 56
+                        color: model.source_id === root.activeListId ? "black" : "white"
+                        border.color: "black"
+                        border.width: 2
+
+                        Text {
+                            id: sourceLabel
+                            anchors.centerIn: parent
+                            text: model.display_name
+                            font.pixelSize: 21
+                            color: model.source_id === root.activeListId ? "white" : "black"
+                        }
+
+                        MouseArea {
+                            anchors.fill: parent
+                            onClicked: endpoint.sendMessage(23, model.source_id)
+                        }
+                    }
+                }
+            }
         }
 
         // Fixed-height status slot: always reserves three lines (even when empty)
@@ -801,9 +937,6 @@ Rectangle {
         // each scroll action is a single deliberate refresh.
         interactive: false
         boundsBehavior: Flickable.StopAtBounds
-        add: Transition {}
-        remove: Transition {}
-        displaced: Transition {}
 
         ScrollBar.vertical: ScrollBar {
             policy: ScrollBar.AlwaysOn
@@ -948,9 +1081,76 @@ Rectangle {
                 spacing: 16
 
             Text {
-                text: "Settings — Sync Target"
+                text: "Settings — Task Lists"
                 font.pixelSize: 32
                 font.bold: true
+            }
+
+            Rectangle {
+                width: 360
+                height: 64
+                color: root.activeListId === "local://default" ? "black" : "white"
+                border.color: "black"
+                border.width: 3
+                Text {
+                    anchors.centerIn: parent
+                    text: "Use On This reMarkable"
+                    font.pixelSize: 22
+                    color: root.activeListId === "local://default" ? "white" : "black"
+                }
+                MouseArea {
+                    anchors.fill: parent
+                    onClicked: endpoint.sendMessage(23, "local://default")
+                }
+            }
+
+            Text { text: "CalDAV provider"; font.pixelSize: 24; color: "black" }
+            Row {
+                spacing: 16
+                Repeater {
+                    model: [
+                        { value: "generic", label: "Generic / Nextcloud" },
+                        { value: "icloud", label: "iCloud Reminders (Beta)" }
+                    ]
+                    delegate: Rectangle {
+                        width: 330
+                        height: 64
+                        color: root.settingsProvider === modelData.value ? "black" : "white"
+                        border.color: "black"
+                        border.width: 3
+                        Text {
+                            anchors.centerIn: parent
+                            text: modelData.label
+                            font.pixelSize: 20
+                            color: root.settingsProvider === modelData.value ? "white" : "black"
+                        }
+                        MouseArea {
+                            anchors.fill: parent
+                            onClicked: {
+                                if (root.settingsProvider === modelData.value) return
+                                root.settingsProvider = modelData.value
+                                calendarsModel.clear()
+                                root.selectedCalendar = ""
+                                root.selectedCalendarHref = ""
+                                settingsPass.text = ""
+                                if (modelData.value === root.settingsLoadedProvider) {
+                                    settingsUrl.text = root.settingsLoadedUrl
+                                    settingsUser.text = root.settingsLoadedUsername
+                                    root.settingsHasPassword = root.settingsLoadedHasPassword
+                                } else if (modelData.value === "icloud") {
+                                    settingsUrl.text = "https://caldav.icloud.com/"
+                                    settingsUser.text = ""
+                                    root.settingsHasPassword = false
+                                } else {
+                                    settingsUrl.text = ""
+                                    settingsUser.text = ""
+                                    root.settingsHasPassword = false
+                                }
+                                root.needsDiscover = true
+                            }
+                        }
+                    }
+                }
             }
 
             Text { text: "Server URL"; font.pixelSize: 24; color: "black" }
@@ -962,10 +1162,18 @@ Rectangle {
                 color: "black"
                 placeholderTextColor: "#303030"
                 placeholderText: "https://nextcloud.example.com"
+                enabled: root.settingsProvider !== "icloud"
+                opacity: enabled ? 1.0 : 0.65
                 onTextChanged: root.needsDiscover = true
             }
 
-            Text { text: "Username"; font.pixelSize: 24; color: "black" }
+            Text {
+                text: root.settingsProvider === "icloud"
+                      ? "Apple Account email"
+                      : "Username"
+                font.pixelSize: 24
+                color: "black"
+            }
             TextField {
                 id: settingsUser
                 width: parent.width
@@ -973,8 +1181,20 @@ Rectangle {
                 font.pixelSize: 26
                 color: "black"
                 placeholderTextColor: "#303030"
-                placeholderText: "username"
+                placeholderText: root.settingsProvider === "icloud"
+                                 ? "name@example.com"
+                                 : "username"
                 onTextChanged: root.needsDiscover = true
+            }
+
+            Text {
+                visible: root.settingsProvider === "icloud"
+                width: parent.width
+                text: "Use the full email address for your Apple Account and an "
+                      + "app-specific password generated at account.apple.com."
+                wrapMode: Text.Wrap
+                font.pixelSize: 20
+                color: "#303030"
             }
 
             Text { text: "App password"; font.pixelSize: 24; color: "black" }
@@ -1063,7 +1283,7 @@ Rectangle {
                     delegate: Rectangle {
                         width: parent.width
                         height: 60
-                        color: model.display_name === root.selectedCalendar ? "black" : "white"
+                        color: model.href === root.selectedCalendarHref ? "black" : "white"
                         border.color: "black"
                         border.width: 2
 
@@ -1073,12 +1293,15 @@ Rectangle {
                             anchors.verticalCenter: parent.verticalCenter
                             text: model.display_name
                             font.pixelSize: 22
-                            color: model.display_name === root.selectedCalendar ? "white" : "black"
+                            color: model.href === root.selectedCalendarHref ? "white" : "black"
                         }
 
                         MouseArea {
                             anchors.fill: parent
-                            onClicked: root.selectedCalendar = model.display_name
+                            onClicked: {
+                                root.selectedCalendar = model.display_name
+                                root.selectedCalendarHref = model.href
+                            }
                         }
                     }
                 }
@@ -1185,12 +1408,51 @@ Rectangle {
 
             Row {
                 spacing: 16
+                Text {
+                    text: "Diagnostics"
+                    font.pixelSize: 24
+                    font.bold: true
+                    color: "black"
+                    anchors.verticalCenter: parent.verticalCenter
+                }
+                Rectangle {
+                    width: 220
+                    height: 56
+                    color: "white"
+                    border.color: "black"
+                    border.width: 2
+                    Text {
+                        anchors.centerIn: parent
+                        text: "Load diagnostic log"
+                        font.pixelSize: 20
+                        color: "black"
+                    }
+                    MouseArea {
+                        anchors.fill: parent
+                        onClicked: endpoint.sendMessage(25, "")
+                    }
+                }
+            }
+
+            Text {
+                id: diagnosticsText
+                width: parent.width
+                text: ""
+                visible: text.length > 0
+                font.pixelSize: 18
+                font.family: "monospace"
+                wrapMode: Text.WrapAnywhere
+                color: "black"
+            }
+
+            Row {
+                spacing: 16
 
                 Rectangle {
                     id: saveBtn
                     property bool active: settingsUrl.text.trim().length > 0
                                           && settingsUser.text.trim().length > 0
-                                          && root.selectedCalendar.length > 0
+                                          && root.selectedCalendarHref.length > 0
                                           && !root.needsDiscover
                     width: 200
                     height: 72
@@ -1244,12 +1506,22 @@ Rectangle {
         visible: root.detailOpen
         z: 150
 
-        Column {
-            anchors.top: parent.top
-            anchors.left: parent.left
-            anchors.right: parent.right
+        Flickable {
+            anchors.fill: parent
             anchors.margins: 40
-            spacing: 16
+            contentWidth: width
+            contentHeight: detailColumn.height + 40
+            clip: true
+            boundsBehavior: Flickable.StopAtBounds
+
+            ScrollBar.vertical: ScrollBar {
+                policy: ScrollBar.AsNeeded
+            }
+
+            Column {
+                id: detailColumn
+                width: parent.width
+                spacing: 16
 
             Text {
                 text: "Task"
@@ -1389,6 +1661,56 @@ Rectangle {
                 }
             }
 
+            Row {
+                visible: root.activeListId === "local://default"
+                         && root.remoteDestinationId.length > 0
+                spacing: 16
+
+                Rectangle {
+                    width: 250
+                    height: 72
+                    color: "white"
+                    border.color: "black"
+                    border.width: 3
+                    Text {
+                        anchors.centerIn: parent
+                        text: "Copy to synced list"
+                        font.pixelSize: 20
+                        color: "black"
+                    }
+                    MouseArea {
+                        anchors.fill: parent
+                        onClicked: endpoint.sendMessage(24, JSON.stringify({
+                            uid: root.detailUid,
+                            destination_id: root.remoteDestinationId,
+                            operation: "copy"
+                        }))
+                    }
+                }
+
+                Rectangle {
+                    width: 250
+                    height: 72
+                    color: "white"
+                    border.color: "black"
+                    border.width: 3
+                    Text {
+                        anchors.centerIn: parent
+                        text: "Move to synced list"
+                        font.pixelSize: 20
+                        color: "black"
+                    }
+                    MouseArea {
+                        anchors.fill: parent
+                        onClicked: endpoint.sendMessage(24, JSON.stringify({
+                            uid: root.detailUid,
+                            destination_id: root.remoteDestinationId,
+                            operation: "move"
+                        }))
+                    }
+                }
+            }
+
             // Delete: two-step confirm. A single tap arms it; a second,
             // deliberate tap on Confirm performs the delete.
             Rectangle {
@@ -1412,57 +1734,58 @@ Rectangle {
                 }
             }
 
-            Row {
-                visible: root.detailDeleteArmed
-                spacing: 16
-
-                Text {
-                    anchors.verticalCenter: parent.verticalCenter
-                    text: "Really delete?"
-                    font.pixelSize: 22
-                    color: "#c00000"
-                }
-
-                Rectangle {
-                    width: 200
-                    height: 72
-                    color: "#c00000"
-                    border.color: "#c00000"
-                    border.width: 3
+                Row {
+                    visible: root.detailDeleteArmed
+                    spacing: 16
 
                     Text {
-                        anchors.centerIn: parent
-                        text: "Confirm"
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: "Really delete?"
                         font.pixelSize: 22
-                        color: "white"
+                        color: "#c00000"
                     }
 
-                    MouseArea {
-                        anchors.fill: parent
-                        onClicked: {
-                            endpoint.sendMessage(20, root.detailUid)
-                            root.closeDetail()
+                    Rectangle {
+                        width: 200
+                        height: 72
+                        color: "#c00000"
+                        border.color: "#c00000"
+                        border.width: 3
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: "Confirm"
+                            font.pixelSize: 22
+                            color: "white"
+                        }
+
+                        MouseArea {
+                            anchors.fill: parent
+                            onClicked: {
+                                endpoint.sendMessage(20, root.detailUid)
+                                root.closeDetail()
+                            }
                         }
                     }
-                }
 
-                Rectangle {
-                    width: 160
-                    height: 72
-                    color: "white"
-                    border.color: "black"
-                    border.width: 3
+                    Rectangle {
+                        width: 160
+                        height: 72
+                        color: "white"
+                        border.color: "black"
+                        border.width: 3
 
-                    Text {
-                        anchors.centerIn: parent
-                        text: "Keep"
-                        font.pixelSize: 22
-                        color: "black"
-                    }
+                        Text {
+                            anchors.centerIn: parent
+                            text: "Keep"
+                            font.pixelSize: 22
+                            color: "black"
+                        }
 
-                    MouseArea {
-                        anchors.fill: parent
-                        onClicked: root.detailDeleteArmed = false
+                        MouseArea {
+                            anchors.fill: parent
+                            onClicked: root.detailDeleteArmed = false
+                        }
                     }
                 }
             }

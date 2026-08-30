@@ -1,15 +1,16 @@
 use std::time::{Duration, SystemTime};
 
+use anyhow::Context;
 use appload_client::{
     AppLoad, AppLoadBackend, BackendReplier, Message, MSG_SYSTEM_NEW_COORDINATOR,
 };
-use anyhow::Context;
 use async_trait::async_trait;
 use rusqlite::Connection;
 use uuid::Uuid;
 
 mod config;
 mod db;
+mod diagnostics;
 mod nextcloud;
 mod queue;
 
@@ -34,6 +35,10 @@ const MSG_DRAIN_INTAKE: u32 = 18;
 const MSG_EDIT_BY_UID: u32 = 19;
 const MSG_DELETE_BY_UID: u32 = 20;
 const MSG_OPEN_NOTE: u32 = 21;
+const MSG_LIST_SOURCES: u32 = 22;
+const MSG_SELECT_SOURCE: u32 = 23;
+const MSG_TRANSFER_TASK: u32 = 24;
+const MSG_GET_DIAGNOSTICS: u32 = 25;
 const MSG_PONG: u32 = 101;
 const MSG_NEXTCLOUD_RESPONSE: u32 = 102;
 const MSG_CALENDARS_RESPONSE: u32 = 103;
@@ -55,9 +60,20 @@ const MSG_DRAIN_INTAKE_RESPONSE: u32 = 118;
 const MSG_EDIT_BY_UID_RESPONSE: u32 = 119;
 const MSG_DELETE_BY_UID_RESPONSE: u32 = 120;
 const MSG_OPEN_NOTE_RESPONSE: u32 = 121;
+const MSG_LIST_SOURCES_RESPONSE: u32 = 122;
+const MSG_SELECT_SOURCE_RESPONSE: u32 = 123;
+const MSG_TRANSFER_TASK_RESPONSE: u32 = 124;
+const MSG_GET_DIAGNOSTICS_RESPONSE: u32 = 125;
 
 #[tokio::main]
 async fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--diagnostics") {
+        match diagnostics::read_tail(200) {
+            Ok(text) => println!("{text}"),
+            Err(e) => eprintln!("retaskable: diagnostics error: {e:#}"),
+        }
+        return;
+    }
     // Headless one-shot mode: `entry --sync-once`. The M14 xochitl capture hook
     // fires this (via command-executor) right after writing an intake file, so a
     // freshly captured to-do reaches the server without the app being open. We
@@ -129,6 +145,7 @@ fn flock_exclusive(path: &std::path::Path) -> anyhow::Result<Option<std::fs::Fil
     }
     let file = std::fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .write(true)
         .open(path)
         .with_context(|| format!("opening lock file {}", path.display()))?;
@@ -181,7 +198,9 @@ impl AppLoadBackend for Backend {
                 // Payload "all" includes finished tasks (Show Completed toggle);
                 // anything else (incl. "open"/"") is the default open-only view.
                 let include_completed = msg.contents.trim() == "all";
-                eprintln!("retaskable: show tasks requested (include_completed={include_completed})");
+                eprintln!(
+                    "retaskable: show tasks requested (include_completed={include_completed})"
+                );
                 let response = match show_tasks(&mut self.db, include_completed) {
                     Ok(s) => s,
                     Err(e) => format!("error: {e:#}"),
@@ -217,7 +236,10 @@ impl AppLoadBackend for Backend {
                 send(replier, MSG_DELETE_RESPONSE, &response);
             }
             MSG_CREATE_TASK => {
-                eprintln!("retaskable: create task requested ({} chars)", msg.contents.len());
+                eprintln!(
+                    "retaskable: create task requested ({} chars)",
+                    msg.contents.len()
+                );
                 let response = match create(&mut self.db, &msg.contents) {
                     Ok(s) => s,
                     Err(e) => format!("error: {e:#}"),
@@ -226,7 +248,10 @@ impl AppLoadBackend for Backend {
                 send(replier, MSG_CREATE_RESPONSE, &response);
             }
             MSG_EDIT_FIRST => {
-                eprintln!("retaskable: edit first task requested ({} chars)", msg.contents.len());
+                eprintln!(
+                    "retaskable: edit first task requested ({} chars)",
+                    msg.contents.len()
+                );
                 let response = match edit_first(&mut self.db, &msg.contents) {
                     Ok(s) => s,
                     Err(e) => format!("error: {e:#}"),
@@ -351,45 +376,129 @@ impl AppLoadBackend for Backend {
                 eprintln!("retaskable: open-note result: {response}");
                 send(replier, MSG_OPEN_NOTE_RESPONSE, &response);
             }
+            MSG_LIST_SOURCES => {
+                let response = match list_sources(&self.db) {
+                    Ok(s) => s,
+                    Err(e) => format!("error: {e:#}"),
+                };
+                send(replier, MSG_LIST_SOURCES_RESPONSE, &response);
+            }
+            MSG_SELECT_SOURCE => {
+                let response = match select_source(&self.db, &msg.contents) {
+                    Ok(s) => s,
+                    Err(e) => format!("error: {e:#}"),
+                };
+                send(replier, MSG_SELECT_SOURCE_RESPONSE, &response);
+            }
+            MSG_TRANSFER_TASK => {
+                let response = match transfer_task(&mut self.db, &msg.contents) {
+                    Ok(s) => s,
+                    Err(e) => format!("error: {e:#}"),
+                };
+                send(replier, MSG_TRANSFER_TASK_RESPONSE, &response);
+            }
+            MSG_GET_DIAGNOSTICS => {
+                send(
+                    replier,
+                    MSG_GET_DIAGNOSTICS_RESPONSE,
+                    &diagnostics::read_tail(80).unwrap_or_else(|e| format!("error: {e:#}")),
+                );
+            }
             t => eprintln!("retaskable: ignoring unknown msg type {t}"),
         }
     }
 }
 
+fn list_sources(db: &Connection) -> anyhow::Result<String> {
+    let active = active_list_href(db)?;
+    Ok(serde_json::json!({
+        "active": active,
+        "sources": db::list_calendars(db)?,
+    })
+    .to_string())
+}
+
+fn select_source(db: &Connection, id: &str) -> anyhow::Result<String> {
+    let id = id.trim();
+    if id.is_empty() || !db::calendar_exists(db, id)? {
+        anyhow::bail!("unknown task list");
+    }
+    let mut cfg = config::load()?;
+    cfg.active_list = Some(id.to_string());
+    config::save(&cfg)?;
+    Ok(serde_json::json!({ "ok": true, "active": id }).to_string())
+}
+
+fn transfer_task(db: &mut Connection, payload: &str) -> anyhow::Result<String> {
+    let value: serde_json::Value = serde_json::from_str(payload)?;
+    let uid = value
+        .get("uid")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let destination = value
+        .get("destination_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let operation = value
+        .get("operation")
+        .and_then(|v| v.as_str())
+        .unwrap_or("copy");
+    if uid.is_empty() || destination.is_empty() {
+        anyhow::bail!("uid and destination_id are required");
+    }
+    if !matches!(operation, "copy" | "move") {
+        anyhow::bail!("operation must be copy or move");
+    }
+    if !db::calendar_exists(db, destination)? {
+        anyhow::bail!("destination task list is not available");
+    }
+    let id = db::transfer_local_to_remote(db, uid, destination, operation == "move")?;
+    Ok(format!(
+        "Queued: {operation} local task to synced list (#{id})"
+    ))
+}
+
 async fn probe_nextcloud() -> anyhow::Result<String> {
     let cfg = config::load()?;
-    nextcloud::probe(&cfg.nextcloud).await
+    nextcloud::probe(&cfg.caldav).await
 }
 
 async fn list_calendars() -> anyhow::Result<String> {
     let cfg = config::load()?;
-    let calendars = nextcloud::discover_calendars(&cfg.nextcloud).await?;
+    let calendars = nextcloud::discover_calendars(&cfg.caldav).await?;
     Ok(serde_json::to_string_pretty(&calendars)?)
 }
 
-fn show_tasks(db: &mut Connection, include_completed: bool) -> anyhow::Result<String> {
+fn active_list_href(db: &Connection) -> anyhow::Result<String> {
+    db::ensure_local_list(db)?;
     let cfg = config::load()?;
-    let wanted = cfg.nextcloud.calendar.as_ref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "config is missing `calendar = \"...\"` under [nextcloud]. \
-             Run List Calendars to see options."
-        )
-    })?;
+    if let Some(id) = config::active_list(&cfg) {
+        if id == config::LOCAL_LIST_ID || db::calendar_exists(db, id)? {
+            return Ok(id.to_string());
+        }
+    }
+    if let Some(name) = cfg.caldav.calendar.as_deref() {
+        if let Some(href) = db::get_calendar_href_by_display_name(db, name)? {
+            return Ok(href);
+        }
+    }
+    Ok(config::LOCAL_LIST_ID.to_string())
+}
 
-    let Some(cal_href) = db::get_calendar_href_by_display_name(db, wanted)? else {
-        return Ok(format!(
-            "calendar {wanted:?} not yet synced -- tap Sync first."
-        ));
-    };
+fn show_tasks(db: &mut Connection, include_completed: bool) -> anyhow::Result<String> {
+    let cal_href = active_list_href(db)?;
 
     let tasks = db::list_tasks(db, &cal_href)?;
     let tasks = nextcloud::filter_for_display(tasks, include_completed);
     let marks = db::pending_marks(db, &cal_href)?;
     let sources = db::source_labels(db, &cal_href)?;
     let anchors = db::source_anchors(db, &cal_href)?;
-    let last_synced = match db::last_synced(db, &cal_href)? {
-        Some(t) => Some(format!("Last synced {} ago.", humanize_since(t))),
-        None => None,
+    let last_synced = if db::is_local_list(&cal_href) {
+        Some("Stored on this reMarkable.".to_string())
+    } else {
+        db::last_synced(db, &cal_href)?.map(|t| format!("Last synced {} ago.", humanize_since(t)))
     };
     let conflicts = db::count_resolvable_conflicts(db)?;
     Ok(nextcloud::format_tasks_json(
@@ -469,9 +578,7 @@ fn compose_sync_response(
     };
 
     let sync_line = match sync_kind {
-        Some(kind) => format!(
-            "Sync complete: {kind}, +{updated} updated, -{deleted} deleted."
-        ),
+        Some(kind) => format!("Sync complete: {kind}, +{updated} updated, -{deleted} deleted."),
         None => "network failed; sync-collection skipped".to_string(),
     };
 
@@ -510,7 +617,11 @@ fn format_conflict_preview(
         None => local_summary,
     };
 
-    let local_marker = if local_completed { "completed" } else { "not completed" };
+    let local_marker = if local_completed {
+        "completed"
+    } else {
+        "not completed"
+    };
     let server_line = match server {
         Some((s, c)) => {
             let m = if c { "completed" } else { "not completed" };
@@ -584,8 +695,8 @@ mod tests {
         .unwrap();
         db::enqueue_create(&mut conn, "/cal/", "uid-1", "Buy milk").unwrap();
 
-        let out = edit_by_uid_inner(&mut conn, "/cal/", "uid-1", "Buy oat milk", None)
-            .expect("edit");
+        let out =
+            edit_by_uid_inner(&mut conn, "/cal/", "uid-1", "Buy oat milk", None).expect("edit");
         assert!(out.contains("Buy milk"), "old summary in status: {out}");
         assert!(out.contains("Buy oat milk"), "new summary in status: {out}");
 
@@ -643,7 +754,10 @@ mod tests {
         // `u` = deliver to QML/UI; trailing newline terminates the pipe command.
         assert_eq!(jump_command("doc-1,idx:2"), "ureTaskableJump:doc-1,idx:2\n");
         // Anchor is trimmed (the value itself has no internal trimming).
-        assert_eq!(jump_command("  doc-1,idx:0  "), "ureTaskableJump:doc-1,idx:0\n");
+        assert_eq!(
+            jump_command("  doc-1,idx:0  "),
+            "ureTaskableJump:doc-1,idx:0\n"
+        );
     }
 
     #[test]
@@ -684,7 +798,10 @@ mod tests {
         assert_eq!(tasks.len(), 2);
         let sources = db::source_labels(&conn, "/cal/").unwrap();
         assert_eq!(sources.len(), 1);
-        assert_eq!(sources.values().next().map(String::as_str), Some("Plan · p.3"));
+        assert_eq!(
+            sources.values().next().map(String::as_str),
+            Some("Plan · p.3")
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -706,7 +823,10 @@ mod tests {
 
         drop(first);
         let third = flock_exclusive(&path).expect("third acquire");
-        assert!(third.is_some(), "lock should be free after the holder drops");
+        assert!(
+            third.is_some(),
+            "lock should be free after the holder drops"
+        );
 
         drop(third);
         let _ = std::fs::remove_file(&path);
@@ -726,10 +846,13 @@ mod tests {
 
     fn cfg(base_url: &str, calendar: Option<&str>) -> config::Config {
         config::Config {
-            nextcloud: config::NextcloudConfig {
+            active_list: None,
+            caldav: config::CaldavConfig {
+                provider: "generic".to_string(),
                 base_url: base_url.to_string(),
                 username: "u".to_string(),
                 app_password: "p".to_string(),
+                calendar_href: calendar.map(|s| s.to_string()),
                 calendar: calendar.map(|s| s.to_string()),
             },
         }
@@ -739,13 +862,29 @@ mod tests {
     fn target_changed_true_on_first_run_url_or_calendar() {
         let old = cfg("https://a", Some("Personal"));
         // first run (no prior config)
-        assert!(target_changed(None, "https://a", &Some("Personal".to_string())));
+        assert!(target_changed(
+            None,
+            "https://a",
+            &Some("Personal".to_string())
+        ));
         // identical target -> unchanged
-        assert!(!target_changed(Some(&old), "https://a", &Some("Personal".to_string())));
+        assert!(!target_changed(
+            Some(&old),
+            "https://a",
+            &Some("Personal".to_string())
+        ));
         // server url changed
-        assert!(target_changed(Some(&old), "https://b", &Some("Personal".to_string())));
+        assert!(target_changed(
+            Some(&old),
+            "https://b",
+            &Some("Personal".to_string())
+        ));
         // calendar changed
-        assert!(target_changed(Some(&old), "https://a", &Some("Work".to_string())));
+        assert!(target_changed(
+            Some(&old),
+            "https://a",
+            &Some("Work".to_string())
+        ));
     }
 
     #[test]
@@ -753,7 +892,11 @@ mod tests {
         // Same base_url + calendar; only username/password would differ. The
         // helper only inspects target, so it must report no change.
         let old = cfg("https://a", Some("Personal"));
-        assert!(!target_changed(Some(&old), "https://a", &Some("Personal".to_string())));
+        assert!(!target_changed(
+            Some(&old),
+            "https://a",
+            &Some("Personal".to_string())
+        ));
     }
 
     #[test]
@@ -791,12 +934,29 @@ mod tests {
     }
 
     #[test]
+    fn icloud_requires_email_identity_and_scrubs_paste_whitespace() {
+        assert!(validate_account_identity("icloud", "old-nextcloud-user").is_err());
+        assert!(validate_account_identity("icloud", "person@example.com").is_ok());
+        assert_eq!(
+            normalize_submitted_password("icloud", "abcd-efgh \n ijkl-mnop"),
+            "abcd-efghijkl-mnop"
+        );
+        assert_eq!(
+            normalize_submitted_password("generic", " keep spaces "),
+            " keep spaces "
+        );
+    }
+
+    #[test]
     fn format_discover_error_explains_dns_failures() {
         let err = anyhow::anyhow!(
             "step 1: PROPFIND .well-known/caldav: sending request: No address associated with hostname"
         );
         let msg = format_discover_error(&err);
-        assert!(msg.contains("Could not resolve the server hostname"), "got {msg}");
+        assert!(
+            msg.contains("Could not resolve the server hostname"),
+            "got {msg}"
+        );
         assert!(msg.contains("step 1: PROPFIND"), "got {msg}");
     }
 
@@ -864,7 +1024,11 @@ mod tests {
     #[test]
     fn compose_flush_then_sync_prepends_flushed_line() {
         // AC1.3
-        let flush = FlushSummary { flushed: 5, retried: 1, ..Default::default() };
+        let flush = FlushSummary {
+            flushed: 5,
+            retried: 1,
+            ..Default::default()
+        };
         let out = compose_sync_response(&flush, Some("incremental"), 0, 0);
         assert_eq!(out, "Flushed 5 / 0 errored (1 retried).\nSync complete: incremental, +0 updated, -0 deleted.");
     }
@@ -872,9 +1036,16 @@ mod tests {
     #[test]
     fn compose_transient_break_appends_skipped_line() {
         // AC1.4
-        let flush = FlushSummary { flushed: 2, transient_failed: 1, ..Default::default() };
+        let flush = FlushSummary {
+            flushed: 2,
+            transient_failed: 1,
+            ..Default::default()
+        };
         let out = compose_sync_response(&flush, None, 0, 0);
-        assert_eq!(out, "Flushed 2 / 0 errored (0 retried).\nnetwork failed; sync-collection skipped");
+        assert_eq!(
+            out,
+            "Flushed 2 / 0 errored (0 retried).\nnetwork failed; sync-collection skipped"
+        );
     }
 
     #[test]
@@ -933,14 +1104,7 @@ mod tests {
 
     #[test]
     fn format_conflict_preview_uses_local_summary_in_header_when_server_gone() {
-        let out = format_conflict_preview(
-            99,
-            "edit",
-            "uid-zzzz",
-            "Local-only task",
-            false,
-            None,
-        );
+        let out = format_conflict_preview(99, "edit", "uid-zzzz", "Local-only task", false, None);
         assert!(out.starts_with("OPID:99\n"));
         assert!(out.contains("Conflict on \"Local-only task\""));
         assert!(out.contains("Server: (deleted server-side)\n"));
@@ -995,7 +1159,9 @@ mod tests {
         let _mock = server
             .mock_async(|when, then| {
                 when.method(GET).path("/cal/walk.ics");
-                then.status(200).header("ETag", "\"server-etag\"").body(server_ical);
+                then.status(200)
+                    .header("ETag", "\"server-etag\"")
+                    .body(server_ical);
             })
             .await;
 
@@ -1027,7 +1193,8 @@ mod tests {
              VALUES ('toggle', 'uid-walk', ?1, NULL, 100, 1,
                      'double-412 (server-side conflict)')",
             params![cal_href],
-        ).unwrap();
+        )
+        .unwrap();
 
         let calendar_url: url::Url = cal_href.parse().unwrap();
         let client = reqwest::Client::new();
@@ -1080,10 +1247,7 @@ mod tests {
         let out = apply_keep_mine_inner(&mut conn, &client, ("u", "p"), &url, 42)
             .await
             .expect("ok");
-        assert!(
-            out.contains("already resolved or cleared"),
-            "got: {out}"
-        );
+        assert!(out.contains("already resolved or cleared"), "got: {out}");
     }
 
     #[tokio::test]
@@ -1097,13 +1261,17 @@ mod tests {
                                      enqueued_at, errored, last_error)
              VALUES ('toggle', 'uid-x', '/cal/', NULL, 100, 1, 'HTTP 401 Unauthorized')",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         let url: url::Url = "http://example.invalid/cal/".parse().unwrap();
         let client = reqwest::Client::new();
         let out = apply_keep_mine_inner(&mut conn, &client, ("u", "p"), &url, 1)
             .await
             .expect("ok");
-        assert!(out.contains("no longer in a resolvable state"), "got: {out}");
+        assert!(
+            out.contains("no longer in a resolvable state"),
+            "got: {out}"
+        );
     }
 
     #[tokio::test]
@@ -1119,7 +1287,9 @@ mod tests {
         let _get = server
             .mock_async(|when, then| {
                 when.method(GET).path("/cal/walk.ics");
-                then.status(200).header("ETag", "\"etag-fresh\"").body(server_ical);
+                then.status(200)
+                    .header("ETag", "\"etag-fresh\"")
+                    .body(server_ical);
             })
             .await;
         // PUT with fresh etag succeeds.
@@ -1166,17 +1336,22 @@ mod tests {
         assert!(out.contains("Walk the dog"));
         assert!(out.contains("completed"));
         // 1 cascaded sibling beyond the parent.
-        assert!(out.contains("1 cascaded"), "expected cascaded count in: {out}");
+        assert!(
+            out.contains("1 cascaded"),
+            "expected cascaded count in: {out}"
+        );
 
         // Cache etag updated.
-        let etag: String = conn.query_row(
-            "SELECT etag FROM task WHERE uid = 'uid-walk'", [], |r| r.get(0),
-        ).unwrap();
+        let etag: String = conn
+            .query_row("SELECT etag FROM task WHERE uid = 'uid-walk'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
         assert_eq!(etag, "\"etag-after-keep\"");
         // Both pending_op rows gone.
-        let remaining: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM pending_op", [], |r| r.get(0),
-        ).unwrap();
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pending_op", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(remaining, 0);
     }
 
@@ -1192,7 +1367,9 @@ mod tests {
         let _get = server
             .mock_async(|when, then| {
                 when.method(GET).path("/cal/t.ics");
-                then.status(200).header("ETag", "\"etag-fresh\"").body(server_ical);
+                then.status(200)
+                    .header("ETag", "\"etag-fresh\"")
+                    .body(server_ical);
             })
             .await;
         let _put = server
@@ -1220,7 +1397,8 @@ mod tests {
                                      enqueued_at, errored, last_error)
              VALUES ('toggle', 'uid-t', ?1, NULL, 100, 1, 'double-412 (server-side conflict)')",
             params![cal_href],
-        ).unwrap();
+        )
+        .unwrap();
 
         let calendar_url: url::Url = cal_href.parse().unwrap();
         let client = reqwest::Client::new();
@@ -1230,11 +1408,14 @@ mod tests {
         assert!(out.contains("Conflict reopened"), "got: {out}");
 
         // Op still errored, etag unchanged.
-        let (errored, etag): (i64, String) = conn.query_row(
-            "SELECT p.errored, t.etag FROM pending_op p, task t
+        let (errored, etag): (i64, String) = conn
+            .query_row(
+                "SELECT p.errored, t.etag FROM pending_op p, task t
              WHERE p.id = 1 AND t.uid = 'uid-t'",
-            [], |r| Ok((r.get(0)?, r.get(1)?)),
-        ).unwrap();
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
         assert_eq!(errored, 1);
         assert_eq!(etag, "etag-stale");
     }
@@ -1269,7 +1450,8 @@ mod tests {
                                      enqueued_at, errored, last_error)
              VALUES ('toggle', 'uid-g', ?1, NULL, 100, 1, 'double-412 (server-side conflict)')",
             params![cal_href],
-        ).unwrap();
+        )
+        .unwrap();
 
         let calendar_url: url::Url = cal_href.parse().unwrap();
         let client = reqwest::Client::new();
@@ -1278,9 +1460,11 @@ mod tests {
             .expect("ok");
         assert!(out.contains("deleted server-side"), "got: {out}");
         // Op still errored.
-        let errored: i64 = conn.query_row(
-            "SELECT errored FROM pending_op WHERE id = 1", [], |r| r.get(0),
-        ).unwrap();
+        let errored: i64 = conn
+            .query_row("SELECT errored FROM pending_op WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
         assert_eq!(errored, 1);
     }
 
@@ -1300,7 +1484,9 @@ mod tests {
         let _get = server
             .mock_async(|when, then| {
                 when.method(GET).path("/cal/walk.ics");
-                then.status(200).header("ETag", "\"etag-fresh\"").body(server_ical);
+                then.status(200)
+                    .header("ETag", "\"etag-fresh\"")
+                    .body(server_ical);
             })
             .await;
 
@@ -1339,17 +1525,20 @@ mod tests {
         assert!(out.contains("1 cascaded"));
 
         // Cache row replaced with server state.
-        let (summary, status, etag): (String, String, String) = conn.query_row(
-            "SELECT summary, status, etag FROM task WHERE uid = 'uid-walk'",
-            [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        ).unwrap();
+        let (summary, status, etag): (String, String, String) = conn
+            .query_row(
+                "SELECT summary, status, etag FROM task WHERE uid = 'uid-walk'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
         assert_eq!(summary, "Walk the dog (server's version)");
         assert_eq!(status, "completed");
         assert_eq!(etag, "\"etag-fresh\"");
         // Both pending_op rows gone.
-        let remaining: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM pending_op", [], |r| r.get(0),
-        ).unwrap();
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pending_op", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(remaining, 0);
     }
 
@@ -1396,14 +1585,18 @@ mod tests {
             "got: {out}"
         );
         // Cache row gone.
-        let cache_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM task WHERE uid = 'uid-g'", [], |r| r.get(0),
-        ).unwrap();
+        let cache_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM task WHERE uid = 'uid-g'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
         assert_eq!(cache_count, 0);
         // Op gone.
-        let op_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM pending_op WHERE id = 1", [], |r| r.get(0),
-        ).unwrap();
+        let op_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pending_op WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
         assert_eq!(op_count, 0);
     }
 
@@ -1491,7 +1684,8 @@ mod tests {
              VALUES ('edit', 'uid-gone', ?1, '{\"summary\":\"Local edit\"}', 100, 1,
                      'double-412 (server-side conflict)')",
             params![cal_href],
-        ).unwrap();
+        )
+        .unwrap();
 
         let calendar_url: url::Url = cal_href.parse().unwrap();
         let client = reqwest::Client::new();
@@ -1516,33 +1710,33 @@ async fn sync(db: &mut Connection) -> anyhow::Result<String> {
     }
 
     let cfg = config::load()?;
-    let wanted = cfg.nextcloud.calendar.as_ref().ok_or_else(|| {
+    if !config::has_remote(&cfg) {
+        return Ok("Local tasks saved. No CalDAV account configured.".to_string());
+    }
+
+    let calendars = nextcloud::discover_calendars(&cfg.caldav).await?;
+    let cal = if let Some(href) = cfg.caldav.calendar_href.as_deref() {
+        calendars.iter().find(|c| c.href == href)
+    } else if let Some(name) = cfg.caldav.calendar.as_deref() {
+        calendars.iter().find(|c| c.display_name == name)
+    } else {
+        None
+    }
+    .ok_or_else(|| {
+        let names: Vec<&str> = calendars.iter().map(|c| c.display_name.as_str()).collect();
         anyhow::anyhow!(
-            "config is missing `calendar = \"...\"` under [nextcloud]. \
-             Run List Calendars to see options."
+            "configured task list not found among discovered calendars: {:?}",
+            names
         )
     })?;
-
-    let calendars = nextcloud::discover_calendars(&cfg.nextcloud).await?;
-    let cal = calendars
-        .iter()
-        .find(|c| c.display_name == *wanted)
-        .ok_or_else(|| {
-            let names: Vec<&str> = calendars.iter().map(|c| c.display_name.as_str()).collect();
-            anyhow::anyhow!(
-                "calendar {:?} not found among discovered calendars: {:?}",
-                wanted,
-                names
-            )
-        })?;
 
     db::upsert_calendar(db, &cal.href, &cal.display_name)?;
 
     let calendar_url = url::Url::parse(&cal.href)?;
-    let client = reqwest::Client::new();
+    let client = nextcloud::dav_client()?;
     let auth = (
-        cfg.nextcloud.username.as_str(),
-        cfg.nextcloud.app_password.as_str(),
+        cfg.caldav.username.as_str(),
+        cfg.caldav.app_password.as_str(),
     );
 
     // --- Phase 1: drain the queue ---
@@ -1569,8 +1763,11 @@ async fn sync(db: &mut Connection) -> anyhow::Result<String> {
     if was_full {
         // Full sync: server returned every resource. Reconcile by deleting
         // anything we hold locally that wasn't in the response.
-        let kept: std::collections::HashSet<String> =
-            delta.added_or_updated.iter().map(|r| r.href.clone()).collect();
+        let kept: std::collections::HashSet<String> = delta
+            .added_or_updated
+            .iter()
+            .map(|r| r.href.clone())
+            .collect();
         for record in &delta.added_or_updated {
             db::upsert_task(
                 db,
@@ -1619,19 +1816,7 @@ async fn sync(db: &mut Connection) -> anyhow::Result<String> {
 }
 
 fn toggle_first(db: &mut Connection) -> anyhow::Result<String> {
-    let cfg = config::load()?;
-    let wanted = cfg.nextcloud.calendar.as_ref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "config is missing `calendar = \"...\"` under [nextcloud]. \
-             Run List Calendars to see options."
-        )
-    })?;
-
-    let Some(cal_href) = db::get_calendar_href_by_display_name(db, wanted)? else {
-        return Ok(format!(
-            "calendar {wanted:?} not yet synced -- tap Sync first."
-        ));
-    };
+    let cal_href = active_list_href(db)?;
 
     let Some(task) = db::get_first_task(db, &cal_href)? else {
         return Ok("no tasks in cache -- tap Sync first.".to_string());
@@ -1644,10 +1829,15 @@ fn toggle_first(db: &mut Connection) -> anyhow::Result<String> {
         "completed"
     };
 
-    let op_id = db::enqueue_toggle(db, &cal_href, &task.uid)?;
-    Ok(format!(
-        "Queued: toggle \"{summary}\" -> {new_state} (#{op_id})"
-    ))
+    if db::is_local_list(&cal_href) {
+        db::toggle_local(db, &task.uid)?;
+        Ok(format!("Updated local task \"{summary}\" -> {new_state}"))
+    } else {
+        let op_id = db::enqueue_toggle(db, &cal_href, &task.uid)?;
+        Ok(format!(
+            "Queued: toggle \"{summary}\" -> {new_state} (#{op_id})"
+        ))
+    }
 }
 
 /// MSG_TOGGLE_BY_UID handler. The M10 ListView addresses a specific task by its
@@ -1660,19 +1850,7 @@ fn toggle_by_uid(db: &mut Connection, uid: &str) -> anyhow::Result<String> {
         anyhow::bail!("uid cannot be empty");
     }
 
-    let cfg = config::load()?;
-    let wanted = cfg.nextcloud.calendar.as_ref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "config is missing `calendar = \"...\"` under [nextcloud]. \
-             Run List Calendars to see options."
-        )
-    })?;
-
-    let Some(cal_href) = db::get_calendar_href_by_display_name(db, wanted)? else {
-        return Ok(format!(
-            "calendar {wanted:?} not yet synced -- tap Sync first."
-        ));
-    };
+    let cal_href = active_list_href(db)?;
 
     toggle_by_uid_inner(db, &cal_href, uid)
 }
@@ -1681,11 +1859,7 @@ fn toggle_by_uid(db: &mut Connection, uid: &str) -> anyhow::Result<String> {
 /// applies optimistically: `{"uid":…,"completed":bool,"mark":"*"}`. The status
 /// flip happens in `db::enqueue_toggle` (cache is mutated at enqueue time), and
 /// the freshly-queued op renders as `*` until the next Sync reconciles it.
-fn toggle_by_uid_inner(
-    db: &mut Connection,
-    cal_href: &str,
-    uid: &str,
-) -> anyhow::Result<String> {
+fn toggle_by_uid_inner(db: &mut Connection, cal_href: &str, uid: &str) -> anyhow::Result<String> {
     let Some(task) = db::get_cached_task_by_uid(db, cal_href, uid)? else {
         anyhow::bail!("no task with uid {uid}");
     };
@@ -1694,13 +1868,17 @@ fn toggle_by_uid_inner(
     // enqueue_toggle flips the cached status in place and inserts the pending op.
     // It enforces liveness (errors on a tombstoned/missing row), so a stale uid
     // surfaces as an Err the dispatcher renders as "error: ...".
-    db::enqueue_toggle(db, cal_href, uid)?;
+    if db::is_local_list(cal_href) {
+        db::toggle_local(db, uid)?;
+    } else {
+        db::enqueue_toggle(db, cal_href, uid)?;
+    }
 
     let now_completed = !was_completed;
     Ok(serde_json::json!({
         "uid": uid,
         "completed": now_completed,
-        "mark": "*",
+        "mark": if db::is_local_list(cal_href) { "" } else { "*" },
     })
     .to_string())
 }
@@ -1728,19 +1906,7 @@ fn edit_by_uid(db: &mut Connection, payload: &str) -> anyhow::Result<String> {
         anyhow::bail!("summary cannot be empty");
     }
 
-    let cfg = config::load()?;
-    let wanted = cfg.nextcloud.calendar.as_ref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "config is missing `calendar = \"...\"` under [nextcloud]. \
-             Run List Calendars to see options."
-        )
-    })?;
-
-    let Some(cal_href) = db::get_calendar_href_by_display_name(db, wanted)? else {
-        return Ok(format!(
-            "calendar {wanted:?} not yet synced -- tap Sync first."
-        ));
-    };
+    let cal_href = active_list_href(db)?;
 
     edit_by_uid_inner(db, &cal_href, uid, new_summary, due)
 }
@@ -1761,10 +1927,17 @@ fn edit_by_uid_inner(
         anyhow::bail!("no task with uid {uid}");
     };
     let old_summary = task.summary.clone();
-    let op_id = db::enqueue_edit(db, cal_href, uid, new_summary, due)?;
-    Ok(format!(
-        "Queued: edit \"{old_summary}\" -> \"{new_summary}\" (#{op_id})"
-    ))
+    if db::is_local_list(cal_href) {
+        db::edit_local(db, uid, new_summary, due)?;
+        Ok(format!(
+            "Updated local task \"{old_summary}\" -> \"{new_summary}\""
+        ))
+    } else {
+        let op_id = db::enqueue_edit(db, cal_href, uid, new_summary, due)?;
+        Ok(format!(
+            "Queued: edit \"{old_summary}\" -> \"{new_summary}\" (#{op_id})"
+        ))
+    }
 }
 
 /// MSG_DELETE_BY_UID handler. Deletes a specific task by UID (the one the
@@ -1776,19 +1949,7 @@ fn delete_by_uid(db: &mut Connection, uid: &str) -> anyhow::Result<String> {
         anyhow::bail!("uid cannot be empty");
     }
 
-    let cfg = config::load()?;
-    let wanted = cfg.nextcloud.calendar.as_ref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "config is missing `calendar = \"...\"` under [nextcloud]. \
-             Run List Calendars to see options."
-        )
-    })?;
-
-    let Some(cal_href) = db::get_calendar_href_by_display_name(db, wanted)? else {
-        return Ok(format!(
-            "calendar {wanted:?} not yet synced -- tap Sync first."
-        ));
-    };
+    let cal_href = active_list_href(db)?;
 
     delete_by_uid_inner(db, &cal_href, uid)
 }
@@ -1797,17 +1958,18 @@ fn delete_by_uid(db: &mut Connection, uid: &str) -> anyhow::Result<String> {
 /// `enqueue_delete` sets `pending_delete = 1` (so the row drops out of the open
 /// list on the next MSG 4 refresh) and inserts the pending op. A
 /// missing/already-deleted uid surfaces as an Err.
-fn delete_by_uid_inner(
-    db: &mut Connection,
-    cal_href: &str,
-    uid: &str,
-) -> anyhow::Result<String> {
+fn delete_by_uid_inner(db: &mut Connection, cal_href: &str, uid: &str) -> anyhow::Result<String> {
     let Some(task) = db::get_cached_task_by_uid(db, cal_href, uid)? else {
         anyhow::bail!("no task with uid {uid}");
     };
     let summary = task.summary.clone();
-    let op_id = db::enqueue_delete(db, cal_href, uid)?;
-    Ok(format!("Queued: delete \"{summary}\" (#{op_id})"))
+    if db::is_local_list(cal_href) {
+        db::delete_local(db, uid)?;
+        Ok(format!("Deleted local task \"{summary}\""))
+    } else {
+        let op_id = db::enqueue_delete(db, cal_href, uid)?;
+        Ok(format!("Queued: delete \"{summary}\" (#{op_id})"))
+    }
 }
 
 /// Build the xovi-message-broker pipe command that drives the M15 jump-back.
@@ -1847,10 +2009,13 @@ fn get_config() -> String {
     match config::load_optional() {
         Ok(Some(c)) => serde_json::json!({
             "configured": true,
-            "base_url": c.nextcloud.base_url,
-            "username": c.nextcloud.username,
-            "calendar": c.nextcloud.calendar,
-            "has_password": !c.nextcloud.app_password.is_empty(),
+            "provider": c.caldav.provider,
+            "base_url": c.caldav.base_url,
+            "username": c.caldav.username,
+            "calendar": c.caldav.calendar,
+            "calendar_href": c.caldav.calendar_href,
+            "active_list": config::active_list(&c),
+            "has_password": !c.caldav.app_password.is_empty(),
         })
         .to_string(),
         Ok(None) => serde_json::json!({
@@ -1872,10 +2037,14 @@ fn get_config() -> String {
 /// Did the sync *target* change? A changed server URL or calendar invalidates
 /// the local cache; a username/password-only change does not (same data, new
 /// auth), so we keep the cache + any queued offline ops in that case.
-fn target_changed(old: Option<&config::Config>, base_url: &str, calendar: &Option<String>) -> bool {
+fn target_changed(
+    old: Option<&config::Config>,
+    base_url: &str,
+    calendar_href: &Option<String>,
+) -> bool {
     match old {
         None => true,
-        Some(o) => o.nextcloud.base_url != base_url || &o.nextcloud.calendar != calendar,
+        Some(o) => o.caldav.base_url != base_url || &o.caldav.calendar_href != calendar_href,
     }
 }
 
@@ -1912,6 +2081,21 @@ fn normalize_base_url(input: &str) -> anyhow::Result<String> {
     Ok(url.as_str().trim_end_matches('/').to_string())
 }
 
+fn validate_account_identity(provider: &str, username: &str) -> anyhow::Result<()> {
+    if provider == "icloud" && !username.contains('@') {
+        anyhow::bail!("iCloud username must be the full Apple Account email address");
+    }
+    Ok(())
+}
+
+fn normalize_submitted_password(provider: &str, password: &str) -> String {
+    if provider == "icloud" {
+        password.chars().filter(|c| !c.is_whitespace()).collect()
+    } else {
+        password.to_string()
+    }
+}
+
 fn format_discover_error(err: &anyhow::Error) -> String {
     let msg = format!("{err:#}");
     let lower = msg.to_ascii_lowercase();
@@ -1919,13 +2103,20 @@ fn format_discover_error(err: &anyhow::Error) -> String {
         || lower.contains("failed to lookup address information")
         || lower.contains("dns")
     {
-        return format!("Could not resolve the server hostname. Check the Server URL. Details: {msg}");
+        return format!(
+            "Could not resolve the server hostname. Check the Server URL. Details: {msg}"
+        );
     }
     if lower.contains("parsing server url") || lower.contains("parsing base_url") {
         return format!("Server URL is not valid. Use a bare URL like https://nextcloud.example.com. Details: {msg}");
     }
     if lower.contains("401") || lower.contains("403") {
-        return format!("Nextcloud rejected the username or app password. Details: {msg}");
+        return format!("The CalDAV server rejected the username or app password. Details: {msg}");
+    }
+    if lower.contains("timed out") || lower.contains("timeout") {
+        return format!(
+            "DAV-DISCOVERY-TIMEOUT: the CalDAV discovery request timed out. Details: {msg}"
+        );
     }
     msg
 }
@@ -1942,11 +2133,36 @@ fn save_config(db: &mut Connection, payload: &str) -> String {
 
 fn save_config_inner(db: &mut Connection, payload: &str) -> anyhow::Result<()> {
     let v: serde_json::Value = serde_json::from_str(payload)?;
-    let base_url = normalize_base_url(v.get("base_url").and_then(|x| x.as_str()).unwrap_or(""))?;
-    let username = v.get("username").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
-    let new_password = v.get("app_password").and_then(|x| x.as_str()).unwrap_or("");
+    let provider = v
+        .get("provider")
+        .and_then(|x| x.as_str())
+        .unwrap_or("generic")
+        .trim()
+        .to_ascii_lowercase();
+    let requested_base = if provider == "icloud" {
+        "https://caldav.icloud.com/"
+    } else {
+        v.get("base_url").and_then(|x| x.as_str()).unwrap_or("")
+    };
+    let base_url = normalize_base_url(requested_base)?;
+    let username = v
+        .get("username")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    validate_account_identity(&provider, &username)?;
+    let new_password = normalize_submitted_password(
+        &provider,
+        v.get("app_password").and_then(|x| x.as_str()).unwrap_or(""),
+    );
     let calendar = v
         .get("calendar")
+        .and_then(|x| x.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let calendar_href = v
+        .get("calendar_href")
         .and_then(|x| x.as_str())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
@@ -1955,15 +2171,37 @@ fn save_config_inner(db: &mut Connection, payload: &str) -> anyhow::Result<()> {
     }
 
     let old = config::load_optional()?;
-    let app_password =
-        config::merge_password(new_password, old.as_ref().map(|c| c.nextcloud.app_password.as_str()));
-    let changed = target_changed(old.as_ref(), &base_url, &calendar);
+    let same_identity = old.as_ref().is_some_and(|c| {
+        c.caldav.provider == provider
+            && c.caldav.base_url == base_url
+            && c.caldav.username == username
+    });
+    let existing_password = old
+        .as_ref()
+        .filter(|_| same_identity)
+        .map(|c| c.caldav.app_password.as_str());
+    let app_password = config::merge_password(&new_password, existing_password);
+    if app_password.is_empty() {
+        anyhow::bail!("an app password is required when the CalDAV account changes");
+    }
+    let changed = target_changed(old.as_ref(), &base_url, &calendar_href);
+    let active_list = v
+        .get("active_list")
+        .and_then(|x| x.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| calendar_href.clone())
+        .or_else(|| Some(config::LOCAL_LIST_ID.to_string()));
 
     let cfg = config::Config {
-        nextcloud: config::NextcloudConfig {
+        active_list,
+        caldav: config::CaldavConfig {
+            provider,
             base_url,
             username,
             app_password,
+            calendar_href,
             calendar,
         },
     };
@@ -1988,25 +2226,61 @@ async fn discover_with(payload: &str) -> String {
                 .collect::<Vec<_>>(),
         })
         .to_string(),
-        Err(e) => serde_json::json!({ "ok": false, "error": format_discover_error(&e) }).to_string(),
+        Err(e) => {
+            serde_json::json!({ "ok": false, "error": format_discover_error(&e) }).to_string()
+        }
     }
 }
 
 async fn discover_with_inner(payload: &str) -> anyhow::Result<Vec<nextcloud::Calendar>> {
     let v: serde_json::Value = serde_json::from_str(payload)?;
-    let base_url = normalize_base_url(v.get("base_url").and_then(|x| x.as_str()).unwrap_or(""))?;
-    let username = v.get("username").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
-    let new_password = v.get("app_password").and_then(|x| x.as_str()).unwrap_or("");
+    let provider = v
+        .get("provider")
+        .and_then(|x| x.as_str())
+        .unwrap_or("generic")
+        .trim()
+        .to_ascii_lowercase();
+    let requested_base = if provider == "icloud" {
+        "https://caldav.icloud.com/"
+    } else {
+        v.get("base_url").and_then(|x| x.as_str()).unwrap_or("")
+    };
+    let base_url = normalize_base_url(requested_base)?;
+    let username = v
+        .get("username")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    validate_account_identity(&provider, &username)?;
+    let new_password = normalize_submitted_password(
+        &provider,
+        v.get("app_password").and_then(|x| x.as_str()).unwrap_or(""),
+    );
     if base_url.is_empty() || username.is_empty() {
         anyhow::bail!("base_url and username are required");
     }
     let old = config::load_optional()?;
-    let app_password =
-        config::merge_password(new_password, old.as_ref().map(|c| c.nextcloud.app_password.as_str()));
-    let cfg = config::NextcloudConfig {
+    let same_identity = old.as_ref().is_some_and(|c| {
+        c.caldav.provider == provider
+            && c.caldav.base_url == base_url
+            && c.caldav.username == username
+    });
+    let app_password = config::merge_password(
+        &new_password,
+        old.as_ref()
+            .filter(|_| same_identity)
+            .map(|c| c.caldav.app_password.as_str()),
+    );
+    if app_password.is_empty() {
+        anyhow::bail!("enter an app password for this CalDAV account");
+    }
+    let cfg = config::CaldavConfig {
+        provider,
         base_url,
         username,
         app_password,
+        calendar_href: None,
         calendar: None,
     };
     nextcloud::discover_calendars(&cfg).await
@@ -2016,15 +2290,22 @@ fn create(db: &mut Connection, payload: &str) -> anyhow::Result<String> {
     // M16: payload is JSON `{summary, due}`. Fall back to treating the whole
     // payload as a bare summary (no due) so a pre-M16 plain-string sender still
     // works. `due` is the normalized token ("" / YYYYMMDD / YYYYMMDDTHHMMSS).
-    let (summary_owned, due_owned) =
-        match serde_json::from_str::<serde_json::Value>(payload) {
-            Ok(v) if v.is_object() => {
-                let s = v.get("summary").and_then(|x| x.as_str()).unwrap_or("").to_string();
-                let d = v.get("due").and_then(|x| x.as_str()).unwrap_or("").to_string();
-                (s, d)
-            }
-            _ => (payload.to_string(), String::new()),
-        };
+    let (summary_owned, due_owned) = match serde_json::from_str::<serde_json::Value>(payload) {
+        Ok(v) if v.is_object() => {
+            let s = v
+                .get("summary")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            let d = v
+                .get("due")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            (s, d)
+        }
+        _ => (payload.to_string(), String::new()),
+    };
     let summary = summary_owned.trim();
     if summary.is_empty() {
         anyhow::bail!("summary cannot be empty");
@@ -2032,23 +2313,16 @@ fn create(db: &mut Connection, payload: &str) -> anyhow::Result<String> {
     let due = due_owned.trim();
     let due_opt = if due.is_empty() { None } else { Some(due) };
 
-    let cfg = config::load()?;
-    let wanted = cfg.nextcloud.calendar.as_ref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "config is missing `calendar = \"...\"` under [nextcloud]. \
-             Run List Calendars to see options."
-        )
-    })?;
-
-    let Some(cal_href) = db::get_calendar_href_by_display_name(db, wanted)? else {
-        return Ok(format!(
-            "calendar {wanted:?} not yet synced -- tap Sync first."
-        ));
-    };
+    let cal_href = active_list_href(db)?;
 
     let uid = Uuid::new_v4().to_string();
-    let op_id = db::enqueue_create_with_anchor(db, &cal_href, &uid, summary, None, due_opt)?;
-    Ok(format!("Queued: create \"{summary}\" (#{op_id})"))
+    if db::is_local_list(&cal_href) {
+        db::create_local_with_anchor(db, &uid, summary, None, due_opt)?;
+        Ok(format!("Created local task \"{summary}\""))
+    } else {
+        let op_id = db::enqueue_create_with_anchor(db, &cal_href, &uid, summary, None, due_opt)?;
+        Ok(format!("Queued: create \"{summary}\" (#{op_id})"))
+    }
 }
 
 /// One hand-off file dropped in the intake spool by a future xochitl-side capture
@@ -2092,17 +2366,7 @@ fn drain_intake(db: &mut Connection) -> anyhow::Result<usize> {
     if !dir.exists() {
         return Ok(0);
     }
-    // Need a synced target calendar to attach creates to. If we can't resolve one,
-    // leave the files in place for a later drain rather than dropping them.
-    let cfg = config::load()?;
-    let Some(wanted) = cfg.nextcloud.calendar.as_ref() else {
-        eprintln!("retaskable: intake drain skipped -- no calendar configured");
-        return Ok(0);
-    };
-    let Some(cal_href) = db::get_calendar_href_by_display_name(db, wanted)? else {
-        eprintln!("retaskable: intake drain skipped -- calendar {wanted:?} not yet synced");
-        return Ok(0);
-    };
+    let cal_href = active_list_href(db)?;
     drain_intake_from(db, &dir, &cal_href)
 }
 
@@ -2117,8 +2381,8 @@ fn drain_intake_from(
     cal_href: &str,
 ) -> anyhow::Result<usize> {
     let mut ingested = 0usize;
-    for entry in std::fs::read_dir(dir)
-        .with_context(|| format!("reading intake dir {}", dir.display()))?
+    for entry in
+        std::fs::read_dir(dir).with_context(|| format!("reading intake dir {}", dir.display()))?
     {
         let Ok(entry) = entry else { continue };
         let path = entry.path();
@@ -2146,10 +2410,17 @@ fn drain_intake_from(
         }
         let anchor = make_anchor(&item);
         let uid = Uuid::new_v4().to_string();
-        if let Err(e) =
+        let result = if db::is_local_list(cal_href) {
+            db::create_local_with_anchor(db, &uid, summary, anchor.as_ref(), None)
+        } else {
             db::enqueue_create_with_anchor(db, cal_href, &uid, summary, anchor.as_ref(), None)
-        {
-            eprintln!("retaskable: intake enqueue failed {}: {e:#}", path.display());
+                .map(|_| ())
+        };
+        if let Err(e) = result {
+            eprintln!(
+                "retaskable: intake enqueue failed {}: {e:#}",
+                path.display()
+            );
             continue; // leave the file for a later retry
         }
         if let Err(e) = std::fs::remove_file(&path) {
@@ -2172,29 +2443,24 @@ fn edit_first(db: &mut Connection, summary: &str) -> anyhow::Result<String> {
         anyhow::bail!("summary cannot be empty");
     }
 
-    let cfg = config::load()?;
-    let wanted = cfg.nextcloud.calendar.as_ref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "config is missing `calendar = \"...\"` under [nextcloud]. \
-             Run List Calendars to see options."
-        )
-    })?;
-
-    let Some(cal_href) = db::get_calendar_href_by_display_name(db, wanted)? else {
-        return Ok(format!(
-            "calendar {wanted:?} not yet synced -- tap Sync first."
-        ));
-    };
+    let cal_href = active_list_href(db)?;
 
     let Some(task) = db::get_first_task(db, &cal_href)? else {
         return Ok("no tasks in cache -- tap Sync first.".to_string());
     };
 
     let old_summary = task.summary.clone();
-    let op_id = db::enqueue_edit(db, &cal_href, &task.uid, new_summary, None)?;
-    Ok(format!(
-        "Queued: edit \"{old_summary}\" -> \"{new_summary}\" (#{op_id})"
-    ))
+    if db::is_local_list(&cal_href) {
+        db::edit_local(db, &task.uid, new_summary, None)?;
+        Ok(format!(
+            "Updated local task \"{old_summary}\" -> \"{new_summary}\""
+        ))
+    } else {
+        let op_id = db::enqueue_edit(db, &cal_href, &task.uid, new_summary, None)?;
+        Ok(format!(
+            "Queued: edit \"{old_summary}\" -> \"{new_summary}\" (#{op_id})"
+        ))
+    }
 }
 
 /// MSG_RESOLVE_FIRST_CONFLICT handler. Finds the first conflict-resolvable
@@ -2207,24 +2473,16 @@ fn edit_first(db: &mut Connection, summary: &str) -> anyhow::Result<String> {
 /// inject a mock server without touching `~/.config/retaskable/config.toml`.
 async fn resolve_first_conflict(db: &mut Connection) -> anyhow::Result<String> {
     let cfg = config::load()?;
-    let wanted = cfg.nextcloud.calendar.as_ref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "config is missing `calendar = \"...\"` under [nextcloud]. \
-             Run List Calendars to see options."
-        )
-    })?;
-
-    let Some(cal_href) = db::get_calendar_href_by_display_name(db, wanted)? else {
-        return Ok(format!(
-            "calendar {wanted:?} not yet synced -- tap Sync first."
-        ));
-    };
+    let cal_href = active_list_href(db)?;
+    if db::is_local_list(&cal_href) {
+        return Ok(format_no_conflict_preview());
+    }
 
     let calendar_url = url::Url::parse(&cal_href)?;
-    let client = reqwest::Client::new();
+    let client = nextcloud::dav_client()?;
     let auth = (
-        cfg.nextcloud.username.as_str(),
-        cfg.nextcloud.app_password.as_str(),
+        cfg.caldav.username.as_str(),
+        cfg.caldav.app_password.as_str(),
     );
     resolve_first_conflict_inner(db, &client, auth, &calendar_url).await
 }
@@ -2241,8 +2499,7 @@ async fn resolve_first_conflict_inner(
         return Ok(format_no_conflict_preview());
     };
 
-    let Some(cached) =
-        db::get_cached_task_by_uid(db, &op.target_calendar_href, &op.target_uid)?
+    let Some(cached) = db::get_cached_task_by_uid(db, &op.target_calendar_href, &op.target_uid)?
     else {
         // Defensive: a resolvable conflict implies a cache row exists
         // (enqueue_toggle/edit insist on one). If it's gone, the queue
@@ -2313,22 +2570,15 @@ fn parse_decision_payload(payload: &str) -> anyhow::Result<(DecisionKind, i64)> 
 /// the inner is testable with an injected http mock.
 async fn apply_decision(db: &mut Connection, payload: &str) -> anyhow::Result<String> {
     let cfg = config::load()?;
-    let wanted = cfg.nextcloud.calendar.as_ref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "config is missing `calendar = \"...\"` under [nextcloud]. \
-             Run List Calendars to see options."
-        )
-    })?;
-    let Some(cal_href) = db::get_calendar_href_by_display_name(db, wanted)? else {
-        return Ok(format!(
-            "calendar {wanted:?} not yet synced -- tap Sync first."
-        ));
-    };
+    let cal_href = active_list_href(db)?;
+    if db::is_local_list(&cal_href) {
+        anyhow::bail!("local tasks do not have sync conflicts");
+    }
     let calendar_url = url::Url::parse(&cal_href)?;
-    let client = reqwest::Client::new();
+    let client = nextcloud::dav_client()?;
     let auth = (
-        cfg.nextcloud.username.as_str(),
-        cfg.nextcloud.app_password.as_str(),
+        cfg.caldav.username.as_str(),
+        cfg.caldav.app_password.as_str(),
     );
     apply_decision_inner(db, &client, auth, &calendar_url, payload).await
 }
@@ -2344,12 +2594,8 @@ async fn apply_decision_inner(
 ) -> anyhow::Result<String> {
     let (kind, op_id) = parse_decision_payload(payload)?;
     match kind {
-        DecisionKind::Keep => {
-            apply_keep_mine_inner(db, client, auth, calendar_url, op_id).await
-        }
-        DecisionKind::Take => {
-            apply_take_theirs_inner(db, client, auth, calendar_url, op_id).await
-        }
+        DecisionKind::Keep => apply_keep_mine_inner(db, client, auth, calendar_url, op_id).await,
+        DecisionKind::Take => apply_take_theirs_inner(db, client, auth, calendar_url, op_id).await,
     }
 }
 
@@ -2367,7 +2613,11 @@ fn load_resolvable_op(
     };
     let is_resolvable = op.errored == 1
         && matches!(op.op_type.as_str(), "toggle" | "edit")
-        && op.last_error.as_deref().unwrap_or("").contains("double-412");
+        && op
+            .last_error
+            .as_deref()
+            .unwrap_or("")
+            .contains("double-412");
     if !is_resolvable {
         return Ok(Err(format!(
             "Op #{op_id} is no longer in a resolvable state."
@@ -2401,8 +2651,7 @@ async fn apply_keep_mine_inner(
         Err(msg) => return Ok(msg),
     };
 
-    let Some(cached) =
-        db::get_cached_task_by_uid(db, &op.target_calendar_href, &op.target_uid)?
+    let Some(cached) = db::get_cached_task_by_uid(db, &op.target_calendar_href, &op.target_uid)?
     else {
         return Ok(format!(
             "Conflict #{op_id} has no matching cache row. Tap Clear Errored."
@@ -2420,15 +2669,9 @@ async fn apply_keep_mine_inner(
 
     // Single-shot PUT with the cached body (M9a invariant: cached
     // ical_text == post-mutation intent). Explicit no-retry.
-    let outcome = nextcloud::put_task_once(
-        client,
-        &task_url,
-        &cached.ical_text,
-        &fresh_etag,
-        auth,
-    )
-    .await
-    .context("Keep Mine PUT")?;
+    let outcome = nextcloud::put_task_once(client, &task_url, &cached.ical_text, &fresh_etag, auth)
+        .await
+        .context("Keep Mine PUT")?;
 
     match outcome {
         nextcloud::WriteOutcome::PreconditionFailed => Ok(format!(
@@ -2508,8 +2751,7 @@ async fn apply_take_theirs_inner(
         Err(msg) => return Ok(msg),
     };
 
-    let Some(cached) =
-        db::get_cached_task_by_uid(db, &op.target_calendar_href, &op.target_uid)?
+    let Some(cached) = db::get_cached_task_by_uid(db, &op.target_calendar_href, &op.target_uid)?
     else {
         return Ok(format!(
             "Conflict #{op_id} has no matching cache row. Tap Clear Errored."
@@ -2591,31 +2833,26 @@ async fn apply_take_theirs_inner(
 }
 
 fn delete_first(db: &mut Connection) -> anyhow::Result<String> {
-    let cfg = config::load()?;
-    let wanted = cfg.nextcloud.calendar.as_ref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "config is missing `calendar = \"...\"` under [nextcloud]. \
-             Run List Calendars to see options."
-        )
-    })?;
-
-    let Some(cal_href) = db::get_calendar_href_by_display_name(db, wanted)? else {
-        return Ok(format!(
-            "calendar {wanted:?} not yet synced -- tap Sync first."
-        ));
-    };
+    let cal_href = active_list_href(db)?;
 
     let Some(task) = db::get_first_task(db, &cal_href)? else {
         return Ok("no tasks in cache -- tap Sync first.".to_string());
     };
 
     let summary = task.summary.clone();
-    let op_id = db::enqueue_delete(db, &cal_href, &task.uid)?;
-    Ok(format!("Queued: delete \"{summary}\" (#{op_id})"))
+    if db::is_local_list(&cal_href) {
+        db::delete_local(db, &task.uid)?;
+        Ok(format!("Deleted local task \"{summary}\""))
+    } else {
+        let op_id = db::enqueue_delete(db, &cal_href, &task.uid)?;
+        Ok(format!("Queued: delete \"{summary}\" (#{op_id})"))
+    }
 }
 
 fn humanize_since(t: SystemTime) -> String {
-    let elapsed = SystemTime::now().duration_since(t).unwrap_or(Duration::ZERO);
+    let elapsed = SystemTime::now()
+        .duration_since(t)
+        .unwrap_or(Duration::ZERO);
     let secs = elapsed.as_secs();
     if secs < 60 {
         "<1 minute".to_string()
