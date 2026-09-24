@@ -411,12 +411,41 @@ Rectangle {
 
     // Jump exactly one screenful with no animation — a single, deliberate
     // e-ink refresh per tap (kinetic scrolling is disabled; see ListView).
+    //
+    // Page by row index, never by contentY arithmetic: with variable-height rows
+    // the ListView only estimates contentHeight and shifts originY as it lays out
+    // delegates, so "contentY ± height, clamped to [0, contentHeight-height]"
+    // drifts until paging overshoots the end or lands on blank space above the
+    // first row. positionViewAtIndex uses real delegate geometry and clamps to
+    // the list's bounds itself.
+    function rowAt(y) {
+        return taskList.indexAt(1, y)
+    }
     function pageDown() {
-        var maxY = Math.max(0, taskList.contentHeight - taskList.height)
-        taskList.contentY = Math.min(maxY, taskList.contentY + taskList.height)
+        var first = rowAt(taskList.contentY)
+        var bottom = taskList.contentY + taskList.height - 1
+        // The row cut off by the bottom edge starts the next page. If the edge
+        // falls between rows, take the next row down.
+        var next = rowAt(bottom)
+        if (next < 0) next = rowAt(bottom + taskList.spacing + 2)
+        if (next < 0) return
+        // A single row taller than the screen must still advance.
+        if (next <= first) next = first + 1
+        if (next >= taskList.count) return
+        taskList.positionViewAtIndex(next, ListView.Beginning)
     }
     function pageUp() {
-        taskList.contentY = Math.max(0, taskList.contentY - taskList.height)
+        var first = rowAt(taskList.contentY)
+        if (first < 0) first = rowAt(taskList.contentY + taskList.spacing + 2)
+        // At (or lost above) the top: snap to the first row.
+        if (first <= 0) {
+            taskList.positionViewAtBeginning()
+            return
+        }
+        // End the previous page on the current first row if it was clipped at
+        // the top, otherwise on the row just above it.
+        var target = rowAt(taskList.contentY - 1) === first ? first : first - 1
+        taskList.positionViewAtIndex(target, ListView.End)
     }
 
     // Give the backend connection a moment to establish, then drain any note-anchor
@@ -466,7 +495,7 @@ Rectangle {
             })
         }
         root.conflictCount = data.conflicts ? data.conflicts : 0
-        taskList.contentY = 0
+        taskList.positionViewAtBeginning()
         var synced = data.last_synced ? data.last_synced : "Not yet synced — tap Sync."
         var summary = synced + "   (" + tasks.length + (root.showCompleted ? " shown, incl. completed)" : " open)")
         // The error leads so the slot's 3-line cap elides the summary, not it.

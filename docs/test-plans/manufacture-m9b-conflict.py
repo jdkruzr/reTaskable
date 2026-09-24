@@ -26,7 +26,7 @@ Full hardware-test workflow (rMPP at 10.11.99.1):
     #    same task before continuing.) Do NOT tap Sync.
 
     # 2. Stop the backend, pull the DB, plant the conflict, push it back:
-    ssh root@10.11.99.1 'kill $(pgrep -f us.reticulum.retaskable.sock) 2>/dev/null; sleep 1'
+    ssh root@10.11.99.1 'kill $(pgrep -f [u]s.reticulum.retaskable.sock) 2>/dev/null; sleep 1'
     scp -O root@10.11.99.1:/home/root/.local/share/retaskable/db.sqlite /tmp/db.sqlite
     python3 docs/test-plans/manufacture-m9b-conflict.py /tmp/db.sqlite
     scp -O /tmp/db.sqlite root@10.11.99.1:/home/root/.local/share/retaskable/db.sqlite
