@@ -27,6 +27,12 @@ Rectangle {
     // it only appears when there's actually a conflict to resolve.
     property int conflictCount: 0
 
+    // A failed sync/write reply, pinned above the "Last synced" line. Every
+    // 105/108/119/120 reply triggers a list refresh whose 104 rewrites the
+    // status slot, which used to wipe errors after a single e-ink refresh.
+    // Cleared by the next successful reply of those types.
+    property string stickyStatus: ""
+
     // Task-detail dialog state. Opened by single-tapping a row's text area;
     // populated from that row's model entry (no backend fetch — the list
     // envelope already carries every field shown). detailDeleteArmed gates the
@@ -120,6 +126,7 @@ Rectangle {
                 return
             }
             if (type === 105 || type === 108 || type === 119 || type === 120) {
+                root.stickyStatus = root.isFailureStatus(contents) ? contents : ""
                 statusText.text = contents
                 root.refreshList()
                 return
@@ -461,7 +468,18 @@ Rectangle {
         root.conflictCount = data.conflicts ? data.conflicts : 0
         taskList.contentY = 0
         var synced = data.last_synced ? data.last_synced : "Not yet synced — tap Sync."
-        statusText.text = synced + "   (" + tasks.length + (root.showCompleted ? " shown, incl. completed)" : " open)")
+        var summary = synced + "   (" + tasks.length + (root.showCompleted ? " shown, incl. completed)" : " open)")
+        // The error leads so the slot's 3-line cap elides the summary, not it.
+        statusText.text = root.stickyStatus ? root.stickyStatus + "\n" + summary : summary
+    }
+
+    // Failure shapes of the sync/write replies: an "error: …" from a handler,
+    // the sync-skipped-on-network-failure line, or a flush with errored ops.
+    function isFailureStatus(text) {
+        if (text.startsWith("error:")) return true
+        if (text.indexOf("network failed") >= 0) return true
+        var m = text.match(/\/ (\d+) errored/)
+        return m !== null && parseInt(m[1], 10) > 0
     }
 
     // Apply the compact MSG 114 result to a single row — no full-list redraw,

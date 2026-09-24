@@ -23,9 +23,12 @@ if [[ ! -d "$LOCAL_BUILD" ]]; then
 fi
 
 echo "==> Killing any running reTaskable backend on $DEVICE"
-# Backend is invoked as "backend/entry <socket>"; pkill -f matches the full
-# command line. The binary is named "entry" so pidof would be too broad.
-ssh "root@$DEVICE" "pkill -f '$REMOTE_DIR/backend/entry' 2>/dev/null || true"
+# Backend is invoked as "backend/entry <socket>"; pgrep -f matches the full
+# command line. The binary is named "entry" so pidof would be too broad, and
+# AppLoad 0.6.0 launches it by relative path, so match the app's unique socket
+# name rather than $REMOTE_DIR (which no longer appears in argv). OS 3.28's
+# busybox has no pkill, hence pgrep + kill.
+ssh "root@$DEVICE" "pids=\$(pgrep -f 'us.reticulum.retaskable.sock'); [ -n \"\$pids\" ] && kill \$pids; true"
 
 echo "==> Wiping $REMOTE_DIR on $DEVICE"
 ssh "root@$DEVICE" "rm -rf '$REMOTE_DIR'"
